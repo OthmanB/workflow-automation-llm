@@ -47,7 +47,11 @@ def compile_effective_policy(
     policy: any undeclared semantic action compiles to an explicit denial.
     """
     layers = config.permission_policy_layers(repo_id=repo_id, role_key=role_key)
-    return compile_policy_layers(layers, dispatch_authorized_actions)
+    rules = compile_policy_layers(layers, dispatch_authorized_actions)
+    if config.role_kind(role_key) == "reviewer":
+        rules["edit"] = "deny"
+        rules["write"] = "deny"
+    return rules
 
 
 def compile_policy_layers(

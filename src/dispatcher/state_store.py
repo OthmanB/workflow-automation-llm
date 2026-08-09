@@ -406,6 +406,7 @@ class StateStore:
         dispatch: DispatchRecord,
         prompt: str,
         policy: Mapping[str, Any],
+        session_metadata: Mapping[str, Any] | None = None,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> int:
         """Commit a PREPARED dispatch and exact private inputs before launching a process."""
@@ -421,7 +422,13 @@ class StateStore:
             record,
             expected_generation=expected_generation,
             sessions=sessions,
-            dispatch_payloads={dispatch.dispatch_id: DispatchPayload(prompt=prompt, policy=policy)},
+            dispatch_payloads={
+                dispatch.dispatch_id: DispatchPayload(
+                    prompt=prompt,
+                    policy=policy,
+                    session_metadata=session_metadata,
+                )
+            },
         )
 
     def update_dispatch_payload(
@@ -486,6 +493,8 @@ class StateStore:
             raise StateStoreError(f"run record does not contain dispatch: {dispatch_id}") from exc
         if target is DispatchStatus.COMPLETED and result is None:
             raise StateStoreError("COMPLETED dispatch transition requires the exact result payload")
+        if target is DispatchStatus.RUNNING and (process_id is None or process_id < 1):
+            raise StateStoreError("RUNNING dispatch transition requires a positive process_id")
         if target is DispatchStatus.FORWARDED and forwarding_payload is None:
             raise StateStoreError("FORWARDED dispatch transition requires the complete forwarding payload")
         transitioned = transition_dispatch_record(
@@ -526,6 +535,60 @@ class StateStore:
         )
         return updated, generation
 
+    def bind_dispatch_session(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        dispatch_id: str,
+        runtime_session_id: str,
+        event: TransitionEvent,
+        pool: str,
+        role_key: str,
+        session_entry: Mapping[str, Any],
+    ) -> tuple[RunRecord, int]:
+        """Atomically bind the first validated session ID to a running dispatch."""
+        try:
+            current = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise StateStoreError(f"run record does not contain dispatch: {dispatch_id}") from exc
+        if current.state is not DispatchStatus.RUNNING:
+            raise StateStoreError("session identity can only bind to a RUNNING dispatch")
+        if current.runtime_session_id is not None:
+            raise StateStoreConflictError("running dispatch already has a runtime session ID")
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch_id] = current.model_copy(
+            update={"runtime_session_id": runtime_session_id, "last_event": event}
+        )
+        updated = record.model_copy(
+            update={
+                "dispatches": dispatches,
+                "sequence": event.sequence,
+                "updated_at": event.occurred_at,
+            }
+        )
+        sessions = self.sessions_for_run(record.run_id)
+        sessions.setdefault(pool, {})[role_key] = dict(session_entry)
+        payload = self.load_dispatch_payload(record.run_id, dispatch_id)
+        metadata = dict(payload.session_metadata or {})
+        metadata["runtime_session_id"] = runtime_session_id
+        generation = self.save_run(
+            updated,
+            expected_generation=expected_generation,
+            sessions=sessions,
+            dispatch_payloads={
+                dispatch_id: DispatchPayload(
+                    prompt=payload.prompt,
+                    policy=payload.policy,
+                    result=payload.result,
+                    forwarding_payload=payload.forwarding_payload,
+                    process_id=payload.process_id,
+                    session_metadata=metadata,
+                )
+            },
+        )
+        return updated, generation
+
     def load_dispatch_payload(self, run_id: str, dispatch_id: str) -> DispatchPayload:
         """Return the exact private inputs and outputs associated with one dispatch."""
         row = self._ready_connection().execute(
@@ -562,8 +625,8 @@ class StateStore:
                     RecoveryItem(
                         dispatch.dispatch_id,
                         dispatch.state,
-                        "safe_to_retry",
-                        "no RUNNING transition was committed; no subprocess launch is recorded",
+                        "operator_reconciliation_required",
+                        "a crash may have occurred after process creation but before RUNNING was committed",
                     )
                 )
             elif dispatch.state is DispatchStatus.RUNNING:
@@ -717,6 +780,54 @@ class StateStore:
                 ),
             )
 
+    def complete_run(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        event_id: str,
+        sequence: int,
+        correlation_id: str,
+        report_path: str,
+    ) -> int:
+        """Commit terminal run state and its audit event in one transaction."""
+        if record.state is not RunStatus.SUCCEEDED:
+            raise StateStoreError("complete_run requires a SUCCEEDED run record")
+        sessions = self.sessions_for_run(record.run_id)
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            row = connection.execute(
+                "SELECT generation FROM runs WHERE run_id = ?", (record.run_id,)
+            ).fetchone()
+            if row is None or row["generation"] != expected_generation:
+                raise StateStoreConflictError(
+                    f"run {record.run_id} changed before terminal commit"
+                )
+            generation = expected_generation + 1
+            self._write_snapshot(
+                connection,
+                record,
+                generation=generation,
+                sessions=sessions,
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    event_id, run_id, sequence, kind, correlation_id,
+                    causation_id, payload_json, created_at
+                ) VALUES (?, ?, ?, 'run_succeeded', ?, NULL, ?, ?)
+                """,
+                (
+                    event_id,
+                    record.run_id,
+                    sequence,
+                    correlation_id,
+                    _json_text({"report_path": report_path}),
+                    _utc_now(),
+                ),
+            )
+        return generation
+
     def record_review(
         self,
         *,
@@ -850,9 +961,19 @@ class StateStore:
         atomic_write_private_text(path, "\n".join(lines) + ("\n" if lines else ""))
         return path
 
-    def export_run_report(self, run_id: str) -> Path:
+    def export_run_report(
+        self,
+        run_id: str,
+        *,
+        record_override: RunRecord | None = None,
+        generation_override: int | None = None,
+    ) -> Path:
         """Render a deterministic Markdown summary from the authoritative rows."""
-        record, generation = self.load_run(run_id)
+        stored_record, stored_generation = self.load_run(run_id)
+        record = record_override or stored_record
+        generation = generation_override or stored_generation
+        if record.run_id != run_id:
+            raise StateStoreError("report record does not match requested run_id")
         lines = [
             f"# Run {record.run_id}",
             "",
@@ -902,6 +1023,32 @@ class StateStore:
         lines.extend(["", "## Artifacts", "", "| Kind | Path | SHA-256 |", "|---|---|---|"])
         for artifact in artifacts:
             lines.append(f"| `{artifact['kind']}` | `{artifact['path']}` | `{artifact['sha256']}` |")
+        lines.extend(["", "## Typed Evidence", "", "| Dispatch | Artifact | Path | SHA-256 |", "|---|---|---|---|"])
+        payload_rows = self._ready_connection().execute(
+            "SELECT dispatch_id, result_json FROM dispatch_payloads WHERE run_id = ? ORDER BY dispatch_id",
+            (record.run_id,),
+        ).fetchall()
+        for payload_row in payload_rows:
+            if payload_row["result_json"] is None:
+                continue
+            result = json.loads(payload_row["result_json"])
+            for evidence in result.get("evidence", []) if isinstance(result, dict) else []:
+                lines.append(
+                    f"| `{payload_row['dispatch_id']}` | `{evidence['artifact_id']}` | "
+                    f"`{evidence['relative_path']}` | `{evidence['sha256']}` |"
+                )
+        lines.extend(["", "## Reviews", "", "| Review | Dispatch | Verdict | Target revision |", "|---|---|---|---|"])
+        reviews = self._ready_connection().execute(
+            "SELECT review_id, dispatch_id, review_json FROM reviews WHERE run_id = ? ORDER BY created_at, review_id",
+            (record.run_id,),
+        ).fetchall()
+        for review_row in reviews:
+            review = json.loads(review_row["review_json"])
+            target = review.get("review_target", {})
+            lines.append(
+                f"| `{review_row['review_id']}` | `{review_row['dispatch_id']}` | "
+                f"`{review.get('verdict', '')}` | `{target.get('result_revision') or target.get('patch_sha256') or ''}` |"
+            )
         reports = ensure_private_directory(self.state_dir / "reports")
         path = reports / f"run-{run_id}.md"
         atomic_write_private_text(path, "\n".join(lines) + "\n")

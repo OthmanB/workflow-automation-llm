@@ -160,7 +160,7 @@ def create_fixture_project(
                 },
                 "reviewer-class": {
                     "default": "deny",
-                    "actions": {"inspect": "allow", "verify": "allow"},
+                    "actions": {"inspect": "allow", "modify": "deny", "verify": "allow"},
                 },
                 "supervisor": {"default": "deny", "actions": {}},
                 "executor": {"default": "deny", "actions": {}},

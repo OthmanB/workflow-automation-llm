@@ -17,6 +17,7 @@ from dispatcher.sessions import (
     OpenCodeSessionError,
     OpenCodeTimeoutError,
     OpenCodeVersionError,
+    SessionLifecycleCallbacks,
     _session_exists,
     list_sessions,
     run_session,
@@ -97,6 +98,52 @@ def test_run_session_streams_validated_output_to_private_logs(
     assert "FIXTURE_OK" in Path(result.stdout_log_path).read_text(encoding="utf-8")
     assert stat.S_IMODE(Path(result.stdout_log_path).stat().st_mode) == 0o600
     assert stat.S_IMODE((tmp_path / "state" / "opencode-events").stat().st_mode) == 0o700
+
+
+def test_lifecycle_callbacks_run_before_prompt_and_once_for_session_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = _write_fake_opencode(tmp_path, _success_body())
+    monkeypatch.setattr(sessions, "OPENCODE_BIN", str(binary))
+    observed: list[tuple[str, object]] = []
+    kwargs = _run_kwargs(tmp_path)
+    kwargs["lifecycle"] = SessionLifecycleCallbacks(
+        lambda process_id: observed.append(("process", process_id)),
+        lambda session_id: observed.append(("session", session_id)),
+    )
+
+    result = run_session(**kwargs)
+
+    assert result.session_id == "ses_fixture_new"
+    assert [kind for kind, _value in observed] == ["process", "session"]
+    assert isinstance(observed[0][1], int)
+    assert observed[1][1] == "ses_fixture_new"
+
+
+def test_process_callback_failure_terminates_the_started_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_body = """    import time
+    time.sleep(60)
+"""
+    binary = _write_fake_opencode(tmp_path, run_body)
+    monkeypatch.setattr(sessions, "OPENCODE_BIN", str(binary))
+    process_ids: list[int] = []
+
+    def reject_start(process_id: int) -> None:
+        process_ids.append(process_id)
+        raise RuntimeError("durable process transition failed")
+
+    kwargs = _run_kwargs(tmp_path)
+    kwargs["lifecycle"] = SessionLifecycleCallbacks(reject_start, lambda _session_id: None)
+    with pytest.raises(RuntimeError, match="durable process transition failed"):
+        run_session(**kwargs)
+
+    assert len(process_ids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_ids[0], 0)
 
 
 def test_run_session_rejects_structured_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -212,9 +259,15 @@ def test_resume_rejects_missing_or_stale_session_identity(
     monkeypatch.setattr(sessions, "OPENCODE_BIN", str(binary))
     kwargs = _run_kwargs(tmp_path)
     kwargs.update({"session_id": "ses_fixture_parent", "mode": "resume"})
+    identified: list[str] = []
+    kwargs["lifecycle"] = SessionLifecycleCallbacks(
+        lambda _process_id: None,
+        identified.append,
+    )
 
     with pytest.raises(OpenCodeSessionError, match="expected"):
         run_session(**kwargs)
+    assert identified == []
 
     kwargs["session_id"] = None
     with pytest.raises(OpenCodeSessionError, match="require"):

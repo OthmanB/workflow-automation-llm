@@ -311,7 +311,9 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
         prompt=prompt,
         policy=policy,
     )
-    assert store.classify_recovery(record.run_id)[0].disposition == "safe_to_retry"
+    assert store.classify_recovery(record.run_id)[0].disposition == (
+        "operator_reconciliation_required"
+    )
 
     running = transition_dispatch(
         dispatch,

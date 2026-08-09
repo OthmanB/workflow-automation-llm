@@ -65,6 +65,7 @@ class PreparedDispatch:
     run_id: str
     generation: int
     dispatch: DispatchRecord
+    prompt: str
     workdir: Path
     permission_config: dict[str, Any]
     auto_approve: bool
@@ -139,6 +140,7 @@ class SequentialWorkflow:
         record, generation = self.store.load_run(run_id)
         if generation != expected_generation:
             raise SequentialWorkflowError("run generation changed before activation")
+        record, generation = self.refresh_readiness(record, generation)
         if record.state is RunStatus.NEW:
             ready_event = self._event(record, "dispatcher", "run approved and ready", "run-activation")
             record = transition_run(record, RunStatus.READY, ready_event)
@@ -150,6 +152,45 @@ class SequentialWorkflow:
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError(f"run is not dispatchable from state {record.state.value}")
         return record, generation
+
+    def refresh_readiness(
+        self,
+        record: RunRecord,
+        generation: int,
+    ) -> tuple[RunRecord, int]:
+        """Mark only dependency-satisfied pending steps ready in normalized order."""
+        steps = dict(record.steps)
+        changed = False
+        sequence = record.sequence
+        updated_at = record.updated_at
+        for plan_step in record.plan.steps:
+            step = steps[plan_step.step_id]
+            if step.state is not StepStatus.PENDING:
+                continue
+            if not step.operator_gate_resolved:
+                continue
+            if any(
+                steps[dependency_id].state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}
+                for dependency_id in plan_step.depends_on
+            ):
+                continue
+            sequence += 1
+            event = self._event(
+                record,
+                "dispatcher",
+                "normalized dependencies are satisfied",
+                plan_step.step_id,
+                sequence=sequence,
+            )
+            steps[plan_step.step_id] = transition_step(step, StepStatus.READY, event)
+            updated_at = event.occurred_at
+            changed = True
+        if not changed:
+            return record, generation
+        updated = record.model_copy(
+            update={"steps": steps, "sequence": sequence, "updated_at": updated_at}
+        )
+        return updated, self.store.save_run(updated, expected_generation=generation)
 
     def prepare_from_supervisor(
         self,
@@ -215,6 +256,15 @@ class SequentialWorkflow:
         dispatch_id = f"dispatch-{uuid.uuid4().hex}"
         event = self._event(record, "dispatcher", f"prepared {role_kind} dispatch", dispatch_id)
         review_target = self._review_target(record, step) if role_kind == "reviewer" else None
+        worker_prompt = _worker_prompt(
+            dispatch_id=dispatch_id,
+            attempt=attempt,
+            role_kind=role_kind,
+            step=step,
+            task=command.prompt,
+            base_revision=base_revision,
+            review_target=review_target,
+        )
         dispatch = DispatchRecord(
             dispatch_id=dispatch_id,
             step_id=step.step_id,
@@ -225,7 +275,7 @@ class SequentialWorkflow:
             runtime_session_id=None,
             state=DispatchStatus.PREPARED,
             intent=DispatchIntent(
-                prompt_sha256=_sha256_text(command.prompt),
+                prompt_sha256=_sha256_text(worker_prompt),
                 policy_digest=_sha256_json(policy),
                 expected_result_kind=role_kind,
                 repository=DispatchRepositoryCoordinate(repo_id=step.repo_id, base_revision=base_revision),
@@ -267,15 +317,16 @@ class SequentialWorkflow:
                 updated,
                 expected_generation=generation,
                 dispatch=dispatch,
-                prompt=command.prompt,
+                prompt=worker_prompt,
                 policy=policy,
+                session_metadata={
+                    "session_mode": command.session_mode,
+                    "parent_session_id": session_id,
+                    "review_target": (
+                        review_target.model_dump(mode="json") if review_target is not None else None
+                    ),
+                },
             )
-            if review_target is not None:
-                self.store.update_dispatch_payload(
-                    run_id=record.run_id,
-                    dispatch_id=dispatch_id,
-                    session_metadata={"review_target": review_target.model_dump(mode="json")},
-                )
         except Exception:
             self.store.release_leases(owner_id=self.owner_id, resource_keys=lease_keys)
             raise
@@ -283,6 +334,7 @@ class SequentialWorkflow:
             run_id=record.run_id,
             generation=next_generation,
             dispatch=dispatch,
+            prompt=worker_prompt,
             workdir=workdir,
             permission_config=policy,
             auto_approve=should_auto_approve(policy_rules),
@@ -296,37 +348,26 @@ class SequentialWorkflow:
         self,
         prepared: PreparedDispatch,
         *,
-        runtime_session_id: str,
-        process_id: int | None = None,
+        process_id: int,
     ) -> PreparedDispatch:
         """Durably record a worker launch before accepting any worker result."""
         record, generation = self.store.load_run(prepared.run_id)
         if generation != prepared.generation:
             raise SequentialWorkflowError("prepared dispatch generation is stale")
         event = self._event(record, "dispatcher", "worker process launched", prepared.dispatch.dispatch_id)
-        sessions = self.store.sessions_for_run(prepared.run_id)
-        pool = "executors" if prepared.dispatch.role_kind == "executor" else "reviewers"
-        sessions.setdefault(pool, {})[prepared.dispatch.role_key] = {
-            "session_id": runtime_session_id,
-            "logical_session_key": prepared.dispatch.logical_session_key,
-            "working_directory": str(prepared.workdir),
-            "status": "active",
-        }
         updated, next_generation = self.store.commit_dispatch_transition(
             record,
             expected_generation=generation,
             dispatch_id=prepared.dispatch.dispatch_id,
             target=DispatchStatus.RUNNING,
             event=event,
-            runtime_session_id=runtime_session_id,
             process_id=process_id,
-            session_metadata={"runtime_session_id": runtime_session_id},
-            sessions=sessions,
         )
         return PreparedDispatch(
             run_id=prepared.run_id,
             generation=next_generation,
             dispatch=updated.dispatches[prepared.dispatch.dispatch_id],
+            prompt=prepared.prompt,
             workdir=prepared.workdir,
             permission_config=prepared.permission_config,
             auto_approve=prepared.auto_approve,
@@ -334,6 +375,50 @@ class SequentialWorkflow:
             review_target=prepared.review_target,
             session_mode=prepared.session_mode,
             session_id=prepared.session_id,
+        )
+
+    def record_session_id(
+        self,
+        running: PreparedDispatch,
+        *,
+        runtime_session_id: str,
+    ) -> PreparedDispatch:
+        """Bind the first validated OpenCode session ID to the running attempt."""
+        record, generation = self.store.load_run(running.run_id)
+        if generation != running.generation:
+            raise SequentialWorkflowError("running dispatch generation is stale")
+        dispatch = record.dispatches[running.dispatch.dispatch_id]
+        if dispatch.state is not DispatchStatus.RUNNING:
+            raise SequentialWorkflowError("session ID arrived for a dispatch that is not RUNNING")
+        event = self._event(record, "dispatcher", "OpenCode session identified", dispatch.dispatch_id)
+        pool = "executors" if dispatch.role_kind == "executor" else "reviewers"
+        updated, next_generation = self.store.bind_dispatch_session(
+            record,
+            expected_generation=generation,
+            dispatch_id=dispatch.dispatch_id,
+            runtime_session_id=runtime_session_id,
+            event=event,
+            pool=pool,
+            role_key=dispatch.role_key,
+            session_entry={
+                "session_id": runtime_session_id,
+                "logical_session_key": dispatch.logical_session_key,
+                "working_directory": str(running.workdir),
+                "status": "active",
+            },
+        )
+        return PreparedDispatch(
+            run_id=running.run_id,
+            generation=next_generation,
+            dispatch=updated.dispatches[dispatch.dispatch_id],
+            prompt=running.prompt,
+            workdir=running.workdir,
+            permission_config=running.permission_config,
+            auto_approve=running.auto_approve,
+            lease_keys=running.lease_keys,
+            review_target=running.review_target,
+            session_mode=running.session_mode,
+            session_id=running.session_id,
         )
 
     def apply_executor_result(
@@ -536,6 +621,52 @@ class SequentialWorkflow:
             event=event,
         )
 
+    def fail_dispatch(
+        self,
+        prepared: PreparedDispatch,
+        *,
+        reason: str,
+    ) -> tuple[RunRecord, int]:
+        """Record a failed adapter/result boundary without advancing the plan step."""
+        record, generation = self.store.load_run(prepared.run_id)
+        if generation != prepared.generation:
+            raise SequentialWorkflowError("failed dispatch generation is stale")
+        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        if dispatch.state is DispatchStatus.PREPARED:
+            target = DispatchStatus.ABANDONED
+        elif dispatch.state is DispatchStatus.RUNNING:
+            target = DispatchStatus.FAILED
+        else:
+            raise SequentialWorkflowError(
+                f"cannot fail dispatch from state {dispatch.state.value}"
+            )
+        event = self._event(record, "dispatcher", reason, dispatch.dispatch_id)
+        record, generation = self.store.commit_dispatch_transition(
+            record,
+            expected_generation=generation,
+            dispatch_id=dispatch.dispatch_id,
+            target=target,
+            event=event,
+        )
+        step = record.steps[dispatch.step_id]
+        step_event = self._event(
+            record,
+            "dispatcher",
+            "worker boundary failed",
+            dispatch.dispatch_id,
+        )
+        if step.state is StepStatus.EXECUTING:
+            updated_step = transition_step(step, StepStatus.BLOCKED, step_event)
+        elif step.state is StepStatus.REVIEWING:
+            updated_step = transition_step(step, StepStatus.REVIEW_REQUIRED, step_event)
+        else:
+            raise SequentialWorkflowError(
+                f"failed dispatch has incompatible step state {step.state.value}"
+            )
+        record, generation = self._replace_step(record, generation, updated_step)
+        self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
+        return record, generation
+
     def evaluate_completion(self, record: RunRecord, generation: int) -> CompletionDecision:
         """Evaluate dispatcher-owned completion obligations, never supervisor prose."""
         obligations = completion_obligations(record)
@@ -545,18 +676,20 @@ class SequentialWorkflow:
                 obligations=tuple(f"{item.code}: {item.detail}" for item in obligations),
                 report_path=None,
             )
-        report_path = self.store.export_run_report(record.run_id)
         event = self._event(record, "dispatcher", "completion guard passed", "completion")
         succeeded = transition_run(record, RunStatus.SUCCEEDED, event)
-        self.store.save_run(succeeded, expected_generation=generation)
-        self.store.append_audit_event(
-            run_id=record.run_id,
+        report_path = self.store.export_run_report(
+            record.run_id,
+            record_override=succeeded,
+            generation_override=generation + 1,
+        )
+        self.store.complete_run(
+            succeeded,
+            expected_generation=generation,
             event_id=event.event_id,
             sequence=event.sequence,
-            kind="run_succeeded",
             correlation_id=event.correlation_id,
-            causation_id=None,
-            payload={"report_path": str(report_path.relative_to(self.store.state_dir))},
+            report_path=str(report_path.relative_to(self.store.state_dir)),
         )
         return CompletionDecision(accepted=True, obligations=(), report_path=report_path)
 
@@ -848,6 +981,49 @@ def _dispatch_example(config: Config, record: RunRecord) -> str:
 def _completion_example() -> str:
     return json.dumps(
         {"protocol_version": 1, "action": "request_completion", "rationale": "All obligations are met."},
+        separators=(",", ":"),
+    )
+
+
+def _worker_prompt(
+    *,
+    dispatch_id: str,
+    attempt: int,
+    role_kind: Literal["executor", "reviewer"],
+    step: PlanStep,
+    task: str,
+    base_revision: str,
+    review_target: ReviewTarget | None,
+) -> str:
+    """Render the exact machine context a worker needs to return a typed result."""
+    return json.dumps(
+        {
+            "context_version": 1,
+            "result_kind": role_kind,
+            "dispatch_id": dispatch_id,
+            "attempt": attempt,
+            "step_id": step.step_id,
+            "repo_id": step.repo_id,
+            "base_revision": base_revision,
+            "task": task,
+            "authorized_actions": list(step.authorization.authorized_actions),
+            "acceptance_criteria": [
+                criterion.model_dump(mode="json") for criterion in step.acceptance_criteria
+            ],
+            "evidence_requirements": [
+                requirement.model_dump(mode="json") for requirement in step.evidence_requirements
+            ],
+            "review_target": (
+                review_target.model_dump(mode="json") if review_target is not None else None
+            ),
+            "response_contract": (
+                "Return exactly one schema-v1 executor result JSON object."
+                if role_kind == "executor"
+                else "Return exactly one schema-v1 reviewer result JSON object."
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
         separators=(",", ":"),
     )
 

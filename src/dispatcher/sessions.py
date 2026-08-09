@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -78,6 +78,14 @@ class SessionDescriptor:
     directory: str
 
 
+@dataclass(frozen=True)
+class SessionLifecycleCallbacks:
+    """Synchronous durable-state hooks around the external process lifecycle."""
+
+    on_process_started: Callable[[int], None]
+    on_session_identified: Callable[[str], None]
+
+
 @dataclass
 class SessionResult:
     """The validated outcome of one OpenCode command."""
@@ -99,7 +107,12 @@ class SessionResult:
 class OpenCodeJsonlDecoder:
     """Incrementally decode the exact JSONL events emitted by OpenCode 1.18.11."""
 
-    def __init__(self, *, max_output_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_output_bytes: int,
+        on_session_identified: Callable[[str], None] | None = None,
+    ) -> None:
         self._max_output_bytes = max_output_bytes
         self._raw: list[dict[str, Any]] = []
         self._raw_bytes = 0
@@ -110,6 +123,7 @@ class OpenCodeJsonlDecoder:
         self._session_id = ""
         self._structured_error = ""
         self._saw_step_finish = False
+        self._on_session_identified = on_session_identified
 
     def consume_line(self, line: str, *, line_number: int) -> None:
         """Decode one complete JSONL line and retain only bounded safe metadata."""
@@ -131,7 +145,10 @@ class OpenCodeJsonlDecoder:
             raise OpenCodeProtocolError(f"OpenCode event at line {line_number} is missing sessionID")
         if self._session_id and self._session_id != session_id:
             raise OpenCodeProtocolError("OpenCode event stream contains multiple session IDs")
-        self._session_id = session_id
+        if not self._session_id:
+            self._session_id = session_id
+            if self._on_session_identified is not None:
+                self._on_session_identified(session_id)
 
         part = event.get("part")
         if event_type != "error" and not isinstance(part, dict):
@@ -277,6 +294,7 @@ def run_session(
     permission_config: Mapping[str, Any] | None = None,
     require_response: bool = True,
     snapshot_dirs: list[str] | None = None,
+    lifecycle: SessionLifecycleCallbacks | None = None,
 ) -> SessionResult:
     """Run one OpenCode command with a private child environment and bounded output."""
     if timeout_seconds < 1:
@@ -310,6 +328,17 @@ def run_session(
 
     logger.info("opencode run model=%s variant=%s session_mode=%s", model, variant, mode)
     started = time.monotonic()
+
+    def session_identified(returned_id: str) -> None:
+        if mode == "resume" and returned_id != session_id:
+            raise OpenCodeSessionError(
+                f"resume returned session {returned_id!r}, expected {session_id!r}"
+            )
+        if mode == "fork" and returned_id == session_id:
+            raise OpenCodeSessionError("fork returned the parent session ID")
+        if lifecycle is not None:
+            lifecycle.on_session_identified(returned_id)
+
     try:
         exit_code, decoder, stderr = _run_streaming_process(
             command=command,
@@ -320,6 +349,8 @@ def run_session(
             max_output_bytes=max_output_bytes,
             stdout_log=stdout_log,
             stderr_log=stderr_log,
+            on_process_started=(lifecycle.on_process_started if lifecycle is not None else None),
+            on_session_identified=session_identified,
         )
         if exit_code != 0:
             raise OpenCodeProcessError(
@@ -498,6 +529,8 @@ def _run_streaming_process(
     max_output_bytes: int,
     stdout_log: Path,
     stderr_log: Path,
+    on_process_started: Callable[[int], None] | None,
+    on_session_identified: Callable[[str], None] | None,
 ) -> tuple[int, OpenCodeJsonlDecoder, str]:
     """Stream stdout/stderr without retaining unbounded process output in memory."""
     try:
@@ -515,19 +548,31 @@ def _run_streaming_process(
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
+    if on_process_started is not None:
+        try:
+            on_process_started(process.pid)
+        except Exception:
+            _terminate_process_group(process, termination_grace_seconds)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+            raise
     streams: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
     _start_stream_reader("stdout", process.stdout, streams)
     _start_stream_reader("stderr", process.stderr, streams)
     _start_stdin_writer(process.stdin, prompt.encode("utf-8"))
 
-    decoder = OpenCodeJsonlDecoder(max_output_bytes=max_output_bytes)
+    decoder = OpenCodeJsonlDecoder(
+        max_output_bytes=max_output_bytes,
+        on_session_identified=on_session_identified,
+    )
     stderr_collector = _BoundedTextCollector(max_output_bytes)
     stdout_buffer = b""
     stderr_buffer = b""
     stdout_closed = False
     stderr_closed = False
     line_number = 0
-    failure: OpenCodeAdapterError | None = None
+    failure: Exception | None = None
     deadline = time.monotonic() + timeout_seconds
 
     with open_private_text(stdout_log, append=False) as stdout_handle, open_private_text(
@@ -566,7 +611,7 @@ def _run_streaming_process(
                     if failure is None:
                         try:
                             decoder.consume_line(line, line_number=line_number)
-                        except OpenCodeAdapterError as exc:
+                        except Exception as exc:
                             failure = exc
                             _terminate_process_group(process, termination_grace_seconds)
             else:
@@ -587,7 +632,7 @@ def _run_streaming_process(
             if failure is None:
                 try:
                     decoder.consume_line(line, line_number=line_number)
-                except OpenCodeAdapterError as exc:
+                except Exception as exc:
                     failure = exc
         if stderr_buffer:
             line = redact_text(stderr_buffer.decode("utf-8", errors="replace"))

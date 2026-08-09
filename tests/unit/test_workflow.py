@@ -130,10 +130,11 @@ def test_step_and_dispatch_allowed_and_rejected_transitions(project: FixtureProj
         dispatch,
         DispatchStatus.RUNNING,
         _event(2),
-        runtime_session_id="runtime-session-one",
     )
+    assert running.runtime_session_id is None
+    identified = running.model_copy(update={"runtime_session_id": "runtime-session-one"})
     completed = transition_dispatch(
-        running,
+        identified,
         DispatchStatus.COMPLETED,
         _event(3),
         result_digest=_DIGEST,
@@ -146,8 +147,10 @@ def test_step_and_dispatch_allowed_and_rejected_transitions(project: FixtureProj
     )
 
     assert forwarded.state is DispatchStatus.FORWARDED
+    with pytest.raises(TransitionError, match="runtime_session_id"):
+        transition_dispatch(running, DispatchStatus.COMPLETED, _event(5), result_digest=_DIGEST)
     with pytest.raises(TransitionError, match="invalid dispatch transition"):
-        transition_dispatch(dispatch, DispatchStatus.COMPLETED, _event(5), result_digest=_DIGEST)
+        transition_dispatch(dispatch, DispatchStatus.COMPLETED, _event(6), result_digest=_DIGEST)
 
 
 def test_completion_guard_returns_structured_unmet_obligations(project: FixtureProject) -> None:

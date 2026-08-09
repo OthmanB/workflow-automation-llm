@@ -155,7 +155,9 @@ def _prepare_executor(project: FixtureProject, *, review_required: bool = False)
         supervisor_text=_dispatch_command(),
     )
     assert isinstance(prepared, PreparedDispatch)
-    return _store_value, workflow, workflow.mark_running(prepared, runtime_session_id="ses-executor")
+    running = workflow.mark_running(prepared, process_id=1234)
+    identified = workflow.record_session_id(running, runtime_session_id="ses-executor")
+    return _store_value, workflow, identified
 
 
 def test_bootstrap_is_self_contained_and_persisted(project: FixtureProject) -> None:
@@ -266,7 +268,8 @@ def test_reviewer_acceptance_is_fresh_policy_bound_and_revision_bound(project: F
     assert isinstance(prepared, PreparedDispatch)
     assert prepared.review_target is not None
     assert prepared.permission_config["permission"]["edit"] == "deny"
-    reviewer = workflow.mark_running(prepared, runtime_session_id="ses-reviewer")
+    running = workflow.mark_running(prepared, process_id=1235)
+    reviewer = workflow.record_session_id(running, runtime_session_id="ses-reviewer")
     review_result = parse_reviewer_result(
         {
             "result_version": 1,
@@ -306,7 +309,8 @@ def test_reviewer_changes_requested_returns_a_deterministic_rework_state(project
         supervisor_text=_dispatch_command(role="reviewer"),
     )
     assert isinstance(prepared, PreparedDispatch)
-    reviewer = workflow.mark_running(prepared, runtime_session_id="ses-reviewer")
+    running = workflow.mark_running(prepared, process_id=1235)
+    reviewer = workflow.record_session_id(running, runtime_session_id="ses-reviewer")
     review_result = parse_reviewer_result(
         {
             "result_version": 1,

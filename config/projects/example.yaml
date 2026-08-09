@@ -108,6 +108,7 @@ permission_policies:
       default: deny
       actions:
         inspect: allow
+        modify: deny
         verify: allow
     supervisor:
       default: deny

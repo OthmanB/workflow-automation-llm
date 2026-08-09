@@ -94,7 +94,7 @@ permission_policies:
       actions: {inspect: allow, modify: allow, verify: allow}
     reviewer-class:
       default: deny
-      actions: {inspect: allow, verify: allow}
+      actions: {inspect: allow, modify: deny, verify: allow}
     supervisor:
       default: deny
       actions: {}

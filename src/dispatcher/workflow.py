@@ -206,8 +206,14 @@ class DispatchRecord(ContractModel):
 
     @model_validator(mode="after")
     def validate_state_data(self) -> "DispatchRecord":
-        if self.state is DispatchStatus.RUNNING and self.runtime_session_id is None:
-            raise ValueError("running dispatch requires runtime_session_id")
+        if self.state is DispatchStatus.PREPARED and self.runtime_session_id is not None:
+            raise ValueError("prepared dispatch cannot have runtime_session_id")
+        if self.state in {
+            DispatchStatus.COMPLETED,
+            DispatchStatus.FORWARDED,
+            DispatchStatus.ACKNOWLEDGED,
+        } and self.runtime_session_id is None:
+            raise ValueError("completed dispatch requires runtime_session_id")
         if self.state in {
             DispatchStatus.COMPLETED,
             DispatchStatus.FORWARDED,
