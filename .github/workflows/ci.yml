@@ -38,4 +38,4 @@ jobs:
       - name: Verify packaged bootstrap template
         working-directory: /tmp
         run: |
-          /tmp/dispatcher-wheel/bin/python -c 'from importlib import resources; text = resources.files("dispatcher").joinpath("templates/bootstrap_supervisor.md").read_text(); assert "Authoritative Inputs" in text'
+          /tmp/dispatcher-wheel/bin/python -c 'import os; from importlib import resources; from pathlib import Path; text = resources.files("dispatcher").joinpath("templates/bootstrap_supervisor.md").read_text(); source = Path(os.environ["GITHUB_WORKSPACE"]) / "src/dispatcher/templates/bootstrap_supervisor.md"; assert text == source.read_text()'

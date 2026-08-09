@@ -228,6 +228,31 @@ def test_completion_guard_accepts_explicit_waiver_and_rejects_unresolved_review(
     }
 
 
+def test_completion_guard_rejects_failed_step_and_unresolved_operator_request(
+    project: FixtureProject,
+) -> None:
+    record = transition_run(_record(project), RunStatus.READY, _event(2))
+    running = transition_run(record, RunStatus.RUNNING, _event(3))
+    failed = running.steps["prepare-fixture"].model_copy(update={"state": StepStatus.FAILED})
+    request = OperatorRequest(
+        request_id="request-completion",
+        question="Reconcile failed work",
+        allowed_answers=["reconcile", "halt"],
+        context_ref="dispatch-failed",
+        resume_to=RunStatus.RUNNING,
+        expires_at=None,
+        required_role=None,
+    )
+    blocked = running.model_copy(
+        update={"steps": {"prepare-fixture": failed}, "operator_request": request}
+    )
+
+    assert {item.code for item in completion_obligations(blocked)} == {
+        "step_not_accepted",
+        "operator_request_unresolved",
+    }
+
+
 def test_run_record_persists_normalized_plan_and_digest(project: FixtureProject) -> None:
     record = _record(project)
 

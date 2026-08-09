@@ -258,6 +258,79 @@ def test_unknown_step_and_missing_session_fail_before_dispatch_persistence(proje
     assert store.load_run(record.run_id)[0].dispatches == {}
 
 
+def test_attempt_exhaustion_is_step_local(project: FixtureProject) -> None:
+    values = valid_plan_values(project)
+    second = json.loads(json.dumps(values["steps"][0]))
+    second.update(
+        {
+            "ordinal": 2,
+            "step_id": "second-fixture",
+            "title": "Second fixture",
+            "produced_outputs": [
+                {
+                    "artifact_id": "second-output",
+                    "producer_step_id": None,
+                    "description": "Second output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "second-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "second-evidence",
+                    "relative_path": "second.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    values["steps"].append(second)
+    plan = NormalizedPlan.model_validate(values)
+    event = _event(1)
+    record = new_run_record(
+        run_id="two-step-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-two-step-plan"),
+        event=event,
+    )
+    first = transition_step(record.steps["prepare-fixture"], StepStatus.READY, _event(2))
+    first = first.model_copy(update={"executor_attempts": 1})
+    second_record = transition_step(record.steps["second-fixture"], StepStatus.READY, _event(3))
+    record = record.model_copy(
+        update={
+            "steps": {
+                "prepare-fixture": first,
+                "second-fixture": second_record,
+            },
+            "sequence": 3,
+            "updated_at": second_record.last_event.occurred_at,
+        }
+    )
+    store = _store(project)
+    generation = store.create_run(record)
+    workflow = _workflow(project, store)
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    exhausted = json.loads(_dispatch_command())
+    second_command = dict(exhausted)
+    second_command["step_id"] = "second-fixture"
+
+    with pytest.raises(SequentialWorkflowError, match="exhausted executor attempts"):
+        workflow.prepare_from_supervisor(
+            active.run_id,
+            expected_generation=generation,
+            supervisor_text=json.dumps(exhausted),
+        )
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=json.dumps(second_command),
+    )
+
+    assert isinstance(prepared, PreparedDispatch)
+    assert prepared.dispatch.step_id == "second-fixture"
+
+
 def test_supervisor_completion_request_cannot_bypass_unmet_obligations(project: FixtureProject) -> None:
     store, workflow, record, generation = _activate_ready_run(project)
 

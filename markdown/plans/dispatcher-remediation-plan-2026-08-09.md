@@ -544,11 +544,11 @@ loop.
 
 **Actions:**
 
-- [ ] Acquire a run lease before bootstrap or resume.
+- [x] Acquire a run lease before bootstrap or resume.
 - [x] Include owner process, host, run ID, acquisition time, and heartbeat.
 - [x] Define stale-lease detection and operator-approved recovery.
-- [ ] Add repository and declared resource locks keyed by normalized IDs.
-- [ ] Reject a second dispatcher before it starts an OpenCode subprocess.
+- [x] Add repository and declared resource locks keyed by normalized IDs.
+- [x] Reject a second dispatcher before it starts an OpenCode subprocess.
 - [x] Add two-process contention and stale-owner fault tests.
 
 **Acceptance criteria:**
@@ -587,16 +587,16 @@ loop.
 
 **Actions:**
 
-- [ ] Commit `PREPARED` with exact prompt, policy, repository revision,
+- [x] Commit `PREPARED` with exact prompt, policy, repository revision,
   expected result, and idempotency key before subprocess launch.
-- [ ] Commit `RUNNING` with process and session metadata after launch.
-- [ ] Commit `COMPLETED` or `FAILED` with the exact result before forwarding.
-- [ ] Persist the complete supervisor forwarding payload before sending it.
-- [ ] Commit `FORWARDED` and `ACKNOWLEDGED` separately.
+- [x] Commit `RUNNING` with process and session metadata after launch.
+- [x] Commit `COMPLETED` or `FAILED` with the exact result before forwarding.
+- [x] Persist the complete supervisor forwarding payload before sending it.
+- [x] Commit `FORWARDED` and `ACKNOWLEDGED` separately.
 - [x] On startup, classify every unresolved dispatch by last durable state.
 - [x] Never automatically retry a potentially non-idempotent `RUNNING`
   dispatch.
-- [ ] Require operator reconciliation or an external idempotency proof before
+- [x] Require operator reconciliation or an external idempotency proof before
   retrying uncertain side effects.
 - [ ] Add crash injection at every transition boundary.
 
@@ -604,7 +604,7 @@ loop.
 
 - [ ] Every injected crash resumes into a deterministic recovery state.
 - [ ] Completed results are never lost before supervisor forwarding.
-- [ ] Potentially completed external side effects are never blindly repeated.
+- [x] Potentially completed external side effects are never blindly repeated.
 
 ### DISP-304: Separate start, resume, recover, and answer operations
 
@@ -648,17 +648,17 @@ directory hints.
 - [x] Include project ID, repository registry, exact specification files,
   selected plan files, normalized plan digest, source hashes, role registry,
   profile obligations, and current accepted baseline.
-- [ ] Include only schema-valid protocol examples generated from fixtures.
+- [x] Include only schema-valid protocol examples generated from fixtures.
 - [x] Include explicit dispatcher-enforced constraints and unsupported actions.
 - [x] Persist the rendered bootstrap and its hash before creating the session.
 - [x] Refuse bootstrap when source hashes or normalized plan approval are
   missing.
-- [ ] Package templates inside the wheel and test installed-path resolution.
+- [x] Package templates inside the wheel and test installed-path resolution.
 
 **Acceptance criteria:**
 
-- [ ] The supervisor never has to guess the selected plan or roles document.
-- [ ] The installed wheel renders the same bootstrap as the source checkout.
+- [x] The supervisor never has to guess the selected plan or roles document.
+- [x] The installed wheel renders the same bootstrap as the source checkout.
 
 ### DISP-401: Implement validated sequential dispatch
 
@@ -673,7 +673,7 @@ directory hints.
   policy.
 - [x] Derive working directory, repository policy, prompt constraints, evidence
   requirements, and logical session from dispatcher state.
-- [ ] Create one correlated dispatch attempt and execute through the Phase 2
+- [x] Create one correlated dispatch attempt and execute through the Phase 2
   adapter.
 - [x] Apply the typed result without interpreting free-form chat.
 - [x] Persist the next supervisor message before the next supervisor turn.
@@ -697,14 +697,14 @@ directory hints.
 - [x] Validate reviewer independence rules from compiled policy.
 - [x] Apply `accepted`, `changes_requested`, `blocked`, and `inconclusive`
   verdicts according to the state machine.
-- [ ] Resume the correct executor task for rework using logical session lineage.
+- [x] Resume the correct executor task for rework using logical session lineage.
 - [x] Preserve every review attempt and superseded verdict for audit.
 - [x] Reject acceptance when the reviewed revision no longer matches current
   work.
 
 **Acceptance criteria:**
 
-- [ ] A reviewer cannot mutate repositories under the tested reviewer policy.
+- [x] A reviewer cannot mutate repositories under the tested reviewer policy.
 - [x] Changes requested return the step to a deterministic rework state.
 - [x] Acceptance applies only to the exact reviewed revision.
 
@@ -719,15 +719,15 @@ directory hints.
 - [x] Return a structured unmet-obligations response when completion is denied.
 - [ ] Generate the final report from authoritative run, step, review, evidence,
   and audit data.
-- [ ] Commit `SUCCEEDED` and a terminal audit event only after report generation
+- [x] Commit `SUCCEEDED` and a terminal audit event only after report generation
   succeeds.
-- [ ] Add premature, complete, waived-step, unresolved-review, missing-evidence,
+- [x] Add premature, complete, waived-step, unresolved-review, missing-evidence,
   in-flight-dispatch, and failed-step tests.
 
 **Acceptance criteria:**
 
 - [x] No supervisor response alone can bypass required work or review.
-- [ ] Final reports identify exact accepted revisions and evidence hashes.
+- [x] Final reports identify exact accepted revisions and evidence hashes.
 
 ### DISP-404: Implement per-step rounds and failure semantics
 
@@ -740,13 +740,13 @@ step-level controls.
   step.
 - [x] Read all limits from validated YAML or normalized plan policy.
 - [x] Define which failures are retryable, blocked, escalated, or terminal.
-- [ ] Require operator approval before retrying uncertain external side effects.
+- [x] Require operator approval before retrying uncertain external side effects.
 - [x] Remove implicit mode changes such as resume-to-new fallback.
 - [ ] Add boundary and exhaustion tests for every counter.
 
 **Acceptance criteria:**
 
-- [ ] One stuck step cannot consume the allowance of unrelated steps.
+- [x] One stuck step cannot consume the allowance of unrelated steps.
 - [ ] Exceeded limits produce deterministic escalation or halt states.
 
 ### DISP-405: Import the existing private-project baseline
@@ -779,10 +779,10 @@ completed work.
 
 ### Phase 4 gate
 
-- [ ] A sequential executor-reviewer-rework-completion scenario passes end to
+- [x] A sequential executor-reviewer-rework-completion scenario passes end to
   end in a disposable local Git fixture.
-- [ ] Every premature completion case is rejected.
-- [ ] Failed subprocesses never advance workflow state.
+- [x] Every premature completion case is rejected.
+- [x] Failed subprocesses never advance workflow state.
 - [ ] The private reference baseline imports without executing work.
 - [ ] Real execution may be enabled only for disposable local repositories and
   non-sensitive test credentials after this gate.

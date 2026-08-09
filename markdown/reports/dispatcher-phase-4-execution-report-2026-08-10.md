@@ -11,7 +11,8 @@ reviewer verdicts, completion, step-local retries, and historical baseline APIs.
 `src/dispatcher/sequential.py` is the validated Phase 4 workflow facade. It
 uses only normalized plans, strict supervisor commands, typed worker results,
 compiled policies, durable dispatch intent/payloads, leases, and SQLite state.
-The legacy mock loop remains separate and real OpenCode launch remains blocked.
+`src/dispatcher/execution.py` connects it to the Phase 2 process adapter. The
+legacy CLI loop remains separate and real model-backed execution remains blocked.
 
 ## Implemented
 
@@ -39,6 +40,12 @@ The legacy mock loop remains separate and real OpenCode launch remains blocked.
   remains `PENDING`; changed historical evidence invalidates approval.
 - The README capability matrix now reflects the implemented adapter, policy,
   SQLite, workflow-facade, and baseline boundaries.
+- A disposable Git fixture completes supervisor, executor, reviewer rejection,
+  resumed executor rework, fresh reviewer acceptance, and guarded completion
+  through nine fake OpenCode 1.18.11-compatible subprocess calls.
+- Process start and session identification are distinct durable generations.
+  Nonzero exits, malformed JSONL, timeout, and post-commit failure enter durable
+  operator reconciliation without advancing the step.
 
 ## Verification
 
@@ -47,27 +54,25 @@ ruff check src tests
 All checks passed!
 
 mypy src
-Success: no issues found in 23 source files
+Success: no issues found in 24 source files
 
 pytest
-135 passed
+147 passed
 
 python -m build
 Successfully built dispatcher-0.1.0.tar.gz and dispatcher-0.1.0-py3-none-any.whl
 
-wheel bootstrap template: present
+clean wheel template: byte-for-byte source match
 ```
 
-No model-backed, repository-mutating, deployment, or infrastructure command
-was run during this phase.
+No model-backed, real-project-mutating, deployment, or infrastructure command
+was run. Repository writes occurred only inside disposable temporary Git fixtures.
 
 ## Remaining Phase 4 Work
 
-- The facade has not yet launched the Phase 2 OpenCode adapter because that
-  adapter cannot currently commit `RUNNING` at process start for a new session.
-  Real execution stays blocked.
 - Live OpenCode allow/ask/deny enforcement remains a Phase 2 open item.
 - Repository movement/worktree/patch handling belongs to Phase 5.
 - The private reference-project historical fixture and its independent per-step
   decisions are explicitly deferred until the generic framework is reviewed.
-- Exhaustive crash-window tests and legacy-loop replacement are not complete.
+- Exhaustive every-transition crash injection and legacy CLI-loop replacement
+  are not complete. The real execution guard remains in place.

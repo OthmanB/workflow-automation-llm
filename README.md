@@ -71,14 +71,14 @@ deliberately blocked until every workflow gate is wired through that facade.
 
 | Capability | Status | Current limitation |
 |---|---|---|
-| Mock supervisor/executor loop | Implemented for development | Canned scenario; not an acceptance test for real OpenCode |
+| Fake OpenCode sequential integration | Implemented | Disposable Git scenario covers execution, review rejection, rework, acceptance, and completion |
 | Schema-v1 project configuration | Implemented | Strict mock-only contract; real execution remains disabled |
 | Normalized plan, protocol, and state contracts | Implemented | The Phase 4 facade validates them; the legacy mock loop is not authoritative |
 | Basic path, Git, credential, and disk preflight | Partial | Phase 0 repairs pass; strict configuration remains Phase 1 |
 | Real OpenCode dispatch | Disabled | No real launch is permitted until the Phase 4 facade is the only execution path |
 | Permission enforcement | Partial | Effective policy is compiled and supplied to isolated child environments; live enforcement tests remain open |
-| Durable resume and crash recovery | Partial | SQLite generations, leases, recovery classification, and state commands exist; legacy loop integration remains open |
-| Reviewer and completion enforcement | Partial | The Phase 4 facade enforces typed results, reviewer verdicts, and completion; the legacy loop does not use it |
+| Durable resume and crash recovery | Partial | Transactional adapter lifecycle and major crash windows are tested; every-transition injection remains open |
+| Reviewer and completion enforcement | Implemented in the sequential coordinator | Real model-backed execution remains disabled |
 | Historical baseline | Partial | Read-only inspect and explicit approval keep unverifiable work pending by default |
 | Multi-repository execution | Unavailable | All sessions currently use one project root |
 | Profiles, budgets, and operator gates | Design only | Configuration is not mechanically enforced |
