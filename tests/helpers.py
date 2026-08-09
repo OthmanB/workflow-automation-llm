@@ -139,6 +139,12 @@ def create_fixture_project(
             "mode": "mock_only",
             "protocol_version": 1,
             "scheduling": "sequential",
+            "concurrency": {
+                "max_active_dispatches": 1,
+                "max_batch_size": 1,
+                "role_capacities": {"terra": 1, "reviewer": 1, "reviewer-two": 1},
+                "failure_mode": "wait_for_started",
+            },
             "default_repo_id": "fixture-repo",
             "timeout_seconds": 60,
             "termination_grace_seconds": 5,

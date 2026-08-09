@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError, field_validator
 
 from .config import ContractModel, Identifier
 
@@ -14,17 +14,39 @@ class ProtocolError(ValueError):
     """Supervisor output does not satisfy the executable command protocol."""
 
 
-class DispatchCommand(ContractModel):
-    """Request a single executor or reviewer dispatch by logical role key."""
+class DispatchRequest(ContractModel):
+    """One independently valid child request used by single and batch dispatches."""
 
-    protocol_version: Literal[1]
-    action: Literal["dispatch"]
     step_id: Identifier
     target_role: Identifier
     session_mode: Literal["new", "resume", "fork"]
     repo_id: Identifier | None = None
     prompt: Annotated[str, Field(min_length=1, max_length=50_000)]
     rationale: Annotated[str, Field(min_length=1, max_length=5000)] | None = None
+
+
+class DispatchCommand(DispatchRequest):
+    """Request a single executor or reviewer dispatch by logical role key."""
+
+    protocol_version: Literal[1]
+    action: Literal["dispatch"]
+
+
+class BatchDispatchCommand(ContractModel):
+    """Request an all-or-none set of independently validated child dispatches."""
+
+    protocol_version: Literal[2]
+    action: Literal["dispatch_batch"]
+    children: Annotated[list[DispatchRequest], Field(min_length=1, max_length=100)]
+    rationale: Annotated[str, Field(min_length=1, max_length=5000)] | None = None
+
+    @field_validator("children")
+    @classmethod
+    def _validate_unique_steps(cls, children: list[DispatchRequest]) -> list[DispatchRequest]:
+        step_ids = [child.step_id for child in children]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError("batch children must not target the same step")
+        return children
 
 
 class AskOperatorCommand(ContractModel):
@@ -63,7 +85,12 @@ class RequestCompletionCommand(ContractModel):
 
 
 SupervisorCommand: TypeAlias = Annotated[
-    DispatchCommand | AskOperatorCommand | RequestReviewWaiverCommand | HaltCommand | RequestCompletionCommand,
+    DispatchCommand
+    | BatchDispatchCommand
+    | AskOperatorCommand
+    | RequestReviewWaiverCommand
+    | HaltCommand
+    | RequestCompletionCommand,
     Field(discriminator="action"),
 ]
 _SUPERVISOR_COMMAND_ADAPTER: TypeAdapter[SupervisorCommand] = TypeAdapter(SupervisorCommand)

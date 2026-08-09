@@ -42,6 +42,48 @@
       "title": "BudgetDefinition",
       "type": "object"
     },
+    "ConcurrencyDefinition": {
+      "additionalProperties": false,
+      "description": "Explicit bounded-parallel controls for independently dispatchable work.",
+      "properties": {
+        "failure_mode": {
+          "const": "wait_for_started",
+          "title": "Failure Mode",
+          "type": "string"
+        },
+        "max_active_dispatches": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Active Dispatches",
+          "type": "integer"
+        },
+        "max_batch_size": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Batch Size",
+          "type": "integer"
+        },
+        "role_capacities": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "title": "Role Capacities",
+          "type": "object"
+        }
+      },
+      "required": [
+        "max_active_dispatches",
+        "max_batch_size",
+        "role_capacities",
+        "failure_mode"
+      ],
+      "title": "ConcurrencyDefinition",
+      "type": "object"
+    },
     "EvidencePolicy": {
       "additionalProperties": false,
       "description": "Explicit evidence integrity requirements used by normalized plans.",
@@ -75,8 +117,11 @@
     },
     "ExecutionDefinition": {
       "additionalProperties": false,
-      "description": "All active execution controls for the mock-only Phase 1 runtime.",
+      "description": "All active execution controls for the mock-only Phase 7 runtime.",
       "properties": {
+        "concurrency": {
+          "$ref": "#/$defs/ConcurrencyDefinition"
+        },
         "default_repo_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Default Repo Id",
@@ -119,7 +164,10 @@
           "type": "string"
         },
         "scheduling": {
-          "const": "sequential",
+          "enum": [
+            "sequential",
+            "bounded_parallel"
+          ],
           "title": "Scheduling",
           "type": "string"
         },
@@ -148,6 +196,7 @@
         "mode",
         "protocol_version",
         "scheduling",
+        "concurrency",
         "default_repo_id",
         "timeout_seconds",
         "termination_grace_seconds",

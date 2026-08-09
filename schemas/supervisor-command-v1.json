@@ -56,6 +56,52 @@
       "title": "AskOperatorCommand",
       "type": "object"
     },
+    "BatchDispatchCommand": {
+      "additionalProperties": false,
+      "description": "Request an all-or-none set of independently validated child dispatches.",
+      "properties": {
+        "action": {
+          "const": "dispatch_batch",
+          "title": "Action",
+          "type": "string"
+        },
+        "children": {
+          "items": {
+            "$ref": "#/$defs/DispatchRequest"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Children",
+          "type": "array"
+        },
+        "protocol_version": {
+          "const": 2,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "rationale": {
+          "anyOf": [
+            {
+              "maxLength": 5000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rationale"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action",
+        "children"
+      ],
+      "title": "BatchDispatchCommand",
+      "type": "object"
+    },
     "DispatchCommand": {
       "additionalProperties": false,
       "description": "Request a single executor or reviewer dispatch by logical role key.",
@@ -124,14 +170,80 @@
         }
       },
       "required": [
+        "step_id",
+        "target_role",
+        "session_mode",
+        "prompt",
         "protocol_version",
-        "action",
+        "action"
+      ],
+      "title": "DispatchCommand",
+      "type": "object"
+    },
+    "DispatchRequest": {
+      "additionalProperties": false,
+      "description": "One independently valid child request used by single and batch dispatches.",
+      "properties": {
+        "prompt": {
+          "maxLength": 50000,
+          "minLength": 1,
+          "title": "Prompt",
+          "type": "string"
+        },
+        "rationale": {
+          "anyOf": [
+            {
+              "maxLength": 5000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rationale"
+        },
+        "repo_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repo Id"
+        },
+        "session_mode": {
+          "enum": [
+            "new",
+            "resume",
+            "fork"
+          ],
+          "title": "Session Mode",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "target_role": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Target Role",
+          "type": "string"
+        }
+      },
+      "required": [
         "step_id",
         "target_role",
         "session_mode",
         "prompt"
       ],
-      "title": "DispatchCommand",
+      "title": "DispatchRequest",
       "type": "object"
     },
     "HaltCommand": {
@@ -239,6 +351,7 @@
     "mapping": {
       "ask_operator": "#/$defs/AskOperatorCommand",
       "dispatch": "#/$defs/DispatchCommand",
+      "dispatch_batch": "#/$defs/BatchDispatchCommand",
       "halt": "#/$defs/HaltCommand",
       "request_completion": "#/$defs/RequestCompletionCommand",
       "request_review_waiver": "#/$defs/RequestReviewWaiverCommand"
@@ -248,6 +361,9 @@
   "oneOf": [
     {
       "$ref": "#/$defs/DispatchCommand"
+    },
+    {
+      "$ref": "#/$defs/BatchDispatchCommand"
     },
     {
       "$ref": "#/$defs/AskOperatorCommand"

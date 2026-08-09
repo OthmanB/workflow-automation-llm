@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sqlite3
+import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -135,6 +136,7 @@ class StateStore:
         self.heartbeat_seconds = heartbeat_seconds
         self.stale_after_seconds = stale_after_seconds
         self._connection: sqlite3.Connection | None = None
+        self._connection_lock = threading.RLock()
         self._initialized = False
 
     def __enter__(self) -> StateStore:
@@ -250,17 +252,18 @@ class StateStore:
 
     def load_run(self, run_id: str) -> tuple[RunRecord, int]:
         """Load one authoritative run record and its generation."""
-        row = self._ready_connection().execute(
-            "SELECT record_json, generation FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if row is None:
-            raise StateStoreError(f"run not found: {run_id}")
-        try:
-            return RunRecord.model_validate_json(row["record_json"]), int(row["generation"])
-        except ValueError as exc:
-            raise StateStoreCorruptionError(
-                f"stored run {run_id} does not match the current workflow schema; recover from backup"
-            ) from exc
+        with self._connection_lock:
+            row = self._ready_connection().execute(
+                "SELECT record_json, generation FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateStoreError(f"run not found: {run_id}")
+            try:
+                return RunRecord.model_validate_json(row["record_json"]), int(row["generation"])
+            except ValueError as exc:
+                raise StateStoreCorruptionError(
+                    f"stored run {run_id} does not match the current workflow schema; recover from backup"
+                ) from exc
 
     def latest_run(self, project_id: str) -> tuple[RunRecord, int] | None:
         """Load the most recently updated run for one project."""
@@ -287,14 +290,15 @@ class StateStore:
     def sessions_for_run(self, run_id: str) -> dict[str, dict[str, dict[str, Any]]]:
         """Load the dispatcher-owned session registry for one run."""
         sessions: dict[str, dict[str, dict[str, Any]]] = {}
-        rows = self._ready_connection().execute(
-            "SELECT pool, role_key, session_json FROM sessions WHERE run_id = ? ORDER BY pool, role_key",
-            (run_id,),
-        ).fetchall()
-        for row in rows:
-            sessions.setdefault(str(row["pool"]), {})[str(row["role_key"])] = json.loads(
-                row["session_json"]
-            )
+        with self._connection_lock:
+            rows = self._ready_connection().execute(
+                "SELECT pool, role_key, session_json FROM sessions WHERE run_id = ? ORDER BY pool, role_key",
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                sessions.setdefault(str(row["pool"]), {})[str(row["role_key"])] = json.loads(
+                    row["session_json"]
+                )
         return sessions
 
     def acquire_run_lease(
@@ -437,6 +441,37 @@ class StateStore:
                     session_metadata=session_metadata,
                 )
             },
+        )
+
+    def prepare_dispatch_batch(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        dispatch_payloads: Mapping[str, DispatchPayload],
+    ) -> int:
+        """Atomically persist every prepared child and exact private batch inputs."""
+        if not dispatch_payloads:
+            raise StateStoreError("prepared batch requires at least one dispatch payload")
+        for dispatch_id, payload in dispatch_payloads.items():
+            try:
+                dispatch = record.dispatches[dispatch_id]
+            except KeyError as exc:
+                raise StateStoreError(f"batch payload references unknown dispatch: {dispatch_id}") from exc
+            if dispatch.state is not DispatchStatus.PREPARED:
+                raise StateStoreError("batch payload requires PREPARED dispatches")
+            if hashlib.sha256(payload.prompt.encode("utf-8")).hexdigest() != dispatch.intent.prompt_sha256:
+                raise StateStoreError("batch dispatch prompt does not match durable prompt_sha256")
+            if _sha256_json(payload.policy) != dispatch.intent.policy_digest:
+                raise StateStoreError("batch dispatch policy does not match durable policy_digest")
+            if payload.repository_before is None or (
+                payload.repository_before.get("repo_id") != dispatch.intent.repository.repo_id
+            ):
+                raise StateStoreError("batch prepared repository snapshot does not match dispatch repository")
+        return self.save_run(
+            record,
+            expected_generation=expected_generation,
+            dispatch_payloads=dispatch_payloads,
         )
 
     def update_dispatch_payload(
@@ -608,40 +643,41 @@ class StateStore:
 
     def load_dispatch_payload(self, run_id: str, dispatch_id: str) -> DispatchPayload:
         """Return the exact private inputs and outputs associated with one dispatch."""
-        row = self._ready_connection().execute(
-            """
-            SELECT prompt, policy_json, result_json, forwarding_payload, process_id, session_metadata_json,
-                   repository_before_json, repository_after_json
-            FROM dispatch_payloads WHERE run_id = ? AND dispatch_id = ?
-            """,
-            (run_id, dispatch_id),
-        ).fetchone()
-        if row is None:
-            raise StateStoreError(f"dispatch payload not found: {dispatch_id}")
-        return DispatchPayload(
-            prompt=str(row["prompt"]),
-            policy=json.loads(row["policy_json"]),
-            result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
-            forwarding_payload=(
-                str(row["forwarding_payload"]) if row["forwarding_payload"] is not None else None
-            ),
-            process_id=int(row["process_id"]) if row["process_id"] is not None else None,
-            session_metadata=(
-                json.loads(row["session_metadata_json"])
-                if row["session_metadata_json"] is not None
-                else None
-            ),
-            repository_before=(
-                json.loads(row["repository_before_json"])
-                if row["repository_before_json"] is not None
-                else None
-            ),
-            repository_after=(
-                json.loads(row["repository_after_json"])
-                if row["repository_after_json"] is not None
-                else None
-            ),
-        )
+        with self._connection_lock:
+            row = self._ready_connection().execute(
+                """
+                SELECT prompt, policy_json, result_json, forwarding_payload, process_id, session_metadata_json,
+                       repository_before_json, repository_after_json
+                FROM dispatch_payloads WHERE run_id = ? AND dispatch_id = ?
+                """,
+                (run_id, dispatch_id),
+            ).fetchone()
+            if row is None:
+                raise StateStoreError(f"dispatch payload not found: {dispatch_id}")
+            return DispatchPayload(
+                prompt=str(row["prompt"]),
+                policy=json.loads(row["policy_json"]),
+                result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
+                forwarding_payload=(
+                    str(row["forwarding_payload"]) if row["forwarding_payload"] is not None else None
+                ),
+                process_id=int(row["process_id"]) if row["process_id"] is not None else None,
+                session_metadata=(
+                    json.loads(row["session_metadata_json"])
+                    if row["session_metadata_json"] is not None
+                    else None
+                ),
+                repository_before=(
+                    json.loads(row["repository_before_json"])
+                    if row["repository_before_json"] is not None
+                    else None
+                ),
+                repository_after=(
+                    json.loads(row["repository_after_json"])
+                    if row["repository_after_json"] is not None
+                    else None
+                ),
+            )
 
     def classify_recovery(self, run_id: str) -> list[RecoveryItem]:
         """Classify unresolved dispatches without launching or retrying any work."""
@@ -1127,6 +1163,12 @@ class StateStore:
                 f"| `{dispatch.dispatch_id}` | `{dispatch.state.value}` | {dispatch.attempt} | "
                 f"`{dispatch.runtime_session_id or ''}` | `{revision}` |"
             )
+        lines.extend(["", "## Batches", "", "| Batch | State | Children | Failed children |", "|---|---|---|---|"])
+        for batch in sorted(record.batches.values(), key=lambda value: value.batch_id):
+            lines.append(
+                f"| `{batch.batch_id}` | `{batch.state.value}` | "
+                f"`{', '.join(batch.dispatch_ids)}` | `{', '.join(batch.failed_dispatch_ids)}` |"
+            )
         lines.extend(
             [
                 "",
@@ -1233,16 +1275,17 @@ class StateStore:
 
     @contextmanager
     def _transaction(self, connection: sqlite3.Connection) -> Iterator[None]:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            yield
-            connection.execute("COMMIT")
-        except sqlite3.DatabaseError as exc:
-            connection.execute("ROLLBACK")
-            raise StateStoreError(f"authoritative state transaction failed: {exc}") from exc
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
+        with self._connection_lock:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield
+                connection.execute("COMMIT")
+            except sqlite3.DatabaseError as exc:
+                connection.execute("ROLLBACK")
+                raise StateStoreError(f"authoritative state transaction failed: {exc}") from exc
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
 
     def _migrate(self, connection: sqlite3.Connection) -> None:
         connection.execute(

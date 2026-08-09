@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from typing import Any
 from .config import Config
 from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
 from .results import parse_executor_result, parse_reviewer_result
-from .sequential import CompletionDecision, PreparedDispatch, SequentialWorkflow
+from .sequential import CompletionDecision, PreparedBatch, PreparedDispatch, SequentialWorkflow
 from .sessions import (
     SessionLifecycleCallbacks,
     SessionResult,
@@ -35,6 +37,17 @@ class WorkerOutcome:
     generation: int
     dispatch_id: str
     forwarding: str
+
+
+@dataclass(frozen=True)
+class BatchOutcome:
+    """One joined batch result with every successful forwarding identified."""
+
+    record: RunRecord
+    generation: int
+    batch_id: str
+    forwarding: str
+    forwarded_dispatch_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -64,6 +77,7 @@ class SequentialExecutionCoordinator:
         self.owner_id = owner_id
         self._session_runner = session_runner
         self._run_lease_key = f"run:{config.project_id}"
+        self._heartbeat_lock = threading.Lock()
 
     def acquire_run(self, run_id: str) -> None:
         """Acquire the single-writer run lease before bootstrap or resume."""
@@ -79,7 +93,8 @@ class SequentialExecutionCoordinator:
 
     def heartbeat(self) -> None:
         """Refresh the run lease around every external process boundary."""
-        self.store.heartbeat_leases(owner_id=self.owner_id, resource_keys=[self._run_lease_key])
+        with self._heartbeat_lock:
+            self.store.heartbeat_leases(owner_id=self.owner_id, resource_keys=[self._run_lease_key])
 
     def run_supervisor_turn(
         self,
@@ -216,6 +231,7 @@ class SequentialExecutionCoordinator:
                     permission_config=current.permission_config,
                     auto_approve=current.auto_approve,
                     lease_keys=current.lease_keys,
+                    lease_owner_id=current.lease_owner_id,
                     review_target=current.review_target,
                     session_mode=current.session_mode,
                     session_id=current.session_id,
@@ -228,6 +244,37 @@ class SequentialExecutionCoordinator:
             raise
         self.heartbeat()
         return WorkerOutcome(record, generation, current.dispatch.dispatch_id, forwarding)
+
+    def execute_batch(self, prepared: PreparedBatch) -> BatchOutcome:
+        """Run all atomically prepared children within the configured global bound."""
+        outcomes: list[WorkerOutcome] = []
+        with ThreadPoolExecutor(
+            max_workers=min(
+                len(prepared.dispatches),
+                self.config.execution.concurrency.max_active_dispatches,
+            ),
+            thread_name_prefix="dispatcher-worker",
+        ) as executor:
+            futures = [executor.submit(self.execute_worker, child) for child in prepared.dispatches]
+            for future in futures:
+                try:
+                    outcomes.append(future.result())
+                except Exception:
+                    # The worker boundary persisted its own failed dispatch state before raising.
+                    continue
+        _record, current_generation = self.store.load_run(prepared.run_id)
+        record, generation, forwarding = self.workflow.finalize_batch(
+            prepared.run_id,
+            expected_generation=current_generation,
+            batch_id=prepared.batch_id,
+        )
+        return BatchOutcome(
+            record=record,
+            generation=generation,
+            batch_id=prepared.batch_id,
+            forwarding=forwarding,
+            forwarded_dispatch_ids=tuple(outcome.dispatch_id for outcome in outcomes),
+        )
 
     def run_to_completion(
         self,
@@ -246,7 +293,7 @@ class SequentialExecutionCoordinator:
             )
             supervisor_session_id: str | None = None
             supervisor_prompt = bootstrap
-            pending_acknowledgement: str | None = None
+            pending_acknowledgements: list[str] = []
             for _turn in range(max_turns):
                 supervisor = self.run_supervisor_turn(
                     run_id,
@@ -256,13 +303,14 @@ class SequentialExecutionCoordinator:
                 )
                 supervisor_session_id = supervisor.session_id
                 generation = supervisor.generation
-                if pending_acknowledgement is not None:
-                    record, generation = self.workflow.acknowledge_forwarding(
-                        run_id,
-                        expected_generation=generation,
-                        dispatch_id=pending_acknowledgement,
-                    )
-                    pending_acknowledgement = None
+                if pending_acknowledgements:
+                    for dispatch_id in pending_acknowledgements:
+                        record, generation = self.workflow.acknowledge_forwarding(
+                            run_id,
+                            expected_generation=generation,
+                            dispatch_id=dispatch_id,
+                        )
+                    pending_acknowledgements = []
                     record, generation = self.workflow.refresh_readiness(record, generation)
                 action = self.workflow.prepare_from_supervisor(
                     run_id,
@@ -279,7 +327,19 @@ class SequentialExecutionCoordinator:
                             report_path=None,
                         )
                     supervisor_prompt = worker.forwarding
-                    pending_acknowledgement = worker.dispatch_id
+                    pending_acknowledgements = [worker.dispatch_id]
+                    continue
+                if isinstance(action, PreparedBatch):
+                    batch = self.execute_batch(action)
+                    generation = batch.generation
+                    if batch.record.state is not RunStatus.RUNNING:
+                        return CompletionDecision(
+                            accepted=False,
+                            obligations=(f"run stopped by batch policy: {batch.record.state.value}",),
+                            report_path=None,
+                        )
+                    supervisor_prompt = batch.forwarding
+                    pending_acknowledgements = list(batch.forwarded_dispatch_ids)
                     continue
                 if isinstance(action, CompletionDecision):
                     if not action.accepted:

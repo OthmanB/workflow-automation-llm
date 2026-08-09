@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import wraps
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal, Mapping, Protocol, cast
+from typing import Any, Callable, Literal, Mapping, Protocol, TypeVar, cast
 
 from .config import Config
 from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
@@ -17,6 +19,7 @@ from .plan import PlanError, PlanStep, validate_plan_approval, verify_plan_sourc
 from .policy import PolicyError, compile_run_policy
 from .protocol import (
     AskOperatorCommand,
+    BatchDispatchCommand,
     DispatchCommand,
     HaltCommand,
     RequestCompletionCommand,
@@ -42,8 +45,11 @@ from .results import (
     validate_executor_result_context,
     validate_reviewer_result_context,
 )
-from .state_store import StateStore
+from .scheduler import SchedulingError, resource_keys, validate_batch
+from .state_store import DispatchPayload, StateStore
 from .workflow import (
+    BatchRecord,
+    BatchStatus,
     CompiledReviewObligation,
     DispatchIntent,
     DispatchRecord,
@@ -57,6 +63,7 @@ from .workflow import (
     UsageAmount,
     UsageLedger,
     completion_obligations,
+    transition_batch,
     transition_run,
     transition_step,
 )
@@ -79,6 +86,21 @@ class SequentialWorkflowError(ValueError):
     """A supervisor request or worker result violates dispatcher-owned invariants."""
 
 
+T = TypeVar("T")
+
+
+def _serialized_transition(method: Callable[..., T]) -> Callable[..., T]:
+    """Serialize run mutations while worker processes continue concurrently."""
+
+    @wraps(method)
+    def wrapped(*args: Any, **kwargs: Any) -> T:
+        workflow = cast("SequentialWorkflow", args[0])
+        with workflow._transition_lock:
+            return method(*args, **kwargs)
+
+    return wrapped
+
+
 @dataclass(frozen=True)
 class PreparedDispatch:
     """The only launchable dispatch state returned by the sequential facade."""
@@ -91,6 +113,7 @@ class PreparedDispatch:
     permission_config: dict[str, Any]
     auto_approve: bool
     lease_keys: tuple[str, ...]
+    lease_owner_id: str
     review_target: ReviewTarget | None
     session_mode: Literal["new", "resume", "fork"]
     session_id: str | None
@@ -104,6 +127,16 @@ class CompletionDecision:
     accepted: bool
     obligations: tuple[str, ...]
     report_path: Path | None
+
+
+@dataclass(frozen=True)
+class PreparedBatch:
+    """An atomically prepared group of independently launchable dispatches."""
+
+    run_id: str
+    generation: int
+    batch_id: str
+    dispatches: tuple[PreparedDispatch, ...]
 
 
 class SequentialWorkflow:
@@ -126,6 +159,7 @@ class SequentialWorkflow:
         self.store = store
         self.owner_id = owner_id
         self._repository_inspector = repository_inspector
+        self._transition_lock = threading.RLock()
 
     def render_bootstrap(self, run_id: str) -> tuple[str, Path]:
         """Render and persist a self-contained bootstrap from one approved run."""
@@ -197,6 +231,12 @@ class SequentialWorkflow:
                 for dependency_id in plan_step.depends_on
             ):
                 continue
+            if any(
+                artifact.producer_step_id is not None
+                and steps[artifact.producer_step_id].state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}
+                for artifact in plan_step.required_inputs
+            ):
+                continue
             sequence += 1
             event = self._event(
                 record,
@@ -221,7 +261,7 @@ class SequentialWorkflow:
         *,
         expected_generation: int,
         supervisor_text: str,
-    ) -> PreparedDispatch | CompletionDecision | RunRecord:
+    ) -> PreparedDispatch | PreparedBatch | CompletionDecision | RunRecord:
         """Parse and apply one strict supervisor command without launching a process."""
         command = parse_supervisor_command(supervisor_text)
         record, generation = self.store.load_run(run_id)
@@ -229,6 +269,8 @@ class SequentialWorkflow:
             raise SequentialWorkflowError("run generation changed before supervisor command")
         if isinstance(command, DispatchCommand):
             return self.prepare_dispatch(record, generation, command)
+        if isinstance(command, BatchDispatchCommand):
+            return self.prepare_batch(record, generation, command)
         if isinstance(command, RequestCompletionCommand):
             return self.evaluate_completion(record, generation)
         if isinstance(command, AskOperatorCommand):
@@ -251,7 +293,7 @@ class SequentialWorkflow:
         """Commit a fully validated PREPARED dispatch before any worker launch."""
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a dispatch")
-        if any(
+        if self.config.execution.scheduling == "sequential" and any(
             dispatch.state
             in {
                 DispatchStatus.PREPARED,
@@ -262,6 +304,11 @@ class SequentialWorkflow:
             for dispatch in record.dispatches.values()
         ):
             raise SequentialWorkflowError("sequential workflow already has an unresolved dispatch")
+        if self.config.execution.scheduling == "bounded_parallel":
+            try:
+                validate_batch(self.config, record, (command,))
+            except SchedulingError as exc:
+                raise SequentialWorkflowError(f"dispatch is not schedulable: {exc}") from exc
         step = _plan_step(record, command.step_id)
         if command.repo_id is not None and command.repo_id != step.repo_id:
             raise SequentialWorkflowError(
@@ -344,10 +391,11 @@ class SequentialWorkflow:
             update={"steps": steps, "dispatches": dispatches, "sequence": event.sequence, "updated_at": event.occurred_at}
         )
         lease_keys = _lease_keys(step)
+        lease_owner_id = _dispatch_lease_owner_id(self.owner_id, dispatch_id)
         session_id = self._owned_session_id(record.run_id, role_kind, command.target_role, command.session_mode)
         self.store.acquire_resource_leases(
             run_id=record.run_id,
-            owner_id=self.owner_id,
+            owner_id=lease_owner_id,
             resource_keys=lease_keys,
         )
         try:
@@ -367,7 +415,7 @@ class SequentialWorkflow:
                 },
             )
         except Exception:
-            self.store.release_leases(owner_id=self.owner_id, resource_keys=lease_keys)
+            self.store.release_leases(owner_id=lease_owner_id, resource_keys=lease_keys)
             raise
         return PreparedDispatch(
             run_id=record.run_id,
@@ -378,12 +426,209 @@ class SequentialWorkflow:
             permission_config=policy,
             auto_approve=should_auto_approve(policy_rules),
             lease_keys=lease_keys,
+            lease_owner_id=lease_owner_id,
             review_target=review_target,
             session_mode=command.session_mode,
             session_id=session_id,
             repository_before=repository_before,
         )
 
+    def prepare_batch(
+        self,
+        record: RunRecord,
+        generation: int,
+        command: BatchDispatchCommand,
+    ) -> PreparedBatch:
+        """Atomically prepare every independently valid child in a protocol-v2 batch."""
+        if record.state is not RunStatus.RUNNING:
+            raise SequentialWorkflowError("only RUNNING runs may prepare a batch")
+        try:
+            children = validate_batch(self.config, record, tuple(command.children))
+        except SchedulingError as exc:
+            raise SequentialWorkflowError(f"batch is not schedulable: {exc}") from exc
+
+        batch_id = f"batch-{uuid.uuid4().hex}"
+        working = record
+        prepared_children: list[PreparedDispatch] = []
+        for child in children:
+            step = _plan_step(working, child.step_id)
+            if child.repo_id is not None and child.repo_id != step.repo_id:
+                raise SequentialWorkflowError(
+                    f"supervisor repository assertion {child.repo_id!r} does not match step repository {step.repo_id!r}"
+                )
+            role_kind = self._role_kind(child.target_role)
+            if not working.steps[step.step_id].operator_gate_resolved:
+                raise SequentialWorkflowError(f"batch step {step.step_id} has an unresolved operator gate")
+            self._ensure_budget_allows_dispatch(
+                working,
+                step,
+                role_key=child.target_role,
+                session_mode=child.session_mode,
+            )
+            self._validate_step_readiness(working, step, role_kind, child.session_mode, child.target_role)
+            workdir = self.config.repository_root(step.repo_id)
+            repository_before = self._inspect_repository(step.repo_id, require_clean=True)
+            policy = generate_opencode_config(
+                compile_effective_policy(
+                    self.config,
+                    repo_id=step.repo_id,
+                    role_key=child.target_role,
+                    dispatch_authorized_actions=step.authorization.authorized_actions,
+                )
+            )
+            step_record = working.steps[step.step_id]
+            attempt = (
+                step_record.executor_attempts + 1
+                if role_kind == "executor"
+                else step_record.reviewer_attempts + 1
+            )
+            dispatch_id = f"dispatch-{uuid.uuid4().hex}"
+            event = self._event(
+                working,
+                "dispatcher",
+                f"prepared {role_kind} batch dispatch",
+                dispatch_id,
+            )
+            review_target = self._review_target(working, step) if role_kind == "reviewer" else None
+            worker_prompt = _worker_prompt(
+                dispatch_id=dispatch_id,
+                attempt=attempt,
+                role_kind=role_kind,
+                step=step,
+                task=child.prompt,
+                repository=repository_before.dispatch_coordinate(),
+                review_target=review_target,
+            )
+            dispatch = DispatchRecord(
+                dispatch_id=dispatch_id,
+                batch_id=batch_id,
+                step_id=step.step_id,
+                role_key=child.target_role,
+                role_kind=role_kind,
+                attempt=attempt,
+                logical_session_key=f"{role_kind}-{child.target_role}-{step.step_id}",
+                runtime_session_id=None,
+                state=DispatchStatus.PREPARED,
+                intent=DispatchIntent(
+                    prompt_sha256=_sha256_text(worker_prompt),
+                    policy_digest=_sha256_json(policy),
+                    expected_result_kind=role_kind,
+                    repository=repository_before.dispatch_coordinate(),
+                    idempotency_key=f"idempotency-{uuid.uuid4().hex}",
+                ),
+                result_digest=None,
+                forwarding_digest=None,
+                last_event=event,
+            )
+            target_state = StepStatus.EXECUTING if role_kind == "executor" else StepStatus.REVIEWING
+            transitioned_step = transition_step(
+                step_record,
+                target_state,
+                event,
+                active_dispatch_id=dispatch_id,
+            ).model_copy(
+                update={
+                    "executor_attempts": attempt if role_kind == "executor" else step_record.executor_attempts,
+                    "reviewer_attempts": attempt if role_kind == "reviewer" else step_record.reviewer_attempts,
+                    "reassignment_role_key": (
+                        None if role_kind == "executor" else step_record.reassignment_role_key
+                    ),
+                }
+            )
+            steps = dict(working.steps)
+            steps[step.step_id] = transitioned_step
+            dispatches = dict(working.dispatches)
+            dispatches[dispatch_id] = dispatch
+            working = working.model_copy(
+                update={
+                    "steps": steps,
+                    "dispatches": dispatches,
+                    "sequence": event.sequence,
+                    "updated_at": event.occurred_at,
+                }
+            )
+            lease_keys = _lease_keys(step)
+            prepared_children.append(
+                PreparedDispatch(
+                    run_id=record.run_id,
+                    generation=generation,
+                    dispatch=dispatch,
+                    prompt=worker_prompt,
+                    workdir=workdir,
+                    permission_config=policy,
+                    auto_approve=should_auto_approve(policy["permission"]),
+                    lease_keys=lease_keys,
+                    lease_owner_id=_dispatch_lease_owner_id(self.owner_id, dispatch_id),
+                    review_target=review_target,
+                    session_mode=child.session_mode,
+                    session_id=self._owned_session_id(
+                        record.run_id,
+                        role_kind,
+                        child.target_role,
+                        child.session_mode,
+                    ),
+                    repository_before=repository_before,
+                )
+            )
+
+        batch_event = self._event(working, "dispatcher", "prepared dispatch batch", batch_id)
+        batch = BatchRecord(
+            batch_id=batch_id,
+            dispatch_ids=tuple(item.dispatch.dispatch_id for item in prepared_children),
+            state=BatchStatus.PREPARED,
+            failure_mode=self.config.execution.concurrency.failure_mode,
+            last_event=batch_event,
+        )
+        batches = dict(working.batches)
+        batches[batch_id] = batch
+        working = working.model_copy(
+            update={"batches": batches, "sequence": batch_event.sequence, "updated_at": batch_event.occurred_at}
+        )
+        acquired: list[PreparedDispatch] = []
+        try:
+            for prepared in prepared_children:
+                self.store.acquire_resource_leases(
+                    run_id=record.run_id,
+                    owner_id=prepared.lease_owner_id,
+                    resource_keys=prepared.lease_keys,
+                )
+                acquired.append(prepared)
+            next_generation = self.store.prepare_dispatch_batch(
+                working,
+                expected_generation=generation,
+                dispatch_payloads={
+                    prepared.dispatch.dispatch_id: DispatchPayload(
+                        prompt=prepared.prompt,
+                        policy=prepared.permission_config,
+                        repository_before=prepared.repository_before.model_dump(mode="json"),
+                        session_metadata={
+                            "session_mode": prepared.session_mode,
+                            "parent_session_id": prepared.session_id,
+                            "review_target": (
+                                prepared.review_target.model_dump(mode="json")
+                                if prepared.review_target is not None
+                                else None
+                            ),
+                        },
+                    )
+                    for prepared in prepared_children
+                },
+            )
+        except Exception:
+            for prepared in acquired:
+                self.store.release_leases(
+                    owner_id=prepared.lease_owner_id,
+                    resource_keys=prepared.lease_keys,
+                )
+            raise
+        return PreparedBatch(
+            run_id=record.run_id,
+            generation=next_generation,
+            batch_id=batch_id,
+            dispatches=tuple(replace(item, generation=next_generation) for item in prepared_children),
+        )
+
+    @_serialized_transition
     def mark_running(
         self,
         prepared: PreparedDispatch,
@@ -392,8 +637,26 @@ class SequentialWorkflow:
     ) -> PreparedDispatch:
         """Durably record a worker launch before accepting any worker result."""
         record, generation = self.store.load_run(prepared.run_id)
-        if generation != prepared.generation:
+        if generation != prepared.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("prepared dispatch generation is stale")
+        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        if dispatch.batch_id is not None:
+            batch = record.batches[dispatch.batch_id]
+            if batch.state is BatchStatus.PREPARED:
+                batch_event = self._event(record, "dispatcher", "batch worker process launched", batch.batch_id)
+                batches = dict(record.batches)
+                batches[batch.batch_id] = transition_batch(
+                    batch,
+                    BatchStatus.RUNNING,
+                    batch_event,
+                )
+                record = record.model_copy(
+                    update={
+                        "batches": batches,
+                        "sequence": batch_event.sequence,
+                        "updated_at": batch_event.occurred_at,
+                    }
+                )
         event = self._event(record, "dispatcher", "worker process launched", prepared.dispatch.dispatch_id)
         updated, next_generation = self.store.commit_dispatch_transition(
             record,
@@ -412,12 +675,14 @@ class SequentialWorkflow:
             permission_config=prepared.permission_config,
             auto_approve=prepared.auto_approve,
             lease_keys=prepared.lease_keys,
+            lease_owner_id=prepared.lease_owner_id,
             review_target=prepared.review_target,
             session_mode=prepared.session_mode,
             session_id=prepared.session_id,
             repository_before=prepared.repository_before,
         )
 
+    @_serialized_transition
     def record_session_id(
         self,
         running: PreparedDispatch,
@@ -426,13 +691,14 @@ class SequentialWorkflow:
     ) -> PreparedDispatch:
         """Bind the first validated OpenCode session ID to the running attempt."""
         record, generation = self.store.load_run(running.run_id)
-        if generation != running.generation:
+        if generation != running.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("running dispatch generation is stale")
         dispatch = record.dispatches[running.dispatch.dispatch_id]
         if dispatch.state is not DispatchStatus.RUNNING:
             raise SequentialWorkflowError("session ID arrived for a dispatch that is not RUNNING")
         event = self._event(record, "dispatcher", "OpenCode session identified", dispatch.dispatch_id)
         pool = "executors" if dispatch.role_kind == "executor" else "reviewers"
+        session_registry_key = dispatch.logical_session_key if dispatch.batch_id is not None else dispatch.role_key
         updated, next_generation = self.store.bind_dispatch_session(
             record,
             expected_generation=generation,
@@ -440,10 +706,11 @@ class SequentialWorkflow:
             runtime_session_id=runtime_session_id,
             event=event,
             pool=pool,
-            role_key=dispatch.role_key,
+            role_key=session_registry_key,
             session_entry={
                 "session_id": runtime_session_id,
                 "logical_session_key": dispatch.logical_session_key,
+                "role_key": dispatch.role_key,
                 "working_directory": str(running.workdir),
                 "status": "active",
             },
@@ -457,12 +724,14 @@ class SequentialWorkflow:
             permission_config=running.permission_config,
             auto_approve=running.auto_approve,
             lease_keys=running.lease_keys,
+            lease_owner_id=running.lease_owner_id,
             review_target=running.review_target,
             session_mode=running.session_mode,
             session_id=running.session_id,
             repository_before=running.repository_before,
         )
 
+    @_serialized_transition
     def apply_executor_result(
         self,
         prepared: PreparedDispatch,
@@ -474,7 +743,7 @@ class SequentialWorkflow:
         if prepared.dispatch.role_kind != "executor":
             raise SequentialWorkflowError("executor result does not match a reviewer dispatch")
         record, generation = self.store.load_run(prepared.run_id)
-        if generation != prepared.generation:
+        if generation != prepared.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("running dispatch generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
         record, generation = self._record_usage(record, generation, dispatch, usage)
@@ -569,11 +838,12 @@ class SequentialWorkflow:
             forwarding_digest=_sha256_text(forwarding),
             forwarding_payload=forwarding,
         )
-        self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
+        self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         if escalation_required:
             return self._request_escalation(record, generation, step, dispatch, forwarding)
         return self._apply_budget_limit(record, generation, dispatch, forwarding)
 
+    @_serialized_transition
     def apply_reviewer_result(
         self,
         prepared: PreparedDispatch,
@@ -585,7 +855,7 @@ class SequentialWorkflow:
         if prepared.dispatch.role_kind != "reviewer" or prepared.review_target is None:
             raise SequentialWorkflowError("reviewer result does not match a prepared review dispatch")
         record, generation = self.store.load_run(prepared.run_id)
-        if generation != prepared.generation:
+        if generation != prepared.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("running review generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
         record, generation = self._record_usage(record, generation, dispatch, usage)
@@ -747,7 +1017,7 @@ class SequentialWorkflow:
             forwarding_digest=_sha256_text(forwarding),
             forwarding_payload=forwarding,
         )
-        self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
+        self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         if escalation_required:
             return self._request_escalation(record, generation, step, dispatch, forwarding)
         return self._apply_budget_limit(record, generation, dispatch, forwarding)
@@ -772,6 +1042,7 @@ class SequentialWorkflow:
             event=event,
         )
 
+    @_serialized_transition
     def fail_dispatch(
         self,
         prepared: PreparedDispatch,
@@ -780,7 +1051,7 @@ class SequentialWorkflow:
     ) -> tuple[RunRecord, int]:
         """Record a failed adapter/result boundary without advancing the plan step."""
         record, generation = self.store.load_run(prepared.run_id)
-        if generation != prepared.generation:
+        if generation != prepared.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("failed dispatch generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
         if dispatch.state is DispatchStatus.PREPARED:
@@ -815,7 +1086,7 @@ class SequentialWorkflow:
                 f"failed dispatch has incompatible step state {step.state.value}"
             )
         record, generation = self._replace_step(record, generation, updated_step)
-        if dispatch.state is DispatchStatus.RUNNING:
+        if dispatch.state is DispatchStatus.RUNNING and dispatch.batch_id is None:
             request_event = self._event(
                 record,
                 "dispatcher",
@@ -843,8 +1114,94 @@ class SequentialWorkflow:
                 operator_request=request,
             )
             generation = self.store.save_run(record, expected_generation=generation)
-        self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
+        self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         return record, generation
+
+    @_serialized_transition
+    def finalize_batch(
+        self,
+        run_id: str,
+        *,
+        expected_generation: int,
+        batch_id: str,
+    ) -> tuple[RunRecord, int, str]:
+        """Join completed child attempts and expose every child disposition to the supervisor."""
+        record, generation = self.store.load_run(run_id)
+        if generation != expected_generation and self.config.execution.scheduling == "sequential":
+            raise SequentialWorkflowError("batch generation is stale")
+        try:
+            batch = record.batches[batch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown batch {batch_id}") from exc
+        if batch.state not in {BatchStatus.PREPARED, BatchStatus.RUNNING}:
+            raise SequentialWorkflowError(f"batch {batch_id} is already joined")
+        child_dispatches = [record.dispatches[dispatch_id] for dispatch_id in batch.dispatch_ids]
+        unresolved = [
+            dispatch.dispatch_id
+            for dispatch in child_dispatches
+            if dispatch.state in {
+                DispatchStatus.PREPARED,
+                DispatchStatus.RUNNING,
+                DispatchStatus.COMPLETED,
+            }
+        ]
+        if unresolved:
+            raise SequentialWorkflowError(
+                f"batch {batch_id} cannot join with unresolved dispatches {sorted(unresolved)}"
+            )
+        failed = tuple(
+            dispatch.dispatch_id
+            for dispatch in child_dispatches
+            if dispatch.state in {DispatchStatus.FAILED, DispatchStatus.ABANDONED}
+        )
+        event = self._event(
+            record,
+            "dispatcher",
+            "batch joined with failures" if failed else "batch joined successfully",
+            batch_id,
+        )
+        batches = dict(record.batches)
+        joined = transition_batch(batch, BatchStatus.FAILED if failed else BatchStatus.JOINED, event)
+        batches[batch_id] = joined.model_copy(update={"failed_dispatch_ids": failed})
+        record = record.model_copy(
+            update={"batches": batches, "sequence": event.sequence, "updated_at": event.occurred_at}
+        )
+        generation = self.store.save_run(record, expected_generation=generation)
+        if failed and record.state is RunStatus.RUNNING:
+            request_event = self._event(record, "dispatcher", "batch requires operator reconciliation", batch_id)
+            request = OperatorRequest(
+                request_id=f"request-{uuid.uuid4().hex}",
+                question=(
+                    f"Batch {batch_id} has failed dispatches {', '.join(failed)}. "
+                    "Reconcile every child before continuing."
+                ),
+                allowed_answers=["reconcile", "halt"],
+                context_ref=batch_id,
+                resume_to=RunStatus.RUNNING,
+                expires_at=None,
+                required_role=None,
+                kind="batch_reconciliation",
+                step_id=None,
+            )
+            record = transition_run(record, RunStatus.WAITING_OPERATOR, request_event, operator_request=request)
+            generation = self.store.save_run(record, expected_generation=generation)
+        forwarding = json.dumps(
+            {
+                "kind": "batch_result",
+                "batch_id": batch_id,
+                "children": [
+                    {
+                        "dispatch_id": dispatch.dispatch_id,
+                        "step_id": dispatch.step_id,
+                        "state": dispatch.state.value,
+                    }
+                    for dispatch in child_dispatches
+                ],
+                "failed_dispatch_ids": list(failed),
+            },
+            sort_keys=True,
+        )
+        return record, generation, forwarding
 
     def evaluate_completion(self, record: RunRecord, generation: int) -> CompletionDecision:
         """Evaluate dispatcher-owned completion obligations, never supervisor prose."""
@@ -1150,6 +1507,14 @@ class SequentialWorkflow:
                 raise SequentialWorkflowError(
                     f"step {step.step_id} dependency {dependency_id} is not accepted"
                 )
+        for artifact in step.required_inputs:
+            if artifact.producer_step_id is None:
+                continue
+            producer = record.steps[artifact.producer_step_id]
+            if producer.state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}:
+                raise SequentialWorkflowError(
+                    f"step {step.step_id} input producer {artifact.producer_step_id} is not accepted"
+                )
         if mode in {"resume", "fork"}:
             sessions = self.store.sessions_for_run(record.run_id)
             pool = "executors" if role_kind == "executor" else "reviewers"
@@ -1279,7 +1644,11 @@ def _plan_step(record: RunRecord, step_id: str) -> PlanStep:
 
 
 def _lease_keys(step: PlanStep) -> tuple[str, ...]:
-    return tuple(sorted({f"repository:{step.repo_id}", *(f"resource:{lock.resource_id}" for lock in step.resource_locks)}))
+    return resource_keys(step.repo_id, tuple(lock.resource_id for lock in step.resource_locks))
+
+
+def _dispatch_lease_owner_id(owner_id: str, dispatch_id: str) -> str:
+    return f"{owner_id}.dispatch.{dispatch_id}"
 
 
 def _bootstrap_template() -> str:

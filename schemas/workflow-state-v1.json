@@ -59,6 +59,64 @@
       "title": "ArtifactReference",
       "type": "object"
     },
+    "BatchRecord": {
+      "additionalProperties": false,
+      "description": "Durable aggregate state for one all-or-none prepared dispatch batch.",
+      "properties": {
+        "batch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Batch Id",
+          "type": "string"
+        },
+        "dispatch_ids": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Dispatch Ids",
+          "type": "array"
+        },
+        "failed_dispatch_ids": {
+          "default": [],
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Failed Dispatch Ids",
+          "type": "array"
+        },
+        "failure_mode": {
+          "const": "wait_for_started",
+          "title": "Failure Mode",
+          "type": "string"
+        },
+        "last_event": {
+          "$ref": "#/$defs/TransitionEvent"
+        },
+        "state": {
+          "$ref": "#/$defs/BatchStatus"
+        }
+      },
+      "required": [
+        "batch_id",
+        "dispatch_ids",
+        "state",
+        "failure_mode",
+        "last_event"
+      ],
+      "title": "BatchRecord",
+      "type": "object"
+    },
+    "BatchStatus": {
+      "enum": [
+        "PREPARED",
+        "RUNNING",
+        "JOINED",
+        "FAILED"
+      ],
+      "title": "BatchStatus",
+      "type": "string"
+    },
     "CompiledReviewObligation": {
       "additionalProperties": false,
       "description": "Concrete pre-dispatch review policy for one normalized plan step.",
@@ -163,6 +221,19 @@
           "minimum": 1,
           "title": "Attempt",
           "type": "integer"
+        },
+        "batch_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Batch Id"
         },
         "dispatch_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
@@ -376,7 +447,8 @@
             "reconciliation",
             "budget",
             "escalation",
-            "review_waiver"
+            "review_waiver",
+            "batch_reconciliation"
           ],
           "title": "Kind",
           "type": "string"
@@ -1220,6 +1292,15 @@
   "additionalProperties": false,
   "description": "Schema-v1 run state containing its immutable normalized plan and digest.",
   "properties": {
+    "batches": {
+      "patternProperties": {
+        "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+          "$ref": "#/$defs/BatchRecord"
+        }
+      },
+      "title": "Batches",
+      "type": "object"
+    },
     "config_digest": {
       "pattern": "^[a-f0-9]{64}$",
       "title": "Config Digest",

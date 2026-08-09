@@ -85,6 +85,7 @@ def test_invalid_schema_values_fail_with_exact_field_paths(
         ("state", "lease_heartbeat_seconds"),
         ("profile", "profiles_file"),
         ("execution", "timeout_seconds"),
+        ("execution", "concurrency"),
         ("repositories", "fixture-repo", "commit_policy"),
         ("repositories", "fixture-repo", "external_roots"),
         ("permission_policies", "policies", "executor", "default"),

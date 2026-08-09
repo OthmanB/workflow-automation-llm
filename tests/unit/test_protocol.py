@@ -8,6 +8,7 @@ from helpers import create_fixture_project
 
 from dispatcher.dispatch import RouteError, route_from_command
 from dispatcher.protocol import (
+    BatchDispatchCommand,
     DispatchCommand,
     ProtocolError,
     diagnostic_command_hint,
@@ -64,6 +65,56 @@ def test_dispatch_cannot_target_configured_supervisor(tmp_path: Path) -> None:
 
     with pytest.raises(RouteError, match="cannot be the supervisor"):
         route_from_command(command, project.config)
+
+
+def test_protocol_v2_batch_requires_unique_independently_valid_children() -> None:
+    command = parse_supervisor_command(
+        json.dumps(
+            {
+                "protocol_version": 2,
+                "action": "dispatch_batch",
+                "children": [
+                    {
+                        "step_id": "prepare-fixture",
+                        "target_role": "terra",
+                        "session_mode": "new",
+                        "prompt": "first",
+                    },
+                    {
+                        "step_id": "second-fixture",
+                        "target_role": "terra",
+                        "session_mode": "new",
+                        "prompt": "second",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert isinstance(command, BatchDispatchCommand)
+    with pytest.raises(ProtocolError, match="must not target the same step"):
+        parse_supervisor_command(
+            json.dumps(
+                {
+                    "protocol_version": 2,
+                    "action": "dispatch_batch",
+                    "children": [
+                        {
+                            "step_id": "prepare-fixture",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "first",
+                        },
+                        {
+                            "step_id": "prepare-fixture",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "duplicate",
+                        },
+                    ],
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize("text", ["{", "[]", "null", "not json", "{}"])

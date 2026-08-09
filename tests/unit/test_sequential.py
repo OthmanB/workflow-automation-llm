@@ -620,6 +620,7 @@ def test_conflicting_reviews_require_a_fresh_tie_break_on_the_same_artifact(proj
         "model": "fixture/reviewer-three",
         "display": "Fixture Tie Break Reviewer",
     }
+    values["execution"]["concurrency"]["role_capacities"]["reviewer-three"] = 1
     configured = replace(project, config=write_config(project, values))
     _store_value, workflow, executor = _prepare_executor(configured, max_reviewer_attempts=3)
     record, generation, _forwarding = workflow.apply_executor_result(

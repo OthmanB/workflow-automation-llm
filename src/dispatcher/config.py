@@ -179,12 +179,30 @@ class ProfilesDocument(ContractModel):
         return self
 
 
+class ConcurrencyDefinition(ContractModel):
+    """Explicit bounded-parallel controls for independently dispatchable work."""
+
+    max_active_dispatches: Annotated[int, Field(ge=1, le=100)]
+    max_batch_size: Annotated[int, Field(ge=1, le=100)]
+    role_capacities: dict[Identifier, Annotated[int, Field(ge=1, le=100)]]
+    failure_mode: Literal["wait_for_started"]
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if self.max_batch_size > self.max_active_dispatches:
+            raise ValueError("max_batch_size cannot exceed max_active_dispatches")
+        if self.max_active_dispatches > sum(self.role_capacities.values()):
+            raise ValueError("max_active_dispatches cannot exceed total role capacity")
+        return self
+
+
 class ExecutionDefinition(ContractModel):
-    """All active execution controls for the mock-only Phase 1 runtime."""
+    """All active execution controls for the mock-only Phase 7 runtime."""
 
     mode: Literal["mock_only"]
     protocol_version: Literal[1]
-    scheduling: Literal["sequential"]
+    scheduling: Literal["sequential", "bounded_parallel"]
+    concurrency: ConcurrencyDefinition
     default_repo_id: Identifier
     timeout_seconds: Annotated[int, Field(ge=1, le=86_400)]
     termination_grace_seconds: Annotated[int, Field(ge=1, le=3_600)]
@@ -308,6 +326,12 @@ class ProjectConfigModel(ContractModel):
                 raise ValueError(
                     f"roles.{role_key}.permission_policy must reference permission_policies"
                 )
+        worker_roles = set(self.roles.executors) | set(self.roles.reviewers)
+        capacities = self.execution.concurrency.role_capacities
+        if set(capacities) != worker_roles:
+            raise ValueError("execution.concurrency.role_capacities must exactly match worker roles")
+        if self.execution.scheduling == "sequential" and self.execution.concurrency.max_active_dispatches != 1:
+            raise ValueError("sequential scheduling requires max_active_dispatches to be 1")
         for layer_name, policy_id in {
             "global_policy": self.permission_policies.global_policy,
             "project_policy": self.permission_policies.project_policy,

@@ -51,6 +51,13 @@ class DispatchStatus(str, Enum):
     ABANDONED = "ABANDONED"
 
 
+class BatchStatus(str, Enum):
+    PREPARED = "PREPARED"
+    RUNNING = "RUNNING"
+    JOINED = "JOINED"
+    FAILED = "FAILED"
+
+
 RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.NEW: frozenset(
         {RunStatus.READY, RunStatus.WAITING_OPERATOR, RunStatus.FAILED, RunStatus.CANCELLED}
@@ -130,6 +137,13 @@ DISPATCH_TRANSITIONS: dict[DispatchStatus, frozenset[DispatchStatus]] = {
     DispatchStatus.ABANDONED: frozenset(),
 }
 
+BATCH_TRANSITIONS: dict[BatchStatus, frozenset[BatchStatus]] = {
+    BatchStatus.PREPARED: frozenset({BatchStatus.RUNNING, BatchStatus.FAILED}),
+    BatchStatus.RUNNING: frozenset({BatchStatus.JOINED, BatchStatus.FAILED}),
+    BatchStatus.JOINED: frozenset(),
+    BatchStatus.FAILED: frozenset(),
+}
+
 ACTIVE_DISPATCH_STATES = frozenset(
     {
         DispatchStatus.PREPARED,
@@ -168,6 +182,7 @@ class OperatorRequest(ContractModel):
         "budget",
         "escalation",
         "review_waiver",
+        "batch_reconciliation",
     ] = "underspecification"
     step_id: Identifier | None = None
     reassignment_role_key: Identifier | None = None
@@ -209,6 +224,7 @@ class DispatchRecord(ContractModel):
     """One independently recoverable dispatch attempt."""
 
     dispatch_id: Identifier
+    batch_id: Identifier | None = None
     step_id: Identifier
     role_key: Identifier
     role_kind: Literal["executor", "reviewer"]
@@ -241,6 +257,27 @@ class DispatchRecord(ContractModel):
             self.forwarding_digest is None
         ):
             raise ValueError("forwarded dispatch requires forwarding_digest")
+        return self
+
+
+class BatchRecord(ContractModel):
+    """Durable aggregate state for one all-or-none prepared dispatch batch."""
+
+    batch_id: Identifier
+    dispatch_ids: tuple[Identifier, ...]
+    state: BatchStatus
+    failure_mode: Literal["wait_for_started"]
+    failed_dispatch_ids: tuple[Identifier, ...] = ()
+    last_event: TransitionEvent
+
+    @model_validator(mode="after")
+    def validate_children(self) -> "BatchRecord":
+        if not self.dispatch_ids:
+            raise ValueError("batch requires at least one dispatch")
+        if len(self.dispatch_ids) != len(set(self.dispatch_ids)):
+            raise ValueError("batch dispatch_ids must not contain duplicates")
+        if not set(self.failed_dispatch_ids).issubset(self.dispatch_ids):
+            raise ValueError("batch failed_dispatch_ids must reference batch dispatch_ids")
         return self
 
 
@@ -348,6 +385,7 @@ class RunRecord(ContractModel):
     sequence: Annotated[int, Field(ge=0)]
     steps: dict[Identifier, StepRecord]
     dispatches: dict[Identifier, DispatchRecord]
+    batches: dict[Identifier, BatchRecord] = Field(default_factory=dict)
     operator_request: OperatorRequest | None
     policy: RunPolicy | None = None
     usage: UsageLedger = Field(default_factory=UsageLedger)
@@ -370,6 +408,11 @@ class RunRecord(ContractModel):
             for step_id, obligation in self.policy.review_obligations.items():
                 if obligation.step_id != step_id:
                     raise ValueError("run policy review obligation step_id must match its mapping key")
+        for batch_id, batch in self.batches.items():
+            if batch.batch_id != batch_id:
+                raise ValueError("batch ID must match its mapping key")
+            if not set(batch.dispatch_ids).issubset(self.dispatches):
+                raise ValueError("batch dispatch_ids must reference run dispatches")
         if self.state is RunStatus.WAITING_OPERATOR and self.operator_request is None:
             raise ValueError("waiting operator run requires operator_request")
         if self.state is not RunStatus.WAITING_OPERATOR and self.operator_request is not None:
@@ -437,6 +480,7 @@ def new_run_record(
         sequence=event.sequence,
         steps=steps,
         dispatches={},
+        batches={},
         operator_request=None,
         created_at=now,
         updated_at=now,
@@ -537,6 +581,12 @@ def transition_dispatch(
         raise TransitionError(f"invalid dispatch transition data: {exc}") from exc
 
 
+def transition_batch(record: BatchRecord, target: BatchStatus, event: TransitionEvent) -> BatchRecord:
+    """Apply one durable batch aggregate transition."""
+    _validate_transition("batch", record.state, target, BATCH_TRANSITIONS)
+    return record.model_copy(update={"state": target, "last_event": event})
+
+
 def completion_obligations(record: RunRecord) -> list[CompletionObligation]:
     """Return every outstanding condition that prevents successful completion."""
     obligations: list[CompletionObligation] = []
@@ -634,7 +684,7 @@ def terminal_exit_code(status: RunStatus) -> int:
         raise TransitionError(f"run state {status.value} is not terminal") from exc
 
 
-State = TypeVar("State", RunStatus, StepStatus, DispatchStatus)
+State = TypeVar("State", RunStatus, StepStatus, DispatchStatus, BatchStatus)
 
 
 def _validate_transition(

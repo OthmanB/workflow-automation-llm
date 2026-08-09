@@ -968,19 +968,19 @@ policy.
 
 **Actions:**
 
-- [ ] Compute ready steps from accepted dependencies and normalized inputs.
-- [ ] Validate resource availability, repository locks, role capacity, global
+- [x] Compute ready steps from accepted dependencies and normalized inputs.
+- [x] Validate resource availability, repository locks, role capacity, global
   capacity, and operator gates.
-- [ ] Keep scheduling deterministic for identical state.
-- [ ] Explain why blocked steps are not ready.
-- [ ] Add fan-in, fan-out, cross-repository dependency, resource conflict, and
+- [x] Keep scheduling deterministic for identical state.
+- [x] Explain why blocked steps are not ready.
+- [x] Add fan-in, fan-out, cross-repository dependency, resource conflict, and
   no-ready-step tests.
 
 **Acceptance criteria:**
 
-- [ ] A dependent step never starts before every required predecessor is
+- [x] A dependent step never starts before every required predecessor is
   accepted.
-- [ ] Different repositories do not imply independence unless the plan graph
+- [x] Different repositories do not imply independence unless the plan graph
   and resource declarations agree.
 
 ### DISP-701: Add batch protocol version 2
@@ -989,20 +989,20 @@ policy.
 
 **Actions:**
 
-- [ ] Define a versioned batch command containing independently valid child
+- [x] Define a versioned batch command containing independently valid child
   dispatch requests.
-- [ ] Validate the entire batch before starting any child.
-- [ ] Define partial-start, partial-failure, cancellation, and result-join
+- [x] Validate the entire batch before starting any child.
+- [x] Define partial-start, partial-failure, cancellation, and result-join
   semantics.
-- [ ] Assign one parent correlation ID and independent child dispatch IDs.
-- [ ] Return a structured batch result to the supervisor.
-- [ ] Reject batches that exceed configured capacity or conflict on resources.
+- [x] Assign one parent correlation ID and independent child dispatch IDs.
+- [x] Return a structured batch result to the supervisor.
+- [x] Reject batches that exceed configured capacity or conflict on resources.
 
 **Acceptance criteria:**
 
-- [ ] An invalid child prevents all child starts.
-- [ ] Every started child has an independent recoverable state.
-- [ ] Batch results cannot hide a failed child.
+- [x] An invalid child prevents all child starts.
+- [x] Every started child has an independent recoverable state.
+- [x] Batch results cannot hide a failed child.
 
 ### DISP-702: Implement bounded concurrent execution
 
@@ -1010,27 +1010,31 @@ policy.
 
 **Actions:**
 
-- [ ] Use the scheduler's ready set and resource locks.
-- [ ] Enforce per-role and global concurrency limits from validated YAML.
+- [x] Use the scheduler's ready set and resource locks.
+- [x] Enforce per-role and global concurrency limits from validated YAML.
 - [ ] Prefer isolated worktrees for concurrent repository work where supported.
-- [ ] Persist every child transition independently.
-- [ ] Define coordinated cancellation and timeout behavior.
-- [ ] Add crash, timeout, one-child failure, lock conflict, and concurrent state
+- [x] Persist every child transition independently.
+- [x] Define coordinated cancellation and timeout behavior.
+- [x] Add crash, timeout, one-child failure, lock conflict, and concurrent state
   update tests.
 
 **Acceptance criteria:**
 
-- [ ] Concurrent runs cannot write the same locked resource.
-- [ ] A dispatcher crash preserves each child's exact recoverable state.
-- [ ] Sequential behavior remains available and uses the same transition model.
+- [x] Concurrent runs cannot write the same locked resource.
+- [x] A dispatcher crash preserves each child's exact recoverable state.
+- [x] Sequential behavior remains available and uses the same transition model.
+
+Same-repository parallelism remains deliberately disabled. The current state
+model has no durable worktree branch/merge lifecycle, so isolated worktree
+execution is deferred rather than risking incorrect dependency propagation.
 
 ### Phase 7 gate
 
-- [ ] Dependency scheduling tests pass.
-- [ ] Batch schema and all-or-none validation pass.
-- [ ] Concurrent fault-injection tests pass without lost state or leaked
+- [x] Dependency scheduling tests pass.
+- [x] Batch schema and all-or-none validation pass.
+- [x] Concurrent fault-injection tests pass without lost state or leaked
   processes.
-- [ ] Parallel execution remains disabled in project YAML until explicitly
+- [x] Parallel execution remains disabled in project YAML until explicitly
   enabled and reviewed.
 
 ## 13. Phase 8: Migration, hardening, and release
