@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -88,6 +89,7 @@ def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
     assert all(item.state.value == "ACKNOWLEDGED" for item in dispatches)
     assert len(executor_dispatches) == 2
     assert executor_dispatches[0].runtime_session_id == executor_dispatches[1].runtime_session_id
+    assert executor_dispatches[0].logical_session_key == executor_dispatches[1].logical_session_key
     assert len(reviewer_dispatches) == 2
     assert reviewer_dispatches[0].runtime_session_id != reviewer_dispatches[1].runtime_session_id
     assert _git(project.repository, "rev-list", "--count", "HEAD") == "3"
@@ -117,11 +119,14 @@ def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
     assert final_evidence_sha in report
     assert "changes_requested" in report
     assert "accepted" in report
-    with store._ready_connection() as connection:
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
         audit = connection.execute(
             "SELECT kind FROM audit_events WHERE run_id = ?", (record.run_id,)
         ).fetchall()
+        lease_count = connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
     assert [row["kind"] for row in audit] == ["run_succeeded"]
+    assert lease_count == 0
 
 
 def _install_fake_opencode(tmp_path: Path) -> Path:

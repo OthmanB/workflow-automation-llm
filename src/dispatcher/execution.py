@@ -201,8 +201,26 @@ class SequentialExecutionCoordinator:
                     parse_reviewer_result(payload),
                 )
         except Exception as exc:
-            if current.dispatch.state.value in {"PREPARED", "RUNNING"}:
-                self.workflow.fail_dispatch(current, reason=f"worker execution failed: {type(exc).__name__}")
+            stored, stored_generation = self.store.load_run(current.run_id)
+            stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
+            if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
+                current = PreparedDispatch(
+                    run_id=current.run_id,
+                    generation=stored_generation,
+                    dispatch=stored_dispatch,
+                    prompt=current.prompt,
+                    workdir=current.workdir,
+                    permission_config=current.permission_config,
+                    auto_approve=current.auto_approve,
+                    lease_keys=current.lease_keys,
+                    review_target=current.review_target,
+                    session_mode=current.session_mode,
+                    session_id=current.session_id,
+                )
+                self.workflow.fail_dispatch(
+                    current,
+                    reason=f"worker execution failed: {type(exc).__name__}",
+                )
             raise
         self.heartbeat()
         return WorkerOutcome(record, generation, current.dispatch.dispatch_id, forwarding)

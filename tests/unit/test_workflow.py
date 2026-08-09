@@ -187,6 +187,47 @@ def test_completion_guard_requires_evidence_and_no_active_dispatch(project: Fixt
     assert {obligation.code for obligation in completion_obligations(active)} == {"dispatch_in_flight"}
 
 
+def test_completion_guard_accepts_explicit_waiver_and_rejects_unresolved_review(
+    project: FixtureProject,
+) -> None:
+    record = transition_run(_record(project), RunStatus.READY, _event(2))
+    running = transition_run(record, RunStatus.RUNNING, _event(3))
+    waived = running.steps["prepare-fixture"].model_copy(
+        update={"state": StepStatus.WAIVED, "waiver_decision_ref": "decision-waive"}
+    )
+    waived_record = running.model_copy(update={"steps": {"prepare-fixture": waived}})
+    assert completion_obligations(waived_record) == []
+
+    values = valid_plan_values(project)
+    values["steps"][0]["review"] = {
+        "required": True,
+        "reviewer_role_keys": ["reviewer"],
+        "required_acceptances": 1,
+    }
+    values["steps"][0]["retry"]["max_reviewer_attempts"] = 1
+    reviewed_plan = NormalizedPlan.model_validate(values)
+    reviewed_record = new_run_record(
+        run_id="reviewed-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=reviewed_plan,
+        plan_approval=approve_plan(reviewed_plan, "decision-reviewed-plan"),
+        event=_event(1),
+    )
+    accepted = reviewed_record.steps["prepare-fixture"].model_copy(
+        update={
+            "state": StepStatus.ACCEPTED,
+            "accepted_artifact_ids": ["fixture-evidence"],
+        }
+    )
+    reviewed_record = reviewed_record.model_copy(
+        update={"steps": {"prepare-fixture": accepted}}
+    )
+    assert {item.code for item in completion_obligations(reviewed_record)} == {
+        "review_incomplete"
+    }
+
+
 def test_run_record_persists_normalized_plan_and_digest(project: FixtureProject) -> None:
     record = _record(project)
 

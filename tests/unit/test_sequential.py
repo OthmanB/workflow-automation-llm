@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 from helpers import FixtureProject, create_fixture_project, valid_plan_values
 
 from dispatcher.plan import NormalizedPlan, approve_plan
+from dispatcher.protocol import parse_supervisor_command
 from dispatcher.results import parse_executor_result, parse_reviewer_result
 from dispatcher.sequential import (
     CompletionDecision,
@@ -170,6 +172,9 @@ def test_bootstrap_is_self_contained_and_persisted(project: FixtureProject) -> N
     assert "plan.md" in bootstrap
     assert "prepare-fixture" in bootstrap
     assert path.is_file()
+    examples = re.findall(r"```json\n(.*?)\n```", bootstrap, flags=re.DOTALL)
+    assert len(examples) == 2
+    assert all(parse_supervisor_command(example) for example in examples)
 
 
 def test_executor_dispatch_transitions_only_its_ready_step_and_completion_is_guarded(
@@ -199,6 +204,36 @@ def test_executor_dispatch_transitions_only_its_ready_step_and_completion_is_gua
     assert decision.accepted
     assert decision.report_path is not None
     assert store.load_run(record.run_id)[0].state.value == "SUCCEEDED"
+
+
+def test_process_and_session_identity_are_separate_atomic_generations(
+    project: FixtureProject,
+) -> None:
+    store, workflow, record, generation = _activate_ready_run(project)
+    prepared = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+
+    running = workflow.mark_running(prepared, process_id=4321)
+
+    assert running.generation == prepared.generation + 1
+    assert running.dispatch.state.value == "RUNNING"
+    assert running.dispatch.runtime_session_id is None
+    assert store.sessions_for_run(record.run_id) == {}
+    assert store.load_dispatch_payload(record.run_id, running.dispatch.dispatch_id).process_id == 4321
+
+    identified = workflow.record_session_id(running, runtime_session_id="ses-atomic")
+
+    assert identified.generation == running.generation + 1
+    assert identified.dispatch.runtime_session_id == "ses-atomic"
+    assert store.sessions_for_run(record.run_id)["executors"]["terra"]["session_id"] == (
+        "ses-atomic"
+    )
+    with pytest.raises(SequentialWorkflowError, match="generation is stale"):
+        workflow.record_session_id(running, runtime_session_id="ses-duplicate")
 
 
 def test_unknown_step_and_missing_session_fail_before_dispatch_persistence(project: FixtureProject) -> None:

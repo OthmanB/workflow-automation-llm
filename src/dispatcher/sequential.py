@@ -664,6 +664,32 @@ class SequentialWorkflow:
                 f"failed dispatch has incompatible step state {step.state.value}"
             )
         record, generation = self._replace_step(record, generation, updated_step)
+        if dispatch.state is DispatchStatus.RUNNING:
+            request_event = self._event(
+                record,
+                "dispatcher",
+                "uncertain external side effect requires operator reconciliation",
+                dispatch.dispatch_id,
+            )
+            request = OperatorRequest(
+                request_id=f"request-{uuid.uuid4().hex}",
+                question=(
+                    "The worker process started but did not produce an applicable result. "
+                    "Reconcile repository and session state before any retry."
+                ),
+                allowed_answers=["reconcile", "halt"],
+                context_ref=dispatch.dispatch_id,
+                resume_to=RunStatus.RUNNING,
+                expires_at=None,
+                required_role=None,
+            )
+            record = transition_run(
+                record,
+                RunStatus.WAITING_OPERATOR,
+                request_event,
+                operator_request=request,
+            )
+            generation = self.store.save_run(record, expected_generation=generation)
         self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
         return record, generation
 
@@ -964,24 +990,26 @@ def _baseline_markdown(record: RunRecord) -> str:
 def _dispatch_example(config: Config, record: RunRecord) -> str:
     step = record.plan.steps[0]
     role = next(iter(config.model.roles.executors))
-    return json.dumps(
-        {
-            "protocol_version": 1,
-            "action": "dispatch",
-            "step_id": step.step_id,
-            "target_role": role,
-            "session_mode": "new",
-            "prompt": "Perform only the authorized work and return one schema-v1 executor result JSON object.",
-            "rationale": "Example only; dispatcher validates every request.",
-        },
-        separators=(",", ":"),
+    return DispatchCommand(
+        protocol_version=1,
+        action="dispatch",
+        step_id=step.step_id,
+        target_role=role,
+        session_mode="new",
+        prompt="Perform only the authorized work and return one schema-v1 executor result JSON object.",
+        rationale="Example only; dispatcher validates every request.",
+    ).model_dump_json(
+        exclude_none=True,
     )
 
 
 def _completion_example() -> str:
-    return json.dumps(
-        {"protocol_version": 1, "action": "request_completion", "rationale": "All obligations are met."},
-        separators=(",", ":"),
+    return RequestCompletionCommand(
+        protocol_version=1,
+        action="request_completion",
+        rationale="All obligations are met.",
+    ).model_dump_json(
+        exclude_none=True,
     )
 
 

@@ -35,3 +35,7 @@ jobs:
       - name: Smoke-test installed CLI outside the checkout
         working-directory: /tmp
         run: /tmp/dispatcher-wheel/bin/dispatcher --help
+      - name: Verify packaged bootstrap template
+        working-directory: /tmp
+        run: |
+          /tmp/dispatcher-wheel/bin/python -c 'from importlib import resources; text = resources.files("dispatcher").joinpath("templates/bootstrap_supervisor.md").read_text(); assert "Authoritative Inputs" in text'
