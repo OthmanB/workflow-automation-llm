@@ -54,7 +54,12 @@ def test_enabled_preflight_uses_injected_smoke_runner(
     results = preflight.run_preflight(project.config, project.config.state_dir, run_session=runner)
 
     assert results["models"]["status"] == "passed"
-    assert calls == ["fixture/executor", "fixture/reviewer", "fixture/supervisor"]
+    assert calls == [
+        "fixture/executor",
+        "fixture/reviewer",
+        "fixture/reviewer-two",
+        "fixture/supervisor",
+    ]
     audit_event = json.loads(
         (Path(project.config.state_dir) / "audit.jsonl").read_text().splitlines()[-1]
     )

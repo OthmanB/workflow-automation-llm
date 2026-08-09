@@ -14,11 +14,13 @@ from typing import Any, Literal, Mapping, Protocol, cast
 from .config import Config
 from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
 from .plan import PlanError, PlanStep, validate_plan_approval, verify_plan_sources
+from .policy import PolicyError, compile_run_policy
 from .protocol import (
     AskOperatorCommand,
     DispatchCommand,
     HaltCommand,
     RequestCompletionCommand,
+    RequestReviewWaiverCommand,
     parse_supervisor_command,
 )
 from .repository import (
@@ -42,6 +44,7 @@ from .results import (
 )
 from .state_store import StateStore
 from .workflow import (
+    CompiledReviewObligation,
     DispatchIntent,
     DispatchRecord,
     DispatchStatus,
@@ -51,6 +54,8 @@ from .workflow import (
     StepRecord,
     StepStatus,
     TransitionEvent,
+    UsageAmount,
+    UsageLedger,
     completion_obligations,
     transition_run,
     transition_step,
@@ -157,6 +162,7 @@ class SequentialWorkflow:
         record, generation = self.store.load_run(run_id)
         if generation != expected_generation:
             raise SequentialWorkflowError("run generation changed before activation")
+        record, generation = self._compile_run_policy(record, generation)
         record, generation = self.refresh_readiness(record, generation)
         if record.state is RunStatus.NEW:
             ready_event = self._event(record, "dispatcher", "run approved and ready", "run-activation")
@@ -227,6 +233,8 @@ class SequentialWorkflow:
             return self.evaluate_completion(record, generation)
         if isinstance(command, AskOperatorCommand):
             return self._wait_for_operator(record, generation, command)
+        if isinstance(command, RequestReviewWaiverCommand):
+            return self._request_review_waiver(record, generation, command)
         if isinstance(command, HaltCommand):
             event = self._event(record, "supervisor", command.reason, "supervisor-halt")
             halted = transition_run(record, RunStatus.HALTED, event)
@@ -239,7 +247,7 @@ class SequentialWorkflow:
         record: RunRecord,
         generation: int,
         command: DispatchCommand,
-    ) -> PreparedDispatch:
+    ) -> PreparedDispatch | RunRecord:
         """Commit a fully validated PREPARED dispatch before any worker launch."""
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a dispatch")
@@ -260,6 +268,14 @@ class SequentialWorkflow:
                 f"supervisor repository assertion {command.repo_id!r} does not match step repository {step.repo_id!r}"
             )
         role_kind = self._role_kind(command.target_role)
+        if not record.steps[step.step_id].operator_gate_resolved:
+            return self._request_risk_gate(record, generation, step)
+        self._ensure_budget_allows_dispatch(
+            record,
+            step,
+            role_key=command.target_role,
+            session_mode=command.session_mode,
+        )
         self._validate_step_readiness(record, step, role_kind, command.session_mode, command.target_role)
         workdir = self.config.repository_root(step.repo_id)
         repository_before = self._inspect_repository(step.repo_id, require_clean=True)
@@ -317,6 +333,7 @@ class SequentialWorkflow:
             update={
                 "executor_attempts": attempt if role_kind == "executor" else step_record.executor_attempts,
                 "reviewer_attempts": attempt if role_kind == "reviewer" else step_record.reviewer_attempts,
+                "reassignment_role_key": None if role_kind == "executor" else step_record.reassignment_role_key,
             }
         )
         steps = dict(record.steps)
@@ -450,6 +467,8 @@ class SequentialWorkflow:
         self,
         prepared: PreparedDispatch,
         result: ExecutorResult,
+        *,
+        usage: Mapping[str, object] | None = None,
     ) -> tuple[RunRecord, int, str]:
         """Apply a typed executor result and persist the next supervisor message."""
         if prepared.dispatch.role_kind != "executor":
@@ -458,6 +477,7 @@ class SequentialWorkflow:
         if generation != prepared.generation:
             raise SequentialWorkflowError("running dispatch generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        record, generation = self._record_usage(record, generation, dispatch, usage)
         _validate_executor_result(result, dispatch)
         step = _plan_step(record, dispatch.step_id)
         self._validate_executor_evidence(step, result)
@@ -485,9 +505,11 @@ class SequentialWorkflow:
         )
         step_record = record.steps[step.step_id]
         result_event = self._event(record, "dispatcher", f"executor outcome {result.outcome}", dispatch.dispatch_id)
+        escalation_required = False
         if isinstance(result, ExecutorCompletedResult):
             executed = transition_step(step_record, StepStatus.EXECUTED, result_event)
-            target = StepStatus.REVIEW_REQUIRED if step.review.required else StepStatus.ACCEPTED
+            obligation = self._review_obligation(record, step)
+            target = StepStatus.REVIEW_REQUIRED if obligation.required else StepStatus.ACCEPTED
             final_event = self._event(
                 record,
                 "dispatcher",
@@ -496,10 +518,14 @@ class SequentialWorkflow:
                 sequence=result_event.sequence + 1,
             )
             updated_step = transition_step(executed, target, final_event)
-            if target is StepStatus.ACCEPTED:
-                updated_step = updated_step.model_copy(
-                    update={"accepted_artifact_ids": [item.artifact_id for item in result.evidence]}
-                )
+            updated_step = updated_step.model_copy(
+                update={
+                    "accepted_artifact_ids": [item.artifact_id for item in result.evidence],
+                    # A fresh executor result invalidates prior reviewer votes on older work.
+                    "review_acceptances": 0,
+                    "accepted_reviewer_role_keys": [],
+                }
+            )
         elif result.outcome == "blocked":
             blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
             updated_step = self._retry_or_terminal_step(
@@ -509,6 +535,7 @@ class SequentialWorkflow:
                 policy=step.retry.on_blocked,
                 correlation_id=dispatch.dispatch_id,
             )
+            escalation_required = step.retry.on_blocked == "escalate"
         else:
             if step.retry.on_failed == "retry" and step_record.executor_attempts < step.retry.max_executor_attempts:
                 blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
@@ -519,10 +546,19 @@ class SequentialWorkflow:
                     policy="retry",
                     correlation_id=dispatch.dispatch_id,
                 )
+            elif step.retry.on_failed == "escalate":
+                updated_step = transition_step(step_record, StepStatus.BLOCKED, result_event)
+                escalation_required = True
             else:
                 updated_step = transition_step(step_record, StepStatus.FAILED, result_event)
         record, generation = self._replace_step(record, generation, updated_step)
-        forwarding = _executor_forwarding(result)
+        forwarding = _executor_forwarding(
+            result,
+            record.usage.by_session.get(
+                dispatch.runtime_session_id or dispatch.logical_session_key,
+                UsageAmount(),
+            ),
+        )
         forward_event = self._event(record, "dispatcher", "supervisor forwarding persisted", dispatch.dispatch_id)
         record, generation = self.store.commit_dispatch_transition(
             record,
@@ -534,12 +570,16 @@ class SequentialWorkflow:
             forwarding_payload=forwarding,
         )
         self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
-        return record, generation, forwarding
+        if escalation_required:
+            return self._request_escalation(record, generation, step, dispatch, forwarding)
+        return self._apply_budget_limit(record, generation, dispatch, forwarding)
 
     def apply_reviewer_result(
         self,
         prepared: PreparedDispatch,
         result: ReviewerResult,
+        *,
+        usage: Mapping[str, object] | None = None,
     ) -> tuple[RunRecord, int, str]:
         """Apply an immutable reviewer verdict to the exact reviewed work product."""
         if prepared.dispatch.role_kind != "reviewer" or prepared.review_target is None:
@@ -548,6 +588,7 @@ class SequentialWorkflow:
         if generation != prepared.generation:
             raise SequentialWorkflowError("running review generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        record, generation = self._record_usage(record, generation, dispatch, usage)
         expectation = ResultExpectation(
             dispatch_id=dispatch.dispatch_id,
             attempt=dispatch.attempt,
@@ -590,18 +631,53 @@ class SequentialWorkflow:
         step = _plan_step(record, dispatch.step_id)
         step_record = record.steps[step.step_id]
         verdict_event = self._event(record, "dispatcher", f"review verdict {result.verdict}", dispatch.dispatch_id)
+        escalation_required = False
         if isinstance(result, ReviewerAcceptedResult):
-            updated_step = transition_step(step_record, StepStatus.ACCEPTED, verdict_event)
+            obligation = self._review_obligation(record, step)
+            if dispatch.role_key in step_record.accepted_reviewer_role_keys:
+                raise SequentialWorkflowError("reviewer role already accepted this immutable artifact")
+            accepted_roles = [*step_record.accepted_reviewer_role_keys, dispatch.role_key]
+            accepted_count = step_record.review_acceptances + 1
+            target = (
+                StepStatus.ACCEPTED
+                if accepted_count >= obligation.required_acceptances
+                else StepStatus.REVIEW_REQUIRED
+            )
+            updated_step = transition_step(step_record, target, verdict_event)
             updated_step = updated_step.model_copy(
                 update={
-                    "review_acceptances": step_record.review_acceptances + 1,
-                    "accepted_artifact_ids": [requirement.artifact_id for requirement in step.evidence_requirements],
+                    "review_acceptances": accepted_count,
+                    "accepted_reviewer_role_keys": accepted_roles,
+                    "accepted_artifact_ids": (
+                        [requirement.artifact_id for requirement in step.evidence_requirements]
+                        if target is StepStatus.ACCEPTED
+                        else []
+                    ),
                 }
             )
         elif isinstance(result, ReviewerChangesRequestedResult):
             changed = transition_step(step_record, StepStatus.CHANGES_REQUESTED, verdict_event)
-            if step.retry.on_changes_requested == "retry" and (
+            changed = changed.model_copy(update={"rework_rounds": step_record.rework_rounds + 1})
+            obligation = self._review_obligation(record, step)
+            remaining_reviewer_roles = set(obligation.reviewer_role_keys) - {
+                *step_record.accepted_reviewer_role_keys,
+                dispatch.role_key,
+            }
+            if remaining_reviewer_roles and step_record.review_acceptances:
+                tie_break_event = self._event(
+                    record,
+                    "dispatcher",
+                    "conflicting review requires a fresh tie-break on the immutable artifact",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                updated_step = transition_step(changed, StepStatus.REVIEW_REQUIRED, tie_break_event)
+            elif (
+                step.retry.on_changes_requested == "retry"
+                and changed.rework_rounds < self.config.execution.max_rounds_per_step
+                and (
                 step_record.executor_attempts < step.retry.max_executor_attempts
+                )
             ):
                 ready_event = self._event(
                     record,
@@ -620,6 +696,7 @@ class SequentialWorkflow:
                     sequence=verdict_event.sequence + 1,
                 )
                 updated_step = transition_step(changed, StepStatus.BLOCKED, blocked_event)
+                escalation_required = True
             else:
                 failed_event = self._event(
                     record,
@@ -630,9 +707,36 @@ class SequentialWorkflow:
                 )
                 updated_step = transition_step(changed, StepStatus.FAILED, failed_event)
         else:
-            updated_step = transition_step(step_record, StepStatus.BLOCKED, verdict_event)
+            blocked = transition_step(step_record, StepStatus.BLOCKED, verdict_event)
+            if step.retry.on_blocked == "retry" and step_record.reviewer_attempts < step.retry.max_reviewer_attempts:
+                retry_event = self._event(
+                    record,
+                    "dispatcher",
+                    "review retry is ready",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                updated_step = transition_step(blocked, StepStatus.REVIEW_REQUIRED, retry_event)
+            elif step.retry.on_blocked == "escalate":
+                updated_step = blocked
+                escalation_required = True
+            else:
+                failed_event = self._event(
+                    record,
+                    "dispatcher",
+                    "review blocked policy halted the step",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                updated_step = transition_step(blocked, StepStatus.FAILED, failed_event)
         record, generation = self._replace_step(record, generation, updated_step)
-        forwarding = _reviewer_forwarding(result)
+        forwarding = _reviewer_forwarding(
+            result,
+            record.usage.by_session.get(
+                dispatch.runtime_session_id or dispatch.logical_session_key,
+                UsageAmount(),
+            ),
+        )
         forward_event = self._event(record, "dispatcher", "review forwarding persisted", dispatch.dispatch_id)
         record, generation = self.store.commit_dispatch_transition(
             record,
@@ -644,7 +748,9 @@ class SequentialWorkflow:
             forwarding_payload=forwarding,
         )
         self.store.release_leases(owner_id=self.owner_id, resource_keys=prepared.lease_keys)
-        return record, generation, forwarding
+        if escalation_required:
+            return self._request_escalation(record, generation, step, dispatch, forwarding)
+        return self._apply_budget_limit(record, generation, dispatch, forwarding)
 
     def acknowledge_forwarding(
         self,
@@ -727,6 +833,8 @@ class SequentialWorkflow:
                 resume_to=RunStatus.RUNNING,
                 expires_at=None,
                 required_role=None,
+                kind="reconciliation",
+                step_id=dispatch.step_id,
             )
             record = transition_run(
                 record,
@@ -787,6 +895,10 @@ class SequentialWorkflow:
         generation: int,
         command: AskOperatorCommand,
     ) -> RunRecord:
+        if record.policy is None or record.policy.underspec_mode != "ask":
+            raise SequentialWorkflowError(
+                "underspecification requests are denied when execution.underspec_mode is auto"
+            )
         event = self._event(record, "supervisor", "operator input requested", "operator-request")
         request = OperatorRequest(
             request_id=f"request-{uuid.uuid4().hex}",
@@ -796,10 +908,178 @@ class SequentialWorkflow:
             resume_to=RunStatus.RUNNING,
             expires_at=None,
             required_role=None,
+            kind="underspecification",
+            step_id=command.step_id,
         )
         waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
         self.store.save_run(waiting, expected_generation=generation)
         return waiting
+
+    def _request_review_waiver(
+        self,
+        record: RunRecord,
+        generation: int,
+        command: RequestReviewWaiverCommand,
+    ) -> RunRecord:
+        step = _plan_step(record, command.step_id)
+        obligation = self._review_obligation(record, step)
+        if record.steps[step.step_id].state is not StepStatus.REVIEW_REQUIRED:
+            raise SequentialWorkflowError("review waiver requires a step awaiting review")
+        if not obligation.waivable:
+            raise SequentialWorkflowError("compiled review obligation cannot be waived")
+        event = self._event(record, "supervisor", command.rationale, step.step_id)
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=f"Waive the non-mandatory review obligation for step {step.step_id}?",
+            allowed_answers=["waive", "halt"],
+            context_ref=step.step_id,
+            resume_to=RunStatus.RUNNING,
+            expires_at=None,
+            required_role=None,
+            kind="review_waiver",
+            step_id=step.step_id,
+        )
+        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+        self.store.save_run(waiting, expected_generation=generation)
+        return waiting
+
+    def _request_risk_gate(self, record: RunRecord, generation: int, step: PlanStep) -> RunRecord:
+        event = self._event(record, "dispatcher", "risk gate requires operator decision", step.step_id)
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=f"Approve dispatch of risk-gated step {step.step_id}?",
+            allowed_answers=["approve", "deny"],
+            context_ref=step.step_id,
+            resume_to=RunStatus.RUNNING,
+            expires_at=None,
+            required_role=None,
+            kind="risk_gate",
+            step_id=step.step_id,
+        )
+        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+        self.store.save_run(waiting, expected_generation=generation)
+        return waiting
+
+    def _request_escalation(
+        self,
+        record: RunRecord,
+        generation: int,
+        step: PlanStep,
+        dispatch: DispatchRecord,
+        forwarding: str,
+    ) -> tuple[RunRecord, int, str]:
+        if step.retry.escalation_role_key is None:
+            raise SequentialWorkflowError("escalation policy has no configured executor reassignment role")
+        event = self._event(record, "dispatcher", "review escalation requires operator reassignment", dispatch.dispatch_id)
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=(
+                f"Step {step.step_id} requires escalation. Reassign executor "
+                f"{step.retry.escalation_role_key} for a new attempt or halt?"
+            ),
+            allowed_answers=["reassign", "halt"],
+            context_ref=dispatch.dispatch_id,
+            resume_to=RunStatus.RUNNING,
+            expires_at=None,
+            required_role=None,
+            kind="escalation",
+            step_id=step.step_id,
+            reassignment_role_key=step.retry.escalation_role_key,
+        )
+        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+        return waiting, self.store.save_run(waiting, expected_generation=generation), forwarding
+
+    def _ensure_budget_allows_dispatch(
+        self,
+        record: RunRecord,
+        step: PlanStep,
+        *,
+        role_key: str,
+        session_mode: Literal["new", "resume", "fork"],
+    ) -> None:
+        if not self.config.model.budget.enabled:
+            return
+        budget = self.config.model.budget
+        step_usage = record.usage.by_step.get(step.step_id, UsageAmount())
+        if record.usage.run.cost_usd >= budget.max_run_cost_usd:
+            raise SequentialWorkflowError("run cost budget is exhausted; a new dispatch is forbidden")
+        if step_usage.cost_usd >= budget.max_step_cost_usd:
+            raise SequentialWorkflowError(f"step {step.step_id} cost budget is exhausted; a new dispatch is forbidden")
+        if session_mode == "resume":
+            pool = "executors" if self._role_kind(role_key) == "executor" else "reviewers"
+            session = self.store.sessions_for_run(record.run_id).get(pool, {}).get(role_key, {})
+            session_id = session.get("session_id")
+            if isinstance(session_id, str):
+                usage = record.usage.by_session.get(session_id, UsageAmount())
+                if usage.tokens_total >= budget.max_context_tokens:
+                    raise SequentialWorkflowError(
+                        f"session context token limit is exhausted for {session_id}; a resumed dispatch is forbidden"
+                    )
+
+    def _record_usage(
+        self,
+        record: RunRecord,
+        generation: int,
+        dispatch: DispatchRecord,
+        usage: Mapping[str, object] | None,
+    ) -> tuple[RunRecord, int]:
+        if usage is None:
+            if self.config.model.budget.enabled:
+                raise SequentialWorkflowError("measured OpenCode usage is required while budget enforcement is enabled")
+            return record, generation
+        amount = _usage_amount(usage)
+        ledger = record.usage
+        updated_ledger = UsageLedger(
+            run=_add_usage(ledger.run, amount),
+            by_step=_updated_usage_bucket(ledger.by_step, dispatch.step_id, amount),
+            by_role=_updated_usage_bucket(ledger.by_role, dispatch.role_key, amount),
+            by_session=_updated_usage_bucket(
+                ledger.by_session,
+                dispatch.runtime_session_id or dispatch.logical_session_key,
+                amount,
+            ),
+        )
+        updated = record.model_copy(update={"usage": updated_ledger})
+        return updated, self.store.save_run(updated, expected_generation=generation)
+
+    def _apply_budget_limit(
+        self,
+        record: RunRecord,
+        generation: int,
+        dispatch: DispatchRecord,
+        forwarding: str,
+    ) -> tuple[RunRecord, int, str]:
+        if not self.config.model.budget.enabled:
+            return record, generation, forwarding
+        budget = self.config.model.budget
+        step_usage = record.usage.by_step[dispatch.step_id]
+        over_context = record.usage.by_session[dispatch.runtime_session_id or dispatch.logical_session_key]
+        detail = None
+        if record.usage.run.cost_usd > budget.max_run_cost_usd:
+            detail = "run cost budget exceeded"
+        elif step_usage.cost_usd > budget.max_step_cost_usd:
+            detail = f"step {dispatch.step_id} cost budget exceeded"
+        elif over_context.tokens_total > budget.max_context_tokens:
+            detail = f"session context token limit exceeded for {dispatch.logical_session_key}"
+        if detail is None:
+            return record, generation, forwarding
+        event = self._event(record, "dispatcher", detail, dispatch.dispatch_id)
+        if budget.on_limit == "halt":
+            halted = transition_run(record, RunStatus.HALTED, event)
+            return halted, self.store.save_run(halted, expected_generation=generation), forwarding
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=f"{detail}; configured action is {budget.on_limit}. Halt this run?",
+            allowed_answers=["halt"],
+            context_ref=dispatch.dispatch_id,
+            resume_to=RunStatus.HALTED,
+            expires_at=None,
+            required_role=None,
+            kind="budget",
+            step_id=dispatch.step_id,
+        )
+        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+        return waiting, self.store.save_run(waiting, expected_generation=generation), forwarding
 
     def _validate_bootstrap_record(self, record: RunRecord) -> None:
         try:
@@ -807,6 +1087,28 @@ class SequentialWorkflow:
             verify_plan_sources(record.plan, self.config)
         except PlanError as exc:
             raise SequentialWorkflowError(f"cannot render bootstrap: {exc}") from exc
+
+    def _compile_run_policy(self, record: RunRecord, generation: int) -> tuple[RunRecord, int]:
+        """Persist exactly one selected-profile policy before activating any run."""
+        try:
+            compiled = compile_run_policy(self.config, record.plan)
+        except PolicyError as exc:
+            raise SequentialWorkflowError(f"cannot compile run policy: {exc}") from exc
+        if record.policy is not None:
+            if record.policy != compiled:
+                raise SequentialWorkflowError("stored run policy no longer matches selected configuration")
+            return record, generation
+        updated = record.model_copy(update={"policy": compiled})
+        return updated, self.store.save_run(updated, expected_generation=generation)
+
+    @staticmethod
+    def _review_obligation(record: RunRecord, step: PlanStep) -> CompiledReviewObligation:
+        if record.policy is None:
+            raise SequentialWorkflowError("run policy must be compiled before dispatch")
+        try:
+            return record.policy.review_obligations[step.step_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"run policy has no obligation for step {step.step_id}") from exc
 
     def _validate_step_readiness(
         self,
@@ -823,13 +1125,23 @@ class SequentialWorkflow:
                 f"step {step.step_id} is {step_record.state.value}, not {expected_state.value}"
             )
         if role_kind == "executor":
+            if (
+                step_record.reassignment_role_key is not None
+                and role_key != step_record.reassignment_role_key
+            ):
+                raise SequentialWorkflowError(
+                    f"step {step.step_id} requires reassignment to {step_record.reassignment_role_key}"
+                )
             if step_record.executor_attempts >= step.retry.max_executor_attempts:
                 raise SequentialWorkflowError(f"step {step.step_id} exhausted executor attempts")
         else:
+            obligation = self._review_obligation(record, step)
             if mode != "new":
                 raise SequentialWorkflowError("reviewer sessions must be new for independent review")
-            if role_key not in step.review.reviewer_role_keys:
-                raise SequentialWorkflowError(f"role {role_key} is not configured to review step {step.step_id}")
+            if role_key not in obligation.reviewer_role_keys:
+                raise SequentialWorkflowError(f"role {role_key} is not compiled to review step {step.step_id}")
+            if role_key in step_record.accepted_reviewer_role_keys:
+                raise SequentialWorkflowError(f"role {role_key} already accepted step {step.step_id}")
             if step_record.reviewer_attempts >= step.retry.max_reviewer_attempts:
                 raise SequentialWorkflowError(f"step {step.step_id} exhausted reviewer attempts")
         for dependency_id in step.depends_on:
@@ -1110,7 +1422,7 @@ def _validate_executor_result(result: ExecutorResult, dispatch: DispatchRecord) 
         raise SequentialWorkflowError("executor result base revision does not match prepared dispatch")
 
 
-def _executor_forwarding(result: ExecutorResult) -> str:
+def _executor_forwarding(result: ExecutorResult, usage: UsageAmount) -> str:
     return json.dumps(
         {
             "kind": "executor_result",
@@ -1118,12 +1430,13 @@ def _executor_forwarding(result: ExecutorResult) -> str:
             "outcome": result.outcome,
             "summary": result.summary,
             "evidence": [item.model_dump(mode="json") for item in result.evidence],
+            "usage": usage.model_dump(mode="json"),
         },
         sort_keys=True,
     )
 
 
-def _reviewer_forwarding(result: ReviewerResult) -> str:
+def _reviewer_forwarding(result: ReviewerResult, usage: UsageAmount) -> str:
     return json.dumps(
         {
             "kind": "reviewer_result",
@@ -1131,6 +1444,7 @@ def _reviewer_forwarding(result: ReviewerResult) -> str:
             "verdict": result.verdict,
             "summary": result.summary,
             "review_target": result.review_target.model_dump(mode="json"),
+            "usage": usage.model_dump(mode="json"),
         },
         sort_keys=True,
     )
@@ -1142,3 +1456,36 @@ def _sha256_text(value: str) -> str:
 
 def _sha256_json(value: Mapping[str, Any]) -> str:
     return _sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def _usage_amount(usage: Mapping[str, object]) -> UsageAmount:
+    cost = usage.get("cost_usd")
+    if not isinstance(cost, (int, float)) or cost < 0:
+        raise SequentialWorkflowError("measured usage cost_usd must be a non-negative number")
+    values: dict[str, int] = {}
+    for key in ("tokens_total", "tokens_input", "tokens_output", "tokens_reasoning"):
+        value = usage.get(key)
+        if not isinstance(value, int) or value < 0:
+            raise SequentialWorkflowError(f"measured usage {key} must be a non-negative integer")
+        values[key] = value
+    return UsageAmount(cost_usd=float(cost), **values)
+
+
+def _add_usage(left: UsageAmount, right: UsageAmount) -> UsageAmount:
+    return UsageAmount(
+        cost_usd=left.cost_usd + right.cost_usd,
+        tokens_total=left.tokens_total + right.tokens_total,
+        tokens_input=left.tokens_input + right.tokens_input,
+        tokens_output=left.tokens_output + right.tokens_output,
+        tokens_reasoning=left.tokens_reasoning + right.tokens_reasoning,
+    )
+
+
+def _updated_usage_bucket(
+    current: Mapping[str, UsageAmount],
+    key: str,
+    amount: UsageAmount,
+) -> dict[str, UsageAmount]:
+    updated = dict(current)
+    updated[key] = _add_usage(updated.get(key, UsageAmount()), amount)
+    return updated

@@ -872,20 +872,20 @@ policy.
 
 **Actions:**
 
-- [ ] Define explicit precedence among mandatory plan review, project policy,
+- [x] Define explicit precedence among mandatory plan review, project policy,
   selected profile, per-step override, and operator waiver.
-- [ ] Reject contradictory review configuration at startup.
-- [ ] Compile a concrete review obligation for every step before execution.
-- [ ] Store the compiled obligation and source policy hashes in run state.
-- [ ] Make supervisor review proposals subject to the compiled obligation.
-- [ ] Add economy, balanced, thorough, multi-review on/off, mandatory review,
+- [x] Reject contradictory review configuration at startup.
+- [x] Compile a concrete review obligation for every step before execution.
+- [x] Store the compiled obligation and source policy hashes in run state.
+- [x] Make supervisor review proposals subject to the compiled obligation.
+- [x] Add economy, balanced, thorough, multi-review on/off, mandatory review,
   and conflicting-policy tests.
 
 **Acceptance criteria:**
 
-- [ ] A mandatory review cannot be skipped by the supervisor or a weaker
+- [x] A mandatory review cannot be skipped by the supervisor or a weaker
   profile.
-- [ ] Every step's required reviewer count and independence class are visible
+- [x] Every step's required reviewer count and independence class are visible
   before execution starts.
 
 ### DISP-601: Implement rework and escalation policy
@@ -894,18 +894,18 @@ policy.
 
 **Actions:**
 
-- [ ] Implement configured rework rounds.
-- [ ] Implement tie-break review only against the same immutable artifact.
-- [ ] Implement high-risk second review according to compiled obligations.
-- [ ] Implement executor reassignment while preserving attempt lineage.
-- [ ] Define exhaustion outcomes and operator intervention points.
-- [ ] Add disagreement, repeated rejection, inconclusive review, blocked
+- [x] Implement configured rework rounds.
+- [x] Implement tie-break review only against the same immutable artifact.
+- [x] Implement high-risk second review according to compiled obligations.
+- [x] Implement executor reassignment while preserving attempt lineage.
+- [x] Define exhaustion outcomes and operator intervention points.
+- [x] Add disagreement, repeated rejection, inconclusive review, blocked
   reviewer, reassignment, and exhaustion tests.
 
 **Acceptance criteria:**
 
-- [ ] Every review verdict has one deterministic next transition.
-- [ ] Escalation cannot reset counters or lose prior findings.
+- [x] Every review verdict has one deterministic next transition.
+- [x] Escalation cannot reset counters or lose prior findings.
 
 ### DISP-602: Implement durable operator gates and underspecification
 
@@ -913,23 +913,23 @@ policy.
 
 **Actions:**
 
-- [ ] Represent risky actions and underspecification questions as typed operator
+- [x] Represent risky actions and underspecification questions as typed operator
   decisions.
-- [ ] Enter `WAITING_OPERATOR` before returning from the active command.
-- [ ] Persist question, allowed answers, context, expiration, and required role.
-- [ ] Apply answers through the `answer` command and resume from the exact
+- [x] Enter `WAITING_OPERATOR` before returning from the active command.
+- [x] Persist question, allowed answers, context, expiration, and required role.
+- [x] Apply answers through the `answer` command and resume from the exact
   blocked transition.
-- [ ] Compile `underspec_mode` into permission and workflow policy.
-- [ ] Remove subjective exceptions such as "genuine project-level
+- [x] Compile `underspec_mode` into permission and workflow policy.
+- [x] Remove subjective exceptions such as "genuine project-level
   clarification."
-- [ ] Add crash-while-waiting, duplicate answer, invalid answer, denied action,
+- [x] Add crash-while-waiting, duplicate answer, invalid answer, denied action,
   and answer-to-terminal-route tests.
 
 **Acceptance criteria:**
 
-- [ ] No question is lost on process exit.
-- [ ] Full-auto mode cannot silently approve an `ask` permission.
-- [ ] Operator decisions are correlated and auditable.
+- [x] No question is lost on process exit.
+- [x] Full-auto mode cannot silently approve an `ask` permission.
+- [x] Operator decisions are correlated and auditable.
 
 ### DISP-603: Enforce budget and context limits
 
@@ -937,28 +937,28 @@ policy.
 
 **Actions:**
 
-- [ ] Require explicit run cost cap, per-step attempt cap, wall-clock timeout,
+- [x] Require explicit run cost cap, per-step attempt cap, wall-clock timeout,
   and context policy when the feature is enabled.
-- [ ] Consume normalized usage and cost from the OpenCode adapter.
-- [ ] Persist cumulative run, step, role, and session usage.
-- [ ] Check limits before dispatch and after each result.
-- [ ] Define halt, fork, compact, or operator decision behavior for each limit.
-- [ ] Replace unresolved forwarding placeholders with structured measured
+- [x] Consume normalized usage and cost from the OpenCode adapter.
+- [x] Persist cumulative run, step, role, and session usage.
+- [x] Check limits before dispatch and after each result.
+- [x] Define halt, fork, compact, or operator decision behavior for each limit.
+- [x] Replace unresolved forwarding placeholders with structured measured
   values.
-- [ ] Add threshold, missing-usage, over-budget, resumed-session, and cumulative
+- [x] Add threshold, missing-usage, over-budget, resumed-session, and cumulative
   accounting tests.
 
 **Acceptance criteria:**
 
-- [ ] A run cannot exceed a configured cost cap through a new dispatch.
-- [ ] Missing required usage data fails closed rather than reporting zero.
+- [x] A run cannot exceed a configured cost cap through a new dispatch.
+- [x] Missing required usage data fails closed rather than reporting zero.
 
 ### Phase 6 gate
 
-- [ ] Review profile and escalation matrices pass.
-- [ ] Operator questions and gates survive restart.
-- [ ] Budget and context limits are enforced from measured data.
-- [ ] Completion remains impossible while any policy obligation is unresolved.
+- [x] Review profile and escalation matrices pass.
+- [x] Operator questions and gates survive restart.
+- [x] Budget and context limits are enforced from measured data.
+- [x] Completion remains impossible while any policy obligation is unresolved.
 
 ## 12. Phase 7: Dependency scheduling and bounded parallelism
 

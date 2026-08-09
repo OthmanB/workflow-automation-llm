@@ -1,5 +1,47 @@
 {
   "$defs": {
+    "BudgetDefinition": {
+      "additionalProperties": false,
+      "description": "Measured resource limits enforced by the sequential coordinator.",
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_context_tokens": {
+          "minimum": 1,
+          "title": "Max Context Tokens",
+          "type": "integer"
+        },
+        "max_run_cost_usd": {
+          "minimum": 0,
+          "title": "Max Run Cost Usd",
+          "type": "number"
+        },
+        "max_step_cost_usd": {
+          "minimum": 0,
+          "title": "Max Step Cost Usd",
+          "type": "number"
+        },
+        "on_limit": {
+          "enum": [
+            "halt",
+            "ask"
+          ],
+          "title": "On Limit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "max_run_cost_usd",
+        "max_step_cost_usd",
+        "max_context_tokens",
+        "on_limit"
+      ],
+      "title": "BudgetDefinition",
+      "type": "object"
+    },
     "EvidencePolicy": {
       "additionalProperties": false,
       "description": "Explicit evidence integrity requirements used by normalized plans.",
@@ -382,6 +424,35 @@
       "title": "RepositoryDefinition",
       "type": "object"
     },
+    "ReviewPolicyDefinition": {
+      "additionalProperties": false,
+      "description": "Project-wide review constraints combined with selected profile policy.",
+      "properties": {
+        "allow_operator_waiver": {
+          "title": "Allow Operator Waiver",
+          "type": "boolean"
+        },
+        "critical_risk_tags": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Critical Risk Tags",
+          "type": "array"
+        },
+        "mandatory_review": {
+          "title": "Mandatory Review",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mandatory_review",
+        "critical_risk_tags",
+        "allow_operator_waiver"
+      ],
+      "title": "ReviewPolicyDefinition",
+      "type": "object"
+    },
     "RoleClassPolicies": {
       "additionalProperties": false,
       "description": "Required policy layer for each role class.",
@@ -557,6 +628,9 @@
   "additionalProperties": false,
   "description": "Versioned, project-neutral configuration schema for Phase 1.",
   "properties": {
+    "budget": {
+      "$ref": "#/$defs/BudgetDefinition"
+    },
     "evidence": {
       "$ref": "#/$defs/EvidencePolicy"
     },
@@ -592,6 +666,9 @@
       "title": "Repositories",
       "type": "object"
     },
+    "review_policy": {
+      "$ref": "#/$defs/ReviewPolicyDefinition"
+    },
     "roles": {
       "$ref": "#/$defs/RolesDefinition"
     },
@@ -616,6 +693,8 @@
     "roles",
     "profile",
     "execution",
+    "review_policy",
+    "budget",
     "permission_policies",
     "evidence"
   ],

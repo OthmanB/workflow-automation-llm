@@ -18,7 +18,7 @@ from .sessions import (
     run_session,
 )
 from .state_store import StateStore
-from .workflow import RunRecord
+from .workflow import RunRecord, RunStatus
 
 SessionRunner = Callable[..., SessionResult]
 
@@ -190,15 +190,18 @@ class SequentialExecutionCoordinator:
                     "adapter result session does not match the durable running dispatch"
                 )
             payload = _strict_json_object(result.chat_response)
+            usage = _session_usage(result)
             if current.dispatch.role_kind == "executor":
                 record, generation, forwarding = self.workflow.apply_executor_result(
                     current,
                     parse_executor_result(payload),
+                    usage=usage,
                 )
             else:
                 record, generation, forwarding = self.workflow.apply_reviewer_result(
                     current,
                     parse_reviewer_result(payload),
+                    usage=usage,
                 )
         except Exception as exc:
             stored, stored_generation = self.store.load_run(current.run_id)
@@ -269,6 +272,12 @@ class SequentialExecutionCoordinator:
                 if isinstance(action, PreparedDispatch):
                     worker = self.execute_worker(action)
                     generation = worker.generation
+                    if worker.record.state is not RunStatus.RUNNING:
+                        return CompletionDecision(
+                            accepted=False,
+                            obligations=(f"run stopped by policy: {worker.record.state.value}",),
+                            report_path=None,
+                        )
                     supervisor_prompt = worker.forwarding
                     pending_acknowledgement = worker.dispatch_id
                     continue
@@ -309,3 +318,16 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _session_usage(result: SessionResult) -> dict[str, object] | None:
+    if result.cost is None:
+        return None
+    tokens = result.usage
+    return {
+        "cost_usd": result.cost,
+        "tokens_total": tokens.get("total"),
+        "tokens_input": tokens.get("input"),
+        "tokens_output": tokens.get("output"),
+        "tokens_reasoning": tokens.get("reasoning"),
+    }

@@ -406,6 +406,46 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
         )
 
 
+@pytest.mark.parametrize(
+    ("expires_at", "required_role", "actor_id", "message"),
+    [
+        (datetime.now(UTC) - timedelta(seconds=1), None, "operator", "has expired"),
+        (None, "release-manager", "operator", "required role"),
+    ],
+)
+def test_operator_answer_rejects_expired_or_unauthorized_requests(
+    project: FixtureProject,
+    expires_at: datetime | None,
+    required_role: str | None,
+    actor_id: str,
+    message: str,
+) -> None:
+    store = _store(project)
+    record = transition_run(_record(project), RunStatus.READY, _event(2))
+    request = OperatorRequest(
+        request_id="request-guarded",
+        question="Approve guarded action",
+        allowed_answers=["approve"],
+        context_ref="guarded",
+        resume_to=RunStatus.READY,
+        expires_at=expires_at,
+        required_role=required_role,
+        kind="risk_gate",
+        step_id="prepare-fixture",
+    )
+    waiting = transition_run(record, RunStatus.WAITING_OPERATOR, _event(3), operator_request=request)
+    store.create_run(waiting)
+
+    with pytest.raises(StateStoreError, match=message):
+        store.answer_operator_request(
+            run_id=waiting.run_id,
+            expected_generation=1,
+            request_id=request.request_id,
+            answer="approve",
+            actor_id=actor_id,
+        )
+
+
 def test_running_dispatch_never_allows_automatic_retry(project: FixtureProject) -> None:
     store = _store(project)
     record = _record(project)

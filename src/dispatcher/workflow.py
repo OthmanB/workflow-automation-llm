@@ -110,7 +110,7 @@ STEP_TRANSITIONS: dict[StepStatus, frozenset[StepStatus]] = {
         }
     ),
     StepStatus.CHANGES_REQUESTED: frozenset(
-        {StepStatus.READY, StepStatus.BLOCKED, StepStatus.FAILED}
+        {StepStatus.READY, StepStatus.REVIEW_REQUIRED, StepStatus.BLOCKED, StepStatus.FAILED}
     ),
     StepStatus.BLOCKED: frozenset({StepStatus.READY, StepStatus.WAIVED, StepStatus.FAILED}),
     StepStatus.ACCEPTED: frozenset(),
@@ -161,6 +161,16 @@ class OperatorRequest(ContractModel):
     resume_to: RunStatus
     expires_at: datetime | None
     required_role: Identifier | None
+    kind: Literal[
+        "underspecification",
+        "risk_gate",
+        "reconciliation",
+        "budget",
+        "escalation",
+        "review_waiver",
+    ] = "underspecification"
+    step_id: Identifier | None = None
+    reassignment_role_key: Identifier | None = None
 
     @model_validator(mode="after")
     def nonempty_answers(self) -> "OperatorRequest":
@@ -168,6 +178,8 @@ class OperatorRequest(ContractModel):
             raise ValueError("operator request requires at least one allowed answer")
         if len(self.allowed_answers) != len(set(self.allowed_answers)):
             raise ValueError("operator request allowed_answers must not contain duplicates")
+        if (self.kind == "escalation") != (self.reassignment_role_key is not None):
+            raise ValueError("only escalation requests may define reassignment_role_key")
         return self
 
 
@@ -232,6 +244,57 @@ class DispatchRecord(ContractModel):
         return self
 
 
+class CompiledReviewObligation(ContractModel):
+    """Concrete pre-dispatch review policy for one normalized plan step."""
+
+    step_id: Identifier
+    required: bool
+    reviewer_role_keys: tuple[Identifier, ...]
+    required_acceptances: Annotated[int, Field(ge=0, le=20)]
+    independence: Literal["fresh_session"]
+    waivable: bool
+    source_policy_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+    @model_validator(mode="after")
+    def validate_requirement(self) -> "CompiledReviewObligation":
+        if self.required != bool(self.required_acceptances):
+            raise ValueError("review obligation required must match required_acceptances")
+        if self.required_acceptances > len(self.reviewer_role_keys):
+            raise ValueError("review obligation acceptances cannot exceed reviewers")
+        if len(self.reviewer_role_keys) != len(set(self.reviewer_role_keys)):
+            raise ValueError("review obligation reviewers must be unique")
+        return self
+
+
+class RunPolicy(ContractModel):
+    """Immutable Phase 6 policy compiled before a run can launch work."""
+
+    profile_id: Identifier
+    profile_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    review_obligations: dict[Identifier, CompiledReviewObligation]
+    underspec_mode: Literal["ask", "auto"]
+    policy_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class UsageAmount(ContractModel):
+    """Normalized measured usage for one run, step, role, or session."""
+
+    cost_usd: Annotated[float, Field(ge=0)] = 0.0
+    tokens_total: Annotated[int, Field(ge=0)] = 0
+    tokens_input: Annotated[int, Field(ge=0)] = 0
+    tokens_output: Annotated[int, Field(ge=0)] = 0
+    tokens_reasoning: Annotated[int, Field(ge=0)] = 0
+
+
+class UsageLedger(ContractModel):
+    """Cumulative measured usage with independently auditable dimensions."""
+
+    run: UsageAmount = Field(default_factory=UsageAmount)
+    by_step: dict[Identifier, UsageAmount] = Field(default_factory=dict)
+    by_role: dict[Identifier, UsageAmount] = Field(default_factory=dict)
+    by_session: dict[Identifier, UsageAmount] = Field(default_factory=dict)
+
+
 class StepRecord(ContractModel):
     """Mutable run status for one immutable normalized plan step."""
 
@@ -242,6 +305,11 @@ class StepRecord(ContractModel):
     active_dispatch_id: Identifier | None
     accepted_artifact_ids: list[Identifier]
     review_acceptances: Annotated[int, Field(ge=0, le=100)]
+    accepted_reviewer_role_keys: list[Identifier] = Field(default_factory=list)
+    rework_rounds: Annotated[int, Field(ge=0, le=100)] = 0
+    reassignment_role_key: Identifier | None = None
+    review_waiver_decision_ref: Identifier | None = None
+    stalls: Annotated[int, Field(ge=0, le=100)] = 0
     operator_gate_resolved: bool
     waiver_decision_ref: Identifier | None
     result_digests: list[Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]]
@@ -255,6 +323,12 @@ class StepRecord(ContractModel):
             raise ValueError("non-waived step cannot have waiver_decision_ref")
         if len(self.accepted_artifact_ids) != len(set(self.accepted_artifact_ids)):
             raise ValueError("accepted_artifact_ids must not contain duplicates")
+        if len(self.accepted_reviewer_role_keys) != len(set(self.accepted_reviewer_role_keys)):
+            raise ValueError("accepted_reviewer_role_keys must not contain duplicates")
+        if self.reassignment_role_key is not None and self.state is not StepStatus.READY:
+            raise ValueError("reassignment_role_key is only valid for ready steps")
+        if self.review_waiver_decision_ref is not None and self.state is not StepStatus.ACCEPTED:
+            raise ValueError("review_waiver_decision_ref is only valid for accepted steps")
         if len(self.result_digests) != len(set(self.result_digests)):
             raise ValueError("result_digests must not contain duplicates")
         return self
@@ -275,6 +349,8 @@ class RunRecord(ContractModel):
     steps: dict[Identifier, StepRecord]
     dispatches: dict[Identifier, DispatchRecord]
     operator_request: OperatorRequest | None
+    policy: RunPolicy | None = None
+    usage: UsageLedger = Field(default_factory=UsageLedger)
     created_at: datetime
     updated_at: datetime
 
@@ -288,6 +364,12 @@ class RunRecord(ContractModel):
             raise ValueError(str(exc)) from exc
         if set(self.steps) != {step.step_id for step in self.plan.steps}:
             raise ValueError("run step records must exactly match normalized plan steps")
+        if self.policy is not None:
+            if set(self.policy.review_obligations) != set(self.steps):
+                raise ValueError("run policy review obligations must exactly match run steps")
+            for step_id, obligation in self.policy.review_obligations.items():
+                if obligation.step_id != step_id:
+                    raise ValueError("run policy review obligation step_id must match its mapping key")
         if self.state is RunStatus.WAITING_OPERATOR and self.operator_request is None:
             raise ValueError("waiting operator run requires operator_request")
         if self.state is not RunStatus.WAITING_OPERATOR and self.operator_request is not None:
@@ -331,6 +413,11 @@ def new_run_record(
             active_dispatch_id=None,
             accepted_artifact_ids=[],
             review_acceptances=0,
+            accepted_reviewer_role_keys=[],
+            rework_rounds=0,
+            reassignment_role_key=None,
+            review_waiver_decision_ref=None,
+            stalls=0,
             operator_gate_resolved=not step.authorization.requires_operator_approval,
             waiver_decision_ref=None,
             result_digests=[],
@@ -394,19 +481,30 @@ def transition_step(
     *,
     active_dispatch_id: str | None = None,
     waiver_decision_ref: str | None = None,
+    review_waiver_decision_ref: str | None = None,
 ) -> StepRecord:
     """Apply one validated step transition without interpreting free-form chat."""
-    _validate_transition("step", record.state, target, STEP_TRANSITIONS)
+    review_waiver_acceptance = (
+        record.state is StepStatus.REVIEW_REQUIRED
+        and target is StepStatus.ACCEPTED
+        and review_waiver_decision_ref is not None
+    )
+    if not review_waiver_acceptance:
+        _validate_transition("step", record.state, target, STEP_TRANSITIONS)
     if target is StepStatus.WAIVED and waiver_decision_ref is None:
         raise TransitionError("WAIVED requires waiver_decision_ref")
     if target is not StepStatus.WAIVED and waiver_decision_ref is not None:
         raise TransitionError("waiver_decision_ref is only valid for WAIVED")
+    if target is not StepStatus.ACCEPTED and review_waiver_decision_ref is not None:
+        raise TransitionError("review_waiver_decision_ref is only valid for ACCEPTED")
     values = record.model_dump()
     values.update(
         {
             "state": target,
             "active_dispatch_id": active_dispatch_id,
             "waiver_decision_ref": waiver_decision_ref,
+            "review_waiver_decision_ref": review_waiver_decision_ref,
+            "reassignment_role_key": None,
             "last_event": event,
         }
     )
@@ -445,6 +543,9 @@ def completion_obligations(record: RunRecord) -> list[CompletionObligation]:
     plan_steps = {step.step_id: step for step in record.plan.steps}
     for step_id, step_record in record.steps.items():
         plan_step = plan_steps[step_id]
+        required_acceptances = plan_step.review.required_acceptances
+        if record.policy is not None:
+            required_acceptances = record.policy.review_obligations[step_id].required_acceptances
         if step_record.state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}:
             obligations.append(
                 CompletionObligation(
@@ -477,14 +578,17 @@ def completion_obligations(record: RunRecord) -> list[CompletionObligation]:
                         detail=f"step {step_id} is missing evidence {sorted(missing_artifacts)}",
                     )
                 )
-            if step_record.review_acceptances < plan_step.review.required_acceptances:
+            if (
+                step_record.review_waiver_decision_ref is None
+                and step_record.review_acceptances < required_acceptances
+            ):
                 obligations.append(
                     CompletionObligation(
                         code="review_incomplete",
                         step_id=step_id,
                         detail=(
                             f"step {step_id} has {step_record.review_acceptances} review acceptances, "
-                            f"requires {plan_step.review.required_acceptances}"
+                            f"requires {required_acceptances}"
                         ),
                     )
                 )

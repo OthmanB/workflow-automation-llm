@@ -1,15 +1,21 @@
-# Schema-v1 review profiles. Review execution semantics land in Phase 6.
+# Schema-v1 review profiles compiled into immutable Phase 6 run obligations.
 schema_version: 1
 
 profiles:
   economy:
     review_schedule: on_failure
     multi_review: "off"
+    reviewer_role_keys: [reviewer]
+    required_acceptances: 1
   balanced:
     review_schedule: critical
     multi_review: on_critical_only
+    reviewer_role_keys: [reviewer, reviewer-two]
+    required_acceptances: 2
   thorough:
     review_schedule: always
     multi_review: on_every_review
+    reviewer_role_keys: [reviewer, reviewer-two]
+    required_acceptances: 2
 
 default: balanced

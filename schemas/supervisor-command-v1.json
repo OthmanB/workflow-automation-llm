@@ -198,6 +198,41 @@
       ],
       "title": "RequestCompletionCommand",
       "type": "object"
+    },
+    "RequestReviewWaiverCommand": {
+      "additionalProperties": false,
+      "description": "Ask the operator to waive a non-mandatory compiled review obligation.",
+      "properties": {
+        "action": {
+          "const": "request_review_waiver",
+          "title": "Action",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "rationale": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action",
+        "step_id",
+        "rationale"
+      ],
+      "title": "RequestReviewWaiverCommand",
+      "type": "object"
     }
   },
   "discriminator": {
@@ -205,7 +240,8 @@
       "ask_operator": "#/$defs/AskOperatorCommand",
       "dispatch": "#/$defs/DispatchCommand",
       "halt": "#/$defs/HaltCommand",
-      "request_completion": "#/$defs/RequestCompletionCommand"
+      "request_completion": "#/$defs/RequestCompletionCommand",
+      "request_review_waiver": "#/$defs/RequestReviewWaiverCommand"
     },
     "propertyName": "action"
   },
@@ -215,6 +251,9 @@
     },
     {
       "$ref": "#/$defs/AskOperatorCommand"
+    },
+    {
+      "$ref": "#/$defs/RequestReviewWaiverCommand"
     },
     {
       "$ref": "#/$defs/HaltCommand"

@@ -59,6 +59,60 @@
       "title": "ArtifactReference",
       "type": "object"
     },
+    "CompiledReviewObligation": {
+      "additionalProperties": false,
+      "description": "Concrete pre-dispatch review policy for one normalized plan step.",
+      "properties": {
+        "independence": {
+          "const": "fresh_session",
+          "title": "Independence",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "required_acceptances": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Required Acceptances",
+          "type": "integer"
+        },
+        "reviewer_role_keys": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Reviewer Role Keys",
+          "type": "array"
+        },
+        "source_policy_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Source Policy Digest",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "waivable": {
+          "title": "Waivable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "step_id",
+        "required",
+        "reviewer_role_keys",
+        "required_acceptances",
+        "independence",
+        "waivable",
+        "source_policy_digest"
+      ],
+      "title": "CompiledReviewObligation",
+      "type": "object"
+    },
     "DispatchIntent": {
       "additionalProperties": false,
       "description": "Durable intent required before a subprocess can be launched in Phase 3.",
@@ -314,11 +368,37 @@
           ],
           "title": "Expires At"
         },
+        "kind": {
+          "default": "underspecification",
+          "enum": [
+            "underspecification",
+            "risk_gate",
+            "reconciliation",
+            "budget",
+            "escalation",
+            "review_waiver"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
         "question": {
           "maxLength": 10000,
           "minLength": 1,
           "title": "Question",
           "type": "string"
+        },
+        "reassignment_role_key": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reassignment Role Key"
         },
         "request_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
@@ -339,6 +419,19 @@
         },
         "resume_to": {
           "$ref": "#/$defs/RunStatus"
+        },
+        "step_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Id"
         }
       },
       "required": [
@@ -750,6 +843,53 @@
       "title": "ReviewObligation",
       "type": "object"
     },
+    "RunPolicy": {
+      "additionalProperties": false,
+      "description": "Immutable Phase 6 policy compiled before a run can launch work.",
+      "properties": {
+        "policy_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Policy Digest",
+          "type": "string"
+        },
+        "profile_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Profile Digest",
+          "type": "string"
+        },
+        "profile_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Profile Id",
+          "type": "string"
+        },
+        "review_obligations": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/CompiledReviewObligation"
+            }
+          },
+          "title": "Review Obligations",
+          "type": "object"
+        },
+        "underspec_mode": {
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "title": "Underspec Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile_id",
+        "profile_digest",
+        "review_obligations",
+        "underspec_mode",
+        "policy_digest"
+      ],
+      "title": "RunPolicy",
+      "type": "object"
+    },
     "RunStatus": {
       "enum": [
         "NEW",
@@ -800,6 +940,14 @@
           "title": "Accepted Artifact Ids",
           "type": "array"
         },
+        "accepted_reviewer_role_keys": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Accepted Reviewer Role Keys",
+          "type": "array"
+        },
         "active_dispatch_id": {
           "anyOf": [
             {
@@ -825,6 +973,19 @@
           "title": "Operator Gate Resolved",
           "type": "boolean"
         },
+        "reassignment_role_key": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reassignment Role Key"
+        },
         "result_digests": {
           "items": {
             "pattern": "^[a-f0-9]{64}$",
@@ -839,10 +1000,37 @@
           "title": "Review Acceptances",
           "type": "integer"
         },
+        "review_waiver_decision_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Review Waiver Decision Ref"
+        },
         "reviewer_attempts": {
           "maximum": 100,
           "minimum": 0,
           "title": "Reviewer Attempts",
+          "type": "integer"
+        },
+        "rework_rounds": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Rework Rounds",
+          "type": "integer"
+        },
+        "stalls": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Stalls",
           "type": "integer"
         },
         "state": {
@@ -951,6 +1139,82 @@
       ],
       "title": "TransitionEvent",
       "type": "object"
+    },
+    "UsageAmount": {
+      "additionalProperties": false,
+      "description": "Normalized measured usage for one run, step, role, or session.",
+      "properties": {
+        "cost_usd": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Cost Usd",
+          "type": "number"
+        },
+        "tokens_input": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Tokens Input",
+          "type": "integer"
+        },
+        "tokens_output": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Tokens Output",
+          "type": "integer"
+        },
+        "tokens_reasoning": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Tokens Reasoning",
+          "type": "integer"
+        },
+        "tokens_total": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Tokens Total",
+          "type": "integer"
+        }
+      },
+      "title": "UsageAmount",
+      "type": "object"
+    },
+    "UsageLedger": {
+      "additionalProperties": false,
+      "description": "Cumulative measured usage with independently auditable dimensions.",
+      "properties": {
+        "by_role": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/UsageAmount"
+            }
+          },
+          "title": "By Role",
+          "type": "object"
+        },
+        "by_session": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/UsageAmount"
+            }
+          },
+          "title": "By Session",
+          "type": "object"
+        },
+        "by_step": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/UsageAmount"
+            }
+          },
+          "title": "By Step",
+          "type": "object"
+        },
+        "run": {
+          "$ref": "#/$defs/UsageAmount"
+        }
+      },
+      "title": "UsageLedger",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -996,6 +1260,17 @@
       "title": "Plan Digest",
       "type": "string"
     },
+    "policy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "project_id": {
       "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
       "title": "Project Id",
@@ -1032,6 +1307,9 @@
       "format": "date-time",
       "title": "Updated At",
       "type": "string"
+    },
+    "usage": {
+      "$ref": "#/$defs/UsageLedger"
     }
   },
   "required": [

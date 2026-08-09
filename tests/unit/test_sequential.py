@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from helpers import FixtureProject, create_fixture_project, valid_plan_values
 
 from dispatcher.plan import NormalizedPlan, approve_plan
@@ -24,6 +26,8 @@ from dispatcher.workflow import (
     RunRecord,
     StepStatus,
     TransitionEvent,
+    UsageAmount,
+    UsageLedger,
     new_run_record,
     transition_step,
 )
@@ -55,7 +59,12 @@ def _store(project: FixtureProject) -> StateStore:
     )
 
 
-def _record(project: FixtureProject, *, review_required: bool = False) -> RunRecord:
+def _record(
+    project: FixtureProject,
+    *,
+    review_required: bool = False,
+    max_reviewer_attempts: int | None = None,
+) -> RunRecord:
     values = valid_plan_values(project)
     if review_required:
         values["steps"][0]["review"] = {
@@ -63,9 +72,11 @@ def _record(project: FixtureProject, *, review_required: bool = False) -> RunRec
             "reviewer_role_keys": ["reviewer"],
             "required_acceptances": 1,
         }
-        values["steps"][0]["retry"]["max_reviewer_attempts"] = 1
+        values["steps"][0]["retry"]["max_reviewer_attempts"] = 2
         values["steps"][0]["retry"]["max_executor_attempts"] = 2
         values["steps"][0]["retry"]["on_changes_requested"] = "retry"
+    if max_reviewer_attempts is not None:
+        values["steps"][0]["retry"]["max_reviewer_attempts"] = max_reviewer_attempts
     plan = NormalizedPlan.model_validate(values)
     record = new_run_record(
         run_id="fixture-run",
@@ -167,17 +178,35 @@ def _executor_result(prepared: PreparedDispatch, outcome: str = "completed") -> 
     return result
 
 
-def _activate_ready_run(project: FixtureProject, *, review_required: bool = False) -> tuple[StateStore, SequentialWorkflow, RunRecord, int]:
+def _activate_ready_run(
+    project: FixtureProject,
+    *,
+    review_required: bool = False,
+    max_reviewer_attempts: int | None = None,
+) -> tuple[StateStore, SequentialWorkflow, RunRecord, int]:
     store = _store(project)
-    record = _record(project, review_required=review_required)
+    record = _record(
+        project,
+        review_required=review_required,
+        max_reviewer_attempts=max_reviewer_attempts,
+    )
     generation = store.create_run(record)
     workflow = _workflow(project, store)
     active, generation = workflow.activate(record.run_id, expected_generation=generation)
     return store, workflow, active, generation
 
 
-def _prepare_executor(project: FixtureProject, *, review_required: bool = False) -> tuple[StateStore, SequentialWorkflow, PreparedDispatch]:
-    _store_value, workflow, record, generation = _activate_ready_run(project, review_required=review_required)
+def _prepare_executor(
+    project: FixtureProject,
+    *,
+    review_required: bool = False,
+    max_reviewer_attempts: int | None = None,
+) -> tuple[StateStore, SequentialWorkflow, PreparedDispatch]:
+    _store_value, workflow, record, generation = _activate_ready_run(
+        project,
+        review_required=review_required,
+        max_reviewer_attempts=max_reviewer_attempts,
+    )
     prepared = workflow.prepare_from_supervisor(
         record.run_id,
         expected_generation=generation,
@@ -298,6 +327,482 @@ def test_supervisor_repository_assertion_cannot_override_normalized_step(project
         )
 
     assert store.load_run(record.run_id)[0].dispatches == {}
+
+
+def test_risk_gate_waits_durably_and_approve_resumes_the_exact_step(project: FixtureProject) -> None:
+    values = valid_plan_values(project)
+    values["steps"][0]["authorization"]["requires_operator_approval"] = True
+    plan = NormalizedPlan.model_validate(values)
+    record = new_run_record(
+        run_id="risk-gate-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-risk-gate"),
+        event=_event(1),
+    )
+    store = _store(project)
+    generation = store.create_run(record)
+    workflow = _workflow(project, store)
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+
+    waiting = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+
+    assert isinstance(waiting, RunRecord)
+    assert waiting.state.value == "WAITING_OPERATOR"
+    assert waiting.operator_request is not None
+    assert waiting.operator_request.kind == "risk_gate"
+    store.close()
+    store = _store(project)
+    workflow = _workflow(project, store)
+    resumed, generation = store.answer_operator_request(
+        run_id=record.run_id,
+        expected_generation=store.load_run(record.run_id)[1],
+        request_id=waiting.operator_request.request_id,
+        answer="approve",
+        actor_id="operator",
+    )
+    resumed, generation = workflow.refresh_readiness(resumed, generation)
+
+    assert resumed.state.value == "RUNNING"
+    assert resumed.steps["prepare-fixture"].operator_gate_resolved
+    assert resumed.steps["prepare-fixture"].state is StepStatus.READY
+
+
+def test_underspecification_auto_mode_never_silently_approves_an_ask(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    values = config_values(project)
+    values["execution"]["underspec_mode"] = "auto"
+    configured = replace(project, config=write_config(project, values))
+    store, workflow, record, generation = _activate_ready_run(configured)
+
+    with pytest.raises(SequentialWorkflowError, match="underspecification requests are denied"):
+        workflow.prepare_from_supervisor(
+            record.run_id,
+            expected_generation=generation,
+            supervisor_text=(
+                '{"protocol_version":1,"action":"ask_operator","question":"Need a decision"}'
+            ),
+        )
+
+    assert store.load_run(record.run_id)[0].state.value == "RUNNING"
+
+
+def test_budget_usage_is_persisted_and_halts_after_an_over_limit_result(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    values = config_values(project)
+    values["budget"].update(
+        {
+            "enabled": True,
+            "max_run_cost_usd": 0.001,
+            "max_step_cost_usd": 0.001,
+            "max_context_tokens": 100,
+            "on_limit": "halt",
+        }
+    )
+    configured = replace(project, config=write_config(project, values))
+    _store_value, workflow, prepared = _prepare_executor(configured)
+
+    record, _generation, forwarding = workflow.apply_executor_result(
+        prepared,
+        parse_executor_result(_executor_result(prepared)),
+        usage={
+            "cost_usd": 0.002,
+            "tokens_total": 10,
+            "tokens_input": 6,
+            "tokens_output": 4,
+            "tokens_reasoning": 0,
+        },
+    )
+
+    assert record.state.value == "HALTED"
+    assert record.usage.run.cost_usd == 0.002
+    assert record.usage.by_step["prepare-fixture"].tokens_total == 10
+    assert record.usage.by_role["terra"].tokens_input == 6
+    assert record.usage.by_session["ses-executor"].tokens_output == 4
+    assert json.loads(forwarding)["usage"]["cost_usd"] == 0.002
+
+
+def test_enabled_budget_rejects_missing_measured_usage(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    values = config_values(project)
+    values["budget"]["enabled"] = True
+    configured = replace(project, config=write_config(project, values))
+    _store_value, workflow, prepared = _prepare_executor(configured)
+
+    with pytest.raises(SequentialWorkflowError, match="measured OpenCode usage is required"):
+        workflow.apply_executor_result(prepared, parse_executor_result(_executor_result(prepared)))
+
+
+def test_budget_blocks_a_resumed_session_at_the_context_threshold(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    values = config_values(project)
+    values["budget"].update(
+        {
+            "enabled": True,
+            "max_run_cost_usd": 1.0,
+            "max_step_cost_usd": 1.0,
+            "max_context_tokens": 10,
+            "on_limit": "halt",
+        }
+    )
+    configured = replace(project, config=write_config(project, values))
+    store = _store(configured)
+    record = _record(configured).model_copy(
+        update={"usage": UsageLedger(by_session={"ses-executor": UsageAmount(tokens_total=10)})}
+    )
+    generation = store.create_run(record, sessions={"executors": {"terra": {"session_id": "ses-executor"}}})
+    workflow = _workflow(configured, store)
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+
+    with pytest.raises(SequentialWorkflowError, match="context token limit is exhausted"):
+        workflow.prepare_from_supervisor(
+            active.run_id,
+            expected_generation=generation,
+            supervisor_text=_dispatch_command(mode="resume"),
+        )
+
+
+def test_operator_can_waive_only_a_non_mandatory_compiled_review(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    profiles = yaml.safe_load(project.profiles_path.read_text(encoding="utf-8"))
+    profiles["profiles"]["economy"] = {
+        "review_schedule": "always",
+        "multi_review": "off",
+        "reviewer_role_keys": ["reviewer"],
+        "required_acceptances": 1,
+    }
+    project.profiles_path.write_text(yaml.safe_dump(profiles, sort_keys=False), encoding="utf-8")
+    values = config_values(project)
+    values["profile"]["profile_id"] = "economy"
+    values["review_policy"]["allow_operator_waiver"] = True
+    configured = replace(project, config=write_config(project, values))
+    _store_value, workflow, executor = _prepare_executor(configured, max_reviewer_attempts=1)
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+
+    waiting = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=(
+            '{"protocol_version":1,"action":"request_review_waiver",'
+            '"step_id":"prepare-fixture","rationale":"operator accepts the evidence risk"}'
+        ),
+    )
+
+    assert isinstance(waiting, RunRecord)
+    assert waiting.operator_request is not None
+    assert waiting.operator_request.kind == "review_waiver"
+    resumed, _generation = _store_value.answer_operator_request(
+        run_id=waiting.run_id,
+        expected_generation=_store_value.load_run(waiting.run_id)[1],
+        request_id=waiting.operator_request.request_id,
+        answer="waive",
+        actor_id="operator",
+    )
+    waived_review = resumed.steps["prepare-fixture"]
+
+    assert resumed.state.value == "RUNNING"
+    assert waived_review.state is StepStatus.ACCEPTED
+    assert waived_review.review_waiver_decision_ref is not None
+    assert waived_review.accepted_artifact_ids == ["fixture-evidence"]
+
+
+def test_thorough_profile_requires_two_distinct_fresh_reviewer_acceptances(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    profiles = yaml.safe_load(project.profiles_path.read_text(encoding="utf-8"))
+    profiles["profiles"]["thorough"] = {
+        "review_schedule": "always",
+        "multi_review": "on_every_review",
+        "reviewer_role_keys": ["reviewer", "reviewer-two"],
+        "required_acceptances": 2,
+    }
+    project.profiles_path.write_text(yaml.safe_dump(profiles, sort_keys=False), encoding="utf-8")
+    values = config_values(project)
+    values["profile"]["profile_id"] = "thorough"
+    configured = replace(project, config=write_config(project, values))
+    store, workflow, executor = _prepare_executor(configured, review_required=True)
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+
+    first = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(first, PreparedDispatch)
+    first = workflow.record_session_id(workflow.mark_running(first, process_id=1235), runtime_session_id="ses-one")
+    first_result = parse_reviewer_result(
+        {
+            "result_version": 1,
+            "dispatch_id": first.dispatch.dispatch_id,
+            "attempt": first.dispatch.attempt,
+            "step_id": "prepare-fixture",
+            "repo_id": "fixture-repo",
+            "review_target": first.review_target.model_dump(mode="json"),
+            "findings": [],
+            "verification": [{"check_id": "review-check", "status": "passed", "summary": "passed"}],
+            "required_remediation": [],
+            "summary": "first review",
+            "verdict": "accepted",
+        }
+    )
+    record, generation, _forwarding = workflow.apply_reviewer_result(first, first_result)
+    assert record.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert record.steps["prepare-fixture"].accepted_reviewer_role_keys == ["reviewer"]
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=first.dispatch.dispatch_id,
+    )
+
+    second = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer-two"),
+    )
+    assert isinstance(second, PreparedDispatch)
+    second = workflow.record_session_id(workflow.mark_running(second, process_id=1236), runtime_session_id="ses-two")
+    second_result = first_result.model_copy(
+        update={
+            "dispatch_id": second.dispatch.dispatch_id,
+            "attempt": second.dispatch.attempt,
+            "review_target": second.review_target,
+            "summary": "second review",
+        }
+    )
+    record, _generation, _forwarding = workflow.apply_reviewer_result(second, second_result)
+
+    assert record.steps["prepare-fixture"].state is StepStatus.ACCEPTED
+    assert record.steps["prepare-fixture"].review_acceptances == 2
+    assert record.steps["prepare-fixture"].accepted_reviewer_role_keys == ["reviewer", "reviewer-two"]
+
+
+def test_conflicting_reviews_require_a_fresh_tie_break_on_the_same_artifact(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    profiles = yaml.safe_load(project.profiles_path.read_text(encoding="utf-8"))
+    profiles["profiles"]["thorough"] = {
+        "review_schedule": "always",
+        "multi_review": "on_every_review",
+        "reviewer_role_keys": ["reviewer", "reviewer-two", "reviewer-three"],
+        "required_acceptances": 2,
+    }
+    project.profiles_path.write_text(yaml.safe_dump(profiles, sort_keys=False), encoding="utf-8")
+    values = config_values(project)
+    values["profile"]["profile_id"] = "thorough"
+    values["roles"]["reviewers"]["reviewer-three"] = {
+        **values["roles"]["reviewers"]["reviewer-two"],
+        "model": "fixture/reviewer-three",
+        "display": "Fixture Tie Break Reviewer",
+    }
+    configured = replace(project, config=write_config(project, values))
+    _store_value, workflow, executor = _prepare_executor(configured, max_reviewer_attempts=3)
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+
+    first = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(first, PreparedDispatch)
+    first = workflow.record_session_id(workflow.mark_running(first, process_id=1235), runtime_session_id="ses-one")
+    accepted = parse_reviewer_result(
+        {
+            "result_version": 1,
+            "dispatch_id": first.dispatch.dispatch_id,
+            "attempt": first.dispatch.attempt,
+            "step_id": "prepare-fixture",
+            "repo_id": "fixture-repo",
+            "review_target": first.review_target.model_dump(mode="json"),
+            "findings": [],
+            "verification": [{"check_id": "review-check", "status": "passed", "summary": "passed"}],
+            "required_remediation": [],
+            "summary": "first review accepts",
+            "verdict": "accepted",
+        }
+    )
+    record, generation, _forwarding = workflow.apply_reviewer_result(first, accepted)
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=first.dispatch.dispatch_id,
+    )
+
+    second = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer-two"),
+    )
+    assert isinstance(second, PreparedDispatch)
+    second = workflow.record_session_id(
+        workflow.mark_running(second, process_id=1236),
+        runtime_session_id="ses-two",
+    )
+    changes_requested = parse_reviewer_result(
+        {
+            "result_version": 1,
+            "dispatch_id": second.dispatch.dispatch_id,
+            "attempt": second.dispatch.attempt,
+            "step_id": "prepare-fixture",
+            "repo_id": "fixture-repo",
+            "review_target": second.review_target.model_dump(mode="json"),
+            "findings": [],
+            "verification": [{"check_id": "review-check", "status": "passed", "summary": "passed"}],
+            "required_remediation": ["resolve tie"],
+            "summary": "second review disagrees",
+            "verdict": "changes_requested",
+        }
+    )
+    record, generation, _forwarding = workflow.apply_reviewer_result(second, changes_requested)
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=second.dispatch.dispatch_id,
+    )
+
+    tie_break = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer-three"),
+    )
+
+    assert isinstance(tie_break, PreparedDispatch)
+    assert record.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert tie_break.review_target == first.review_target == second.review_target
+
+
+def test_review_escalation_waits_for_reassignment_without_resetting_attempts(project: FixtureProject) -> None:
+    values = valid_plan_values(project)
+    values["steps"][0]["review"] = {
+        "required": True,
+        "reviewer_role_keys": ["reviewer"],
+        "required_acceptances": 1,
+    }
+    values["steps"][0]["retry"] = {
+        "max_executor_attempts": 2,
+        "max_reviewer_attempts": 1,
+        "on_failed": "halt",
+        "on_blocked": "halt",
+        "on_changes_requested": "escalate",
+        "escalation_role_key": "terra",
+    }
+    plan = NormalizedPlan.model_validate(values)
+    record = new_run_record(
+        run_id="escalation-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-escalation"),
+        event=_event(1),
+    )
+    store = _store(project)
+    generation = store.create_run(record)
+    workflow = _workflow(project, store)
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    executor = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(executor, PreparedDispatch)
+    executor = workflow.record_session_id(
+        workflow.mark_running(executor, process_id=1234),
+        runtime_session_id="ses-executor",
+    )
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+    reviewer = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(reviewer, PreparedDispatch)
+    reviewer = workflow.record_session_id(
+        workflow.mark_running(reviewer, process_id=1235),
+        runtime_session_id="ses-reviewer",
+    )
+    changes = parse_reviewer_result(
+        {
+            "result_version": 1,
+            "dispatch_id": reviewer.dispatch.dispatch_id,
+            "attempt": reviewer.dispatch.attempt,
+            "step_id": "prepare-fixture",
+            "repo_id": "fixture-repo",
+            "review_target": reviewer.review_target.model_dump(mode="json"),
+            "findings": [],
+            "verification": [{"check_id": "review-check", "status": "passed", "summary": "passed"}],
+            "required_remediation": ["reassign executor"],
+            "summary": "review requires escalation",
+            "verdict": "changes_requested",
+        }
+    )
+    waiting, generation, _forwarding = workflow.apply_reviewer_result(reviewer, changes)
+
+    assert waiting.state.value == "WAITING_OPERATOR"
+    assert waiting.steps["prepare-fixture"].state is StepStatus.BLOCKED
+    assert waiting.steps["prepare-fixture"].rework_rounds == 1
+    assert waiting.operator_request is not None
+    waiting, generation = workflow.acknowledge_forwarding(
+        waiting.run_id,
+        expected_generation=generation,
+        dispatch_id=reviewer.dispatch.dispatch_id,
+    )
+    resumed, generation = store.answer_operator_request(
+        run_id=waiting.run_id,
+        expected_generation=generation,
+        request_id=waiting.operator_request.request_id,
+        answer="reassign",
+        actor_id="operator",
+    )
+    assert resumed.steps["prepare-fixture"].reassignment_role_key == "terra"
+    reassigned = workflow.prepare_from_supervisor(
+        resumed.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(mode="resume"),
+    )
+
+    assert isinstance(reassigned, PreparedDispatch)
+    assert reassigned.dispatch.attempt == 2
 
 
 def test_attempt_exhaustion_is_step_local(project: FixtureProject) -> None:
@@ -477,6 +982,29 @@ def test_reviewer_changes_requested_returns_a_deterministic_rework_state(project
         }
     )
 
-    record, _generation, _forwarding = workflow.apply_reviewer_result(reviewer, review_result)
+    record, generation, _forwarding = workflow.apply_reviewer_result(reviewer, review_result)
 
     assert record.steps["prepare-fixture"].state is StepStatus.READY
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=reviewer.dispatch.dispatch_id,
+    )
+    rework = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(mode="resume"),
+    )
+    assert isinstance(rework, PreparedDispatch)
+    rework = workflow.record_session_id(
+        workflow.mark_running(rework, process_id=1236),
+        runtime_session_id="ses-executor-rework",
+    )
+    record, _generation, _forwarding = workflow.apply_executor_result(
+        rework,
+        parse_executor_result(_executor_result(rework)),
+    )
+
+    assert record.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert record.steps["prepare-fixture"].review_acceptances == 0
+    assert record.steps["prepare-fixture"].accepted_reviewer_role_keys == []

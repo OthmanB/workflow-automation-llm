@@ -37,6 +37,15 @@ class AskOperatorCommand(ContractModel):
     rationale: Annotated[str, Field(min_length=1, max_length=5000)] | None = None
 
 
+class RequestReviewWaiverCommand(ContractModel):
+    """Ask the operator to waive a non-mandatory compiled review obligation."""
+
+    protocol_version: Literal[1]
+    action: Literal["request_review_waiver"]
+    step_id: Identifier
+    rationale: Annotated[str, Field(min_length=1, max_length=5000)]
+
+
 class HaltCommand(ContractModel):
     """Request an explicit halted state with a durable reason."""
 
@@ -54,7 +63,7 @@ class RequestCompletionCommand(ContractModel):
 
 
 SupervisorCommand: TypeAlias = Annotated[
-    DispatchCommand | AskOperatorCommand | HaltCommand | RequestCompletionCommand,
+    DispatchCommand | AskOperatorCommand | RequestReviewWaiverCommand | HaltCommand | RequestCompletionCommand,
     Field(discriminator="action"),
 ]
 _SUPERVISOR_COMMAND_ADAPTER: TypeAdapter[SupervisorCommand] = TypeAdapter(SupervisorCommand)

@@ -145,10 +145,24 @@ class ProfileSelection(ContractModel):
 
 
 class ProfileDefinition(ContractModel):
-    """Validated profile shape; execution semantics land in a later phase."""
+    """Explicit review obligations selected for a run in Phase 6."""
 
     review_schedule: Literal["on_failure", "critical", "always"]
     multi_review: Literal["off", "on_critical_only", "on_every_review"]
+    reviewer_role_keys: list[Identifier]
+    required_acceptances: Annotated[int, Field(ge=1, le=20)]
+
+    @model_validator(mode="after")
+    def validate_reviewer_obligation(self) -> Self:
+        if len(self.reviewer_role_keys) != len(set(self.reviewer_role_keys)):
+            raise ValueError("reviewer_role_keys must not contain duplicates")
+        if self.required_acceptances > len(self.reviewer_role_keys):
+            raise ValueError("required_acceptances cannot exceed reviewer_role_keys")
+        if self.multi_review == "off" and self.required_acceptances != 1:
+            raise ValueError("multi_review off profiles require exactly one acceptance")
+        if self.multi_review != "off" and self.required_acceptances < 2:
+            raise ValueError("multi_review profiles require at least two acceptances")
+        return self
 
 
 class ProfilesDocument(ContractModel):
@@ -179,6 +193,31 @@ class ExecutionDefinition(ContractModel):
     halt_mode: Literal["ask_on_ambiguity", "full_auto"]
     underspec_mode: Literal["ask", "auto"]
     response_template: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+
+class ReviewPolicyDefinition(ContractModel):
+    """Project-wide review constraints combined with selected profile policy."""
+
+    mandatory_review: bool
+    critical_risk_tags: list[Identifier]
+    allow_operator_waiver: bool
+
+    @field_validator("critical_risk_tags")
+    @classmethod
+    def critical_risk_tags_are_unique(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("critical_risk_tags must not contain duplicates")
+        return values
+
+
+class BudgetDefinition(ContractModel):
+    """Measured resource limits enforced by the sequential coordinator."""
+
+    enabled: bool
+    max_run_cost_usd: Annotated[float, Field(ge=0)]
+    max_step_cost_usd: Annotated[float, Field(ge=0)]
+    max_context_tokens: Annotated[int, Field(ge=1)]
+    on_limit: Literal["halt", "ask"]
 
 
 class PermissionPolicy(ContractModel):
@@ -243,6 +282,8 @@ class ProjectConfigModel(ContractModel):
     roles: RolesDefinition
     profile: ProfileSelection
     execution: ExecutionDefinition
+    review_policy: ReviewPolicyDefinition
+    budget: BudgetDefinition
     permission_policies: PermissionPoliciesDefinition
     evidence: EvidencePolicy
     preflight: PreflightDefinition | None = None
@@ -439,7 +480,21 @@ class Config:
                 "profile.profile_id must reference profiles config profiles: "
                 f"{self.model.profile.profile_id}"
             )
+        for profile_id, profile in profiles.profiles.items():
+            for role_key in profile.reviewer_role_keys:
+                if self.role_kind(role_key) != "reviewer":
+                    raise ConfigError(f"profiles.{profile_id}.reviewer_role_keys must reference reviewers")
         return profiles
+
+    @property
+    def profile_digest(self) -> str:
+        """Return the immutable selected-profile policy hash for a run record."""
+        payload = {
+            "profile_id": self.profile_id,
+            "profile": self.profiles.profiles[self.profile_id].model_dump(mode="json"),
+            "review_policy": self.model.review_policy.model_dump(mode="json"),
+        }
+        return _sha256_json(payload)
 
     def _validate_environment(self) -> None:
         _require_directory(Path(self.model.sources.specifications_dir), "sources.specifications_dir")

@@ -53,6 +53,8 @@ def create_fixture_project(
                     "balanced": {
                         "review_schedule": "critical",
                         "multi_review": "on_critical_only",
+                        "reviewer_role_keys": ["reviewer", "reviewer-two"],
+                        "required_acceptances": 2,
                     }
                 },
                 "default": "balanced",
@@ -120,6 +122,12 @@ def create_fixture_project(
                     "variant": "high",
                     "display": "Fixture Reviewer",
                     "permission_policy": "reviewer",
+                },
+                "reviewer-two": {
+                    "model": "fixture/reviewer-two",
+                    "variant": "high",
+                    "display": "Fixture Second Reviewer",
+                    "permission_policy": "reviewer",
                 }
             },
         },
@@ -139,6 +147,18 @@ def create_fixture_project(
             "halt_mode": "ask_on_ambiguity",
             "underspec_mode": "ask",
             "response_template": "[response_content_chat]",
+        },
+        "review_policy": {
+            "mandatory_review": False,
+            "critical_risk_tags": ["critical"],
+            "allow_operator_waiver": False,
+        },
+        "budget": {
+            "enabled": False,
+            "max_run_cost_usd": 10.0,
+            "max_step_cost_usd": 5.0,
+            "max_context_tokens": 100000,
+            "on_limit": "halt",
         },
         "permission_policies": {
             "global_policy": "global",

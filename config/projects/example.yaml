@@ -54,6 +54,11 @@ roles:
       variant: standard
       display: Example Reviewer
       permission_policy: reviewer
+    reviewer-two:
+      model: example/reviewer-model
+      variant: standard
+      display: Example Second Reviewer
+      permission_policy: reviewer
 
 profile:
   profiles_file: ../profiles.yaml
@@ -75,6 +80,18 @@ execution:
     [response_content_chat]
     ---
     Provide next prompt.
+
+review_policy:
+  mandatory_review: false
+  critical_risk_tags: [critical]
+  allow_operator_waiver: false
+
+budget:
+  enabled: false
+  max_run_cost_usd: 10.0
+  max_step_cost_usd: 5.0
+  max_context_tokens: 100000
+  on_limit: halt
 
 permission_policies:
   global_policy: global

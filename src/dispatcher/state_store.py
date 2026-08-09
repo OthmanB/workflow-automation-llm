@@ -28,8 +28,10 @@ from .workflow import (
     DispatchStatus,
     RunRecord,
     RunStatus,
+    StepStatus,
     TransitionEvent,
     transition_run,
+    transition_step,
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
@@ -706,6 +708,10 @@ class StateStore:
             raise StateStoreError("operator request ID does not match the active waiting request")
         if answer not in request.allowed_answers:
             raise StateStoreError("operator answer is not one of the allowed answers")
+        if request.expires_at is not None and request.expires_at <= datetime.now(UTC):
+            raise StateStoreError("operator request has expired")
+        if request.required_role is not None and actor_id != request.required_role:
+            raise StateStoreError("operator actor does not satisfy the required role")
         event = TransitionEvent(
             event_id=f"event-{uuid.uuid4().hex}",
             sequence=record.sequence + 1,
@@ -714,7 +720,72 @@ class StateStore:
             correlation_id=request.context_ref,
             occurred_at=datetime.now(UTC),
         )
-        updated = transition_run(record, request.resume_to, event)
+        decision_id = f"decision-{uuid.uuid4().hex}"
+        updated_record = record
+        target = request.resume_to
+        if request.kind == "risk_gate":
+            if request.step_id is None or request.step_id not in record.steps:
+                raise StateStoreCorruptionError("risk gate request does not reference a known step")
+            if answer == "approve":
+                step = record.steps[request.step_id]
+                if step.operator_gate_resolved:
+                    raise StateStoreError("risk gate was already resolved")
+                steps = dict(record.steps)
+                steps[request.step_id] = step.model_copy(
+                    update={"operator_gate_resolved": True, "last_event": event}
+                )
+                updated_record = record.model_copy(
+                    update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                )
+                target = RunStatus.RUNNING
+            else:
+                target = RunStatus.HALTED
+        elif request.kind == "escalation":
+            if request.step_id is None or request.step_id not in record.steps:
+                raise StateStoreCorruptionError("escalation request does not reference a known step")
+            if answer == "reassign":
+                step = record.steps[request.step_id]
+                if step.state is not StepStatus.BLOCKED:
+                    raise StateStoreError("escalation reassignment requires a blocked step")
+                plan_step = next(step for step in record.plan.steps if step.step_id == request.step_id)
+                if plan_step.retry.escalation_role_key != request.reassignment_role_key:
+                    raise StateStoreCorruptionError(
+                        "escalation request reassignment role does not match the normalized plan"
+                    )
+                steps = dict(record.steps)
+                reassigned = transition_step(step, StepStatus.READY, event)
+                steps[request.step_id] = reassigned.model_copy(
+                    update={"reassignment_role_key": request.reassignment_role_key}
+                )
+                updated_record = record.model_copy(
+                    update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                )
+                target = RunStatus.RUNNING
+            else:
+                target = RunStatus.HALTED
+        elif request.kind == "review_waiver":
+            if request.step_id is None or request.step_id not in record.steps or record.policy is None:
+                raise StateStoreCorruptionError("review waiver request does not reference a compiled policy step")
+            obligation = record.policy.review_obligations[request.step_id]
+            step = record.steps[request.step_id]
+            if not obligation.waivable or step.state is not StepStatus.REVIEW_REQUIRED:
+                raise StateStoreError("review waiver is not available for the current step state")
+            if answer == "waive":
+                waived_review = transition_step(
+                    step,
+                    StepStatus.ACCEPTED,
+                    event,
+                    review_waiver_decision_ref=decision_id,
+                )
+                steps = dict(record.steps)
+                steps[request.step_id] = waived_review
+                updated_record = record.model_copy(
+                    update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                )
+                target = RunStatus.RUNNING
+            else:
+                target = RunStatus.HALTED
+        updated = transition_run(updated_record, target, event)
         sessions = self.sessions_for_run(run_id)
         connection = self._ready_connection()
         with self._transaction(connection):
@@ -730,7 +801,7 @@ class StateStore:
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    f"decision-{uuid.uuid4().hex}",
+                    decision_id,
                     run_id,
                     request_id,
                     actor_id,
@@ -1017,6 +1088,20 @@ class StateStore:
             lines.append(
                 f"| `{step.step_id}` | `{step.state.value}` | {step.executor_attempts} | "
                 f"{step.reviewer_attempts} |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Measured Usage",
+                "",
+                "| Scope | Cost USD | Tokens | Input | Output | Reasoning |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for scope, usage in [("run", record.usage.run), *sorted(record.usage.by_step.items())]:
+            lines.append(
+                f"| `{scope}` | {usage.cost_usd:.6f} | {usage.tokens_total} | {usage.tokens_input} | "
+                f"{usage.tokens_output} | {usage.tokens_reasoning} |"
             )
         lines.extend(
             [
