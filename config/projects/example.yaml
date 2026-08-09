@@ -1,0 +1,134 @@
+# Schema-v1 public example configuration for this repository.
+schema_version: 1
+
+project:
+  project_id: workflow-automation-example
+  name: Workflow Automation Example
+  description: Sanitized local configuration for dispatcher development
+
+sources:
+  specifications_dir: ../../docs
+  plans_dir: ../../markdown/plans
+  plan_files:
+    - dispatcher-remediation-plan-2026-08-09.md
+  roles_files:
+    - dispatcher-remediation-plan-2026-08-09.md
+
+state:
+  directory: ../../state/workflow-automation-example
+  lease_heartbeat_seconds: 30
+  lease_stale_after_seconds: 120
+
+repositories:
+  dispatcher-framework:
+    root: ../..
+    expected_remote:
+      name: origin
+      url: https://github.com/OthmanB/workflow-automation-llm.git
+    default_branch: main
+    evidence_roots:
+      - markdown/reports
+    writable_roots:
+      - .
+    permission_policy: repository
+    allow_shared_writable_roots: false
+
+roles:
+  supervisor:
+    supervisor:
+      model: example/supervisor-model
+      variant: standard
+      display: Example Supervisor
+      permission_policy: supervisor
+  executors:
+    executor:
+      model: example/executor-model
+      variant: standard
+      display: Example Executor
+      permission_policy: executor
+  reviewers:
+    reviewer:
+      model: example/reviewer-model
+      variant: standard
+      display: Example Reviewer
+      permission_policy: reviewer
+
+profile:
+  profiles_file: ../profiles.yaml
+  profile_id: balanced
+
+execution:
+  mode: mock_only
+  protocol_version: 1
+  scheduling: sequential
+  default_repo_id: dispatcher-framework
+  timeout_seconds: 300
+  termination_grace_seconds: 10
+  max_output_bytes: 1048576
+  max_rounds_per_step: 4
+  halt_mode: ask_on_ambiguity
+  underspec_mode: ask
+  response_template: |
+    response is,
+    [response_content_chat]
+    ---
+    Provide next prompt.
+
+permission_policies:
+  global_policy: global
+  project_policy: project
+  role_class_policies:
+    supervisor: supervisor-class
+    executor: executor-class
+    reviewer: reviewer-class
+  policies:
+    global:
+      default: deny
+      actions: {}
+    project:
+      default: deny
+      actions: {}
+    repository:
+      default: deny
+      actions:
+        inspect: allow
+        modify: allow
+        verify: allow
+    supervisor-class:
+      default: deny
+      actions:
+        inspect: allow
+    executor-class:
+      default: deny
+      actions:
+        inspect: allow
+        modify: allow
+        verify: allow
+    reviewer-class:
+      default: deny
+      actions:
+        inspect: allow
+        verify: allow
+    supervisor:
+      default: deny
+      actions: {}
+    executor:
+      default: deny
+      actions: {}
+    reviewer:
+      default: deny
+      actions: {}
+
+evidence:
+  hash_algorithm: sha256
+  require_content_hashes: true
+  immutable: true
+  allow_unexpected_writes: false
+
+preflight:
+  enabled: true
+  models_smoke_test: false
+  smoke_prompt: "Reply with exactly: OK"
+  credentials: []
+  require_git_remote: true
+  disk_space_min_mb: 500

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check src tests
+      - name: Type check
+        run: mypy src
+      - name: Test
+        run: pytest
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv /tmp/dispatcher-wheel
+          /tmp/dispatcher-wheel/bin/python -m pip install dist/*.whl
+      - name: Smoke-test installed CLI outside the checkout
+        working-directory: /tmp
+        run: /tmp/dispatcher-wheel/bin/dispatcher --help

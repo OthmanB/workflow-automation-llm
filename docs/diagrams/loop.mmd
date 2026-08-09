@@ -1,0 +1,24 @@
+---
+title: Orchestration loop
+---
+sequenceDiagram
+    participant OP as Operator
+    participant SW as Dispatcher
+    participant S as Supervisor (Sol)
+    participant E as Executor (Terra)
+    participant R as Reviewer (Kimi)
+    SW->>S: bootstrap / resume context
+    S-->>SW: decision envelope (dispatch)
+    alt executor
+        SW->>E: opencode run -s (id) (prompt)
+        E-->>SW: chat response + evidence md
+        SW-->>S: response template + usage stats
+    else reviewer
+        SW->>R: opencode run (new session)
+        R-->>SW: verdict + evidence md
+        SW-->>S: response template + usage stats
+    end
+    S-->>SW: next decision (dispatch | done | halt)
+    SW->>SW: persist state, audit, transcripts
+    S-->>SW: done
+    SW-->>OP: final report

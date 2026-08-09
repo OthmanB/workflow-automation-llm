@@ -1,0 +1,213 @@
+{
+  "$defs": {
+    "AskOperatorCommand": {
+      "additionalProperties": false,
+      "description": "Request durable operator input without launching a session.",
+      "properties": {
+        "action": {
+          "const": "ask_operator",
+          "title": "Action",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "question": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "rationale": {
+          "anyOf": [
+            {
+              "maxLength": 5000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rationale"
+        },
+        "step_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Id"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action",
+        "question"
+      ],
+      "title": "AskOperatorCommand",
+      "type": "object"
+    },
+    "DispatchCommand": {
+      "additionalProperties": false,
+      "description": "Request a single executor or reviewer dispatch by logical role key.",
+      "properties": {
+        "action": {
+          "const": "dispatch",
+          "title": "Action",
+          "type": "string"
+        },
+        "prompt": {
+          "maxLength": 50000,
+          "minLength": 1,
+          "title": "Prompt",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "rationale": {
+          "anyOf": [
+            {
+              "maxLength": 5000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rationale"
+        },
+        "session_mode": {
+          "enum": [
+            "new",
+            "resume",
+            "fork"
+          ],
+          "title": "Session Mode",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "target_role": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Target Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action",
+        "step_id",
+        "target_role",
+        "session_mode",
+        "prompt"
+      ],
+      "title": "DispatchCommand",
+      "type": "object"
+    },
+    "HaltCommand": {
+      "additionalProperties": false,
+      "description": "Request an explicit halted state with a durable reason.",
+      "properties": {
+        "action": {
+          "const": "halt",
+          "title": "Action",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action",
+        "reason"
+      ],
+      "title": "HaltCommand",
+      "type": "object"
+    },
+    "RequestCompletionCommand": {
+      "additionalProperties": false,
+      "description": "Ask the dispatcher to evaluate, rather than assume, completion.",
+      "properties": {
+        "action": {
+          "const": "request_completion",
+          "title": "Action",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "rationale": {
+          "anyOf": [
+            {
+              "maxLength": 5000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rationale"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "action"
+      ],
+      "title": "RequestCompletionCommand",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "ask_operator": "#/$defs/AskOperatorCommand",
+      "dispatch": "#/$defs/DispatchCommand",
+      "halt": "#/$defs/HaltCommand",
+      "request_completion": "#/$defs/RequestCompletionCommand"
+    },
+    "propertyName": "action"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/DispatchCommand"
+    },
+    {
+      "$ref": "#/$defs/AskOperatorCommand"
+    },
+    {
+      "$ref": "#/$defs/HaltCommand"
+    },
+    {
+      "$ref": "#/$defs/RequestCompletionCommand"
+    }
+  ]
+}

@@ -1,0 +1,401 @@
+"""CLI entry point for the dispatcher.
+
+Usage:
+    dispatcher run --config config/projects/<name>.yaml  [--resume]  [--mock]  [--skip-smoke]
+    dispatcher preflight --config config/projects/<name>.yaml  [--skip-smoke]
+    dispatcher status --config config/projects/<name>.yaml
+    dispatcher start --config config/projects/<name>.yaml --run-record <record.json>
+    dispatcher resume --config config/projects/<name>.yaml --run-id <run-id>
+    dispatcher recover --config config/projects/<name>.yaml --run-id <run-id>
+    dispatcher answer --config config/projects/<name>.yaml --run-id <run-id> --request-id <id> --answer <value>
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+# Configure coloured logging.
+try:
+    import colorlog  # type: ignore
+
+    _handler = colorlog.StreamHandler()
+    _handler.setFormatter(
+        colorlog.ColoredFormatter(
+            "%(log_color)s%(levelname)-8s%(reset)s %(message)s",
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
+        )
+    )
+    _root_logger = colorlog.getLogger()
+except ImportError:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(levelname)-8s %(message)s")
+    )
+    _root_logger = logging.getLogger()
+
+_root_logger.addHandler(_handler)
+logger = logging.getLogger("dispatcher")
+
+
+def _setup_logging(level: str) -> None:
+    _root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Keep opencode subprocess noise down.
+    logging.getLogger("opencode").setLevel(logging.WARNING)
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="dispatcher",
+        description="Automated supervisor → executor → reviewer loop over opencode sessions.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # --- run ---
+    run_parser = sub.add_parser("run", help="start (or resume) a run")
+    run_parser.add_argument(
+        "--config", required=True,
+        help="path to per-project YAML config file",
+    )
+    run_parser.add_argument(
+        "--resume", action="store_true",
+        help="resume from saved state",
+    )
+    run_parser.add_argument(
+        "--mock", action="store_true",
+        help="use the mock harness instead of real opencode calls",
+    )
+    run_parser.add_argument(
+        "--mock-scenario", default="simple",
+        help="mock scenario name (default: simple)",
+    )
+    run_parser.add_argument(
+        "--skip-smoke", action="store_true",
+        help="skip the model smoke test (useful after first run)",
+    )
+    run_parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    # --- preflight ---
+    pf_parser = sub.add_parser("preflight", help="run pre-flight checks only")
+    pf_parser.add_argument("--config", required=True)
+    pf_parser.add_argument("--skip-smoke", action="store_true")
+    pf_parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    # --- status ---
+    st_parser = sub.add_parser("status", help="show current run status")
+    st_parser.add_argument("--config", required=True)
+    st_parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    # --- recover ---
+    start_parser = sub.add_parser("start", help="persist a new approved run without executing it")
+    start_parser.add_argument("--config", required=True)
+    start_parser.add_argument("--run-record", required=True)
+    start_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    resume_parser = sub.add_parser("resume", help="validate a resumable durable run without executing it")
+    resume_parser.add_argument("--config", required=True)
+    resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    # --- recover ---
+    recover_parser = sub.add_parser("recover", help="inspect unresolved durable dispatches")
+    recover_parser.add_argument("--config", required=True)
+    recover_parser.add_argument("--run-id", required=True)
+    recover_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    # --- answer ---
+    answer_parser = sub.add_parser("answer", help="persist an answer for a waiting run")
+    answer_parser.add_argument("--config", required=True)
+    answer_parser.add_argument("--run-id", required=True)
+    answer_parser.add_argument("--request-id", required=True)
+    answer_parser.add_argument("--answer", required=True)
+    answer_parser.add_argument("--actor-id", required=True)
+    answer_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    # --- baseline ---
+    baseline_parser = sub.add_parser("baseline", help="inspect or approve historical project baseline")
+    baseline_sub = baseline_parser.add_subparsers(dest="baseline_command", required=True)
+    baseline_inspect = baseline_sub.add_parser("inspect", help="produce a read-only baseline candidate")
+    baseline_inspect.add_argument("--config", required=True)
+    baseline_inspect.add_argument("--plan", required=True)
+    baseline_inspect.add_argument("--output")
+    baseline_inspect.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+    baseline_approve = baseline_sub.add_parser("approve", help="persist an approved baseline candidate")
+    baseline_approve.add_argument("--config", required=True)
+    baseline_approve.add_argument("--plan", required=True)
+    baseline_approve.add_argument("--candidate", required=True)
+    baseline_approve.add_argument("--operator-decision-ref", required=True)
+    baseline_approve.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    return parser.parse_args(argv)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    _setup_logging(args.log_level)
+    if not args.mock:
+        logger.error(
+            "real OpenCode execution is disabled during remediation Phase 2; "
+            "use --mock for proof-of-concept validation"
+        )
+        return 2
+
+    from .config import load_config
+    from .loop import Orchestrator
+    from .preflight import run_preflight
+
+    cfg = load_config(args.config)
+
+    logger.info("project: %s  profile: %s  root: %s",
+                 cfg.project_name,
+                 cfg.profile_id,
+                 cfg.default_repository.root)
+
+    # Pre-flight.
+    from .mock_harness import MockRunner
+    run_session = MockRunner(scenario=args.mock_scenario)
+    logger.warning("=== MOCK MODE: no real opencode calls ===")
+
+    run_preflight(cfg, cfg.state_dir, skip_smoke=args.skip_smoke,
+                  run_session=run_session)
+
+    orch = Orchestrator(cfg, run_session=run_session, resume=args.resume)
+    return orch.run()
+
+
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from .mock_harness import MockRunner
+    from .preflight import run_preflight
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+
+    try:
+        run_preflight(
+            cfg,
+            cfg.state_dir,
+            run_session=MockRunner(),
+            skip_smoke=args.skip_smoke,
+        )
+        print("pre-flight: ALL CHECKS PASSED")
+        return 0
+    except Exception as exc:
+        print(f"pre-flight: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+
+    database_path = Path(cfg.state_dir) / "dispatcher.sqlite3"
+    if database_path.exists():
+        store = state_mod.open_state_store(cfg)
+        latest = store.latest_run(cfg.project_id)
+        if latest is not None:
+            record, generation = latest
+            print(f"Project: {record.project_id}")
+            print(f"Run: {record.run_id}  state={record.state.value}  generation={generation}")
+            print(f"Current step: {next(iter(record.steps), '(not started)')}")
+            return 0
+
+    s = state_mod.load_state(cfg.state_dir)
+    sessions = state_mod.load_sessions(cfg.state_dir)
+
+    print(f"Project: {s.get('project', '?')}")
+    print(f"Current step: {s.get('current_step', '(not started)')}")
+    print()
+
+    for pool, label in [
+        ("supervisor", "Supervisor"),
+        ("executors", "Executors"),
+        ("reviewers", "Reviewers"),
+    ]:
+        print(f"{label}:")
+        pool_sessions = sessions.get(pool, {})
+        for key, info in pool_sessions.items():
+            sid = info.get("session_id", "?")
+            model = info.get("model", "?")
+            print(f"  {key}: {model}  session={sid}")
+        if not pool_sessions:
+            print("  (none)")
+    return 0
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .state_store import StateStoreError
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+    try:
+        store = state_mod.open_state_store(cfg)
+        items = store.classify_recovery(args.run_id)
+    except StateStoreError as exc:
+        print(f"recover: FAILED - {exc}", file=sys.stderr)
+        return 2
+    if not items:
+        print("recover: no unresolved dispatches")
+        return 0
+    for item in items:
+        print(f"{item.dispatch_id}: {item.state.value} -> {item.disposition}: {item.detail}")
+    return 1 if any(item.disposition == "operator_reconciliation_required" for item in items) else 0
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .state_store import StateStoreError
+    from .workflow import RunRecord, RunStatus
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+    try:
+        record = RunRecord.model_validate_json(Path(args.run_record).read_text(encoding="utf-8"))
+        if record.project_id != cfg.project_id or record.config_digest != cfg.config_digest:
+            raise StateStoreError("run record project or config digest does not match --config")
+        if record.state is not RunStatus.NEW:
+            raise StateStoreError("start requires a NEW run record; use resume, recover, or explicit archive")
+        generation = state_mod.open_state_store(cfg).create_run(record)
+    except (OSError, ValueError, StateStoreError) as exc:
+        print(f"start: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"start: persisted  run={record.run_id} generation={generation}")
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .state_store import StateStoreError
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+    try:
+        record, generation = state_mod.open_state_store(cfg).resume_run(
+            project_id=cfg.project_id,
+            run_id=args.run_id,
+        )
+    except StateStoreError as exc:
+        print(f"resume: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"resume: validated  run={record.run_id} state={record.state.value} generation={generation}")
+    return 0
+
+
+def _cmd_answer(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .state_store import StateStoreError
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+    try:
+        store = state_mod.open_state_store(cfg)
+        _record, generation = store.load_run(args.run_id)
+        updated, new_generation = store.answer_operator_request(
+            run_id=args.run_id,
+            expected_generation=generation,
+            request_id=args.request_id,
+            answer=args.answer,
+            actor_id=args.actor_id,
+        )
+    except StateStoreError as exc:
+        print(f"answer: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"answer: recorded  run={updated.run_id} state={updated.state.value} generation={new_generation}")
+    return 0
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .baseline import BaselineCandidate, BaselineError, approve_baseline, inspect_baseline
+    from .config import load_config
+    from .plan import load_normalized_plan
+    from .security import atomic_write_private_text
+    from .state_store import StateStoreError
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level)
+    try:
+        plan = load_normalized_plan(args.plan, cfg)
+        if args.baseline_command == "inspect":
+            candidate = inspect_baseline(plan, cfg)
+            payload = candidate.model_dump_json(indent=2) + "\n"
+            if args.output:
+                atomic_write_private_text(args.output, payload)
+                print(f"baseline: candidate written to {args.output}")
+            else:
+                print(payload, end="")
+            return 0
+        candidate = BaselineCandidate.model_validate_json(Path(args.candidate).read_text(encoding="utf-8"))
+        approve_baseline(
+            candidate,
+            plan=plan,
+            config=cfg,
+            store=state_mod.open_state_store(cfg),
+            operator_decision_ref=args.operator_decision_ref,
+        )
+        print(f"baseline: approved  project={cfg.project_id} plan={plan.plan_id}")
+        return 0
+    except (BaselineError, OSError, StateStoreError, ValueError) as exc:
+        print(f"baseline: FAILED - {exc}", file=sys.stderr)
+        return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    if args.command == "run":
+        return _cmd_run(args)
+    elif args.command == "preflight":
+        return _cmd_preflight(args)
+    elif args.command == "status":
+        return _cmd_status(args)
+    elif args.command == "start":
+        return _cmd_start(args)
+    elif args.command == "resume":
+        return _cmd_resume(args)
+    elif args.command == "recover":
+        return _cmd_recover(args)
+    elif args.command == "answer":
+        return _cmd_answer(args)
+    elif args.command == "baseline":
+        return _cmd_baseline(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

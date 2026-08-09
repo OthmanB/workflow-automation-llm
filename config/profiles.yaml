@@ -1,0 +1,15 @@
+# Schema-v1 review profiles. Review execution semantics land in Phase 6.
+schema_version: 1
+
+profiles:
+  economy:
+    review_schedule: on_failure
+    multi_review: "off"
+  balanced:
+    review_schedule: critical
+    multi_review: on_critical_only
+  thorough:
+    review_schedule: always
+    multi_review: on_every_review
+
+default: balanced

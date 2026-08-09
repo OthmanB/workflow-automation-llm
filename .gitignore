@@ -1,0 +1,36 @@
+# Runtime state (per-project, not committed)
+state/
+config/projects/local/
+private-reference/
+
+# Local credentials and databases
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Test workspaces
+.test-worktrees/
+
+# OS
+.DS_Store

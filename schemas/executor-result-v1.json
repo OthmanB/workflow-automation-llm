@@ -1,0 +1,411 @@
+{
+  "$defs": {
+    "ArtifactRecord": {
+      "additionalProperties": false,
+      "description": "Immutable evidence artifact returned by an executor or reviewer.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/json",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size_bytes": {
+          "maximum": 1000000000,
+          "minimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relative_path",
+        "sha256",
+        "media_type",
+        "size_bytes"
+      ],
+      "title": "ArtifactRecord",
+      "type": "object"
+    },
+    "ExecutorBlockedResult": {
+      "additionalProperties": false,
+      "description": "Executor cannot continue and supplies one or more structured blockers.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "blockers": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Blockers",
+          "type": "array"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "outcome": {
+          "const": "blocked",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryCoordinate"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "verification",
+        "summary",
+        "outcome",
+        "blockers"
+      ],
+      "title": "ExecutorBlockedResult",
+      "type": "object"
+    },
+    "ExecutorCompletedResult": {
+      "additionalProperties": false,
+      "description": "Executor reported completed work at a pinned revision or patch.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "outcome": {
+          "const": "completed",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryCoordinate"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "verification",
+        "summary",
+        "outcome"
+      ],
+      "title": "ExecutorCompletedResult",
+      "type": "object"
+    },
+    "ExecutorFailedResult": {
+      "additionalProperties": false,
+      "description": "Executor failed with a stable classification code.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRecord"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "failure_code": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Failure Code",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "failed",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryCoordinate"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "verification",
+        "summary",
+        "outcome",
+        "failure_code"
+      ],
+      "title": "ExecutorFailedResult",
+      "type": "object"
+    },
+    "RepositoryCoordinate": {
+      "additionalProperties": false,
+      "description": "Executor work coordinates pinned before and after a dispatch.",
+      "properties": {
+        "base_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Base Revision",
+          "type": "string"
+        },
+        "patch_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Patch Sha256"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "result_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result Revision"
+        }
+      },
+      "required": [
+        "repo_id",
+        "base_revision",
+        "result_revision",
+        "patch_sha256"
+      ],
+      "title": "RepositoryCoordinate",
+      "type": "object"
+    },
+    "VerificationResult": {
+      "additionalProperties": false,
+      "description": "Structured verification outcome; command transcript stays supplemental.",
+      "properties": {
+        "check_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Check Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "status",
+        "summary"
+      ],
+      "title": "VerificationResult",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "blocked": "#/$defs/ExecutorBlockedResult",
+      "completed": "#/$defs/ExecutorCompletedResult",
+      "failed": "#/$defs/ExecutorFailedResult"
+    },
+    "propertyName": "outcome"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ExecutorCompletedResult"
+    },
+    {
+      "$ref": "#/$defs/ExecutorBlockedResult"
+    },
+    {
+      "$ref": "#/$defs/ExecutorFailedResult"
+    }
+  ]
+}

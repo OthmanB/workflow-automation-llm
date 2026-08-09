@@ -1,0 +1,557 @@
+{
+  "$defs": {
+    "ReviewFinding": {
+      "additionalProperties": false,
+      "description": "A review finding whose severity determines whether acceptance is possible.",
+      "properties": {
+        "finding_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Finding Id",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "blocking"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "finding_id",
+        "severity",
+        "summary"
+      ],
+      "title": "ReviewFinding",
+      "type": "object"
+    },
+    "ReviewTarget": {
+      "additionalProperties": false,
+      "description": "Immutable executor output and artifacts a reviewer was asked to inspect.",
+      "properties": {
+        "artifact_hashes": {
+          "items": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "title": "Artifact Hashes",
+          "type": "array"
+        },
+        "executor_attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Executor Attempt",
+          "type": "integer"
+        },
+        "executor_dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Executor Dispatch Id",
+          "type": "string"
+        },
+        "patch_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Patch Sha256"
+        },
+        "result_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result Revision"
+        }
+      },
+      "required": [
+        "executor_dispatch_id",
+        "executor_attempt",
+        "result_revision",
+        "patch_sha256",
+        "artifact_hashes"
+      ],
+      "title": "ReviewTarget",
+      "type": "object"
+    },
+    "ReviewerAcceptedResult": {
+      "additionalProperties": false,
+      "description": "Reviewer accepted the exact target without blocking remediation.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ReviewFinding"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_remediation": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Remediation",
+          "type": "array"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "review_target": {
+          "$ref": "#/$defs/ReviewTarget"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verdict": {
+          "const": "accepted",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repo_id",
+        "review_target",
+        "findings",
+        "verification",
+        "required_remediation",
+        "summary",
+        "verdict"
+      ],
+      "title": "ReviewerAcceptedResult",
+      "type": "object"
+    },
+    "ReviewerBlockedResult": {
+      "additionalProperties": false,
+      "description": "Reviewer could not determine a valid verdict and includes blockers.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "blockers": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Blockers",
+          "type": "array"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ReviewFinding"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_remediation": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Remediation",
+          "type": "array"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "review_target": {
+          "$ref": "#/$defs/ReviewTarget"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verdict": {
+          "const": "blocked",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repo_id",
+        "review_target",
+        "findings",
+        "verification",
+        "required_remediation",
+        "summary",
+        "verdict",
+        "blockers"
+      ],
+      "title": "ReviewerBlockedResult",
+      "type": "object"
+    },
+    "ReviewerChangesRequestedResult": {
+      "additionalProperties": false,
+      "description": "Reviewer requested deterministic rework for the immutable target.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ReviewFinding"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_remediation": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Remediation",
+          "type": "array"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "review_target": {
+          "$ref": "#/$defs/ReviewTarget"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verdict": {
+          "const": "changes_requested",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repo_id",
+        "review_target",
+        "findings",
+        "verification",
+        "required_remediation",
+        "summary",
+        "verdict"
+      ],
+      "title": "ReviewerChangesRequestedResult",
+      "type": "object"
+    },
+    "ReviewerInconclusiveResult": {
+      "additionalProperties": false,
+      "description": "Reviewer lacks sufficient evidence and records a specific reason.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ReviewFinding"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "reason": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_remediation": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Remediation",
+          "type": "array"
+        },
+        "result_version": {
+          "const": 1,
+          "title": "Result Version",
+          "type": "integer"
+        },
+        "review_target": {
+          "$ref": "#/$defs/ReviewTarget"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        },
+        "verdict": {
+          "const": "inconclusive",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationResult"
+          },
+          "title": "Verification",
+          "type": "array"
+        }
+      },
+      "required": [
+        "result_version",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repo_id",
+        "review_target",
+        "findings",
+        "verification",
+        "required_remediation",
+        "summary",
+        "verdict",
+        "reason"
+      ],
+      "title": "ReviewerInconclusiveResult",
+      "type": "object"
+    },
+    "VerificationResult": {
+      "additionalProperties": false,
+      "description": "Structured verification outcome; command transcript stays supplemental.",
+      "properties": {
+        "check_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Check Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "status",
+        "summary"
+      ],
+      "title": "VerificationResult",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "accepted": "#/$defs/ReviewerAcceptedResult",
+      "blocked": "#/$defs/ReviewerBlockedResult",
+      "changes_requested": "#/$defs/ReviewerChangesRequestedResult",
+      "inconclusive": "#/$defs/ReviewerInconclusiveResult"
+    },
+    "propertyName": "verdict"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ReviewerAcceptedResult"
+    },
+    {
+      "$ref": "#/$defs/ReviewerChangesRequestedResult"
+    },
+    {
+      "$ref": "#/$defs/ReviewerBlockedResult"
+    },
+    {
+      "$ref": "#/$defs/ReviewerInconclusiveResult"
+    }
+  ]
+}

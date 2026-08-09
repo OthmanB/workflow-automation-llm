@@ -1,0 +1,6 @@
+{
+  "scenario": "opencode_nonzero_exit",
+  "exit_code": 1,
+  "stdout_fixture": "run-error.jsonl",
+  "stderr": "fixture OpenCode command failed"
+}

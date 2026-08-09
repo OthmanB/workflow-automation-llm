@@ -1,0 +1,990 @@
+{
+  "$defs": {
+    "AcceptanceCriterion": {
+      "additionalProperties": false,
+      "description": "A check that must pass before a step can be accepted.",
+      "properties": {
+        "criterion_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Criterion Id",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "criterion_id",
+        "description"
+      ],
+      "title": "AcceptanceCriterion",
+      "type": "object"
+    },
+    "ArtifactReference": {
+      "additionalProperties": false,
+      "description": "A required input or produced output identified independently of prose.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "producer_step_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Producer Step Id"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "producer_step_id",
+        "description"
+      ],
+      "title": "ArtifactReference",
+      "type": "object"
+    },
+    "DispatchIntent": {
+      "additionalProperties": false,
+      "description": "Durable intent required before a subprocess can be launched in Phase 3.",
+      "properties": {
+        "expected_result_kind": {
+          "enum": [
+            "executor",
+            "reviewer"
+          ],
+          "title": "Expected Result Kind",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "policy_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Policy Digest",
+          "type": "string"
+        },
+        "prompt_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Prompt Sha256",
+          "type": "string"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryCoordinate"
+        }
+      },
+      "required": [
+        "prompt_sha256",
+        "policy_digest",
+        "expected_result_kind",
+        "repository",
+        "idempotency_key"
+      ],
+      "title": "DispatchIntent",
+      "type": "object"
+    },
+    "DispatchRecord": {
+      "additionalProperties": false,
+      "description": "One independently recoverable dispatch attempt.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "forwarding_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Forwarding Digest"
+        },
+        "intent": {
+          "$ref": "#/$defs/DispatchIntent"
+        },
+        "last_event": {
+          "$ref": "#/$defs/TransitionEvent"
+        },
+        "logical_session_key": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Logical Session Key",
+          "type": "string"
+        },
+        "result_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result Digest"
+        },
+        "role_key": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Role Key",
+          "type": "string"
+        },
+        "role_kind": {
+          "enum": [
+            "executor",
+            "reviewer"
+          ],
+          "title": "Role Kind",
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Runtime Session Id"
+        },
+        "state": {
+          "$ref": "#/$defs/DispatchStatus"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "step_id",
+        "role_key",
+        "role_kind",
+        "attempt",
+        "logical_session_key",
+        "runtime_session_id",
+        "state",
+        "intent",
+        "result_digest",
+        "forwarding_digest",
+        "last_event"
+      ],
+      "title": "DispatchRecord",
+      "type": "object"
+    },
+    "DispatchStatus": {
+      "enum": [
+        "PREPARED",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+        "FORWARDED",
+        "ACKNOWLEDGED",
+        "ABANDONED"
+      ],
+      "title": "DispatchStatus",
+      "type": "string"
+    },
+    "EvidenceRequirement": {
+      "additionalProperties": false,
+      "description": "An evidence artifact required for step acceptance.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/json",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relative_path",
+        "media_type"
+      ],
+      "title": "EvidenceRequirement",
+      "type": "object"
+    },
+    "NormalizedPlan": {
+      "additionalProperties": false,
+      "description": "Immutable execution plan, with semantic digest independent of source format.",
+      "properties": {
+        "plan_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Plan Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/PlanSource"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/PlanStep"
+          },
+          "title": "Steps",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "plan_id",
+        "sources",
+        "steps"
+      ],
+      "title": "NormalizedPlan",
+      "type": "object"
+    },
+    "OperatorRequest": {
+      "additionalProperties": false,
+      "description": "Durable operator question required for the non-terminal waiting state.",
+      "properties": {
+        "allowed_answers": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Allowed Answers",
+          "type": "array"
+        },
+        "context_ref": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Context Ref",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "question": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "request_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Request Id",
+          "type": "string"
+        },
+        "required_role": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Required Role"
+        },
+        "resume_to": {
+          "$ref": "#/$defs/RunStatus"
+        }
+      },
+      "required": [
+        "request_id",
+        "question",
+        "allowed_answers",
+        "context_ref",
+        "resume_to",
+        "expires_at",
+        "required_role"
+      ],
+      "title": "OperatorRequest",
+      "type": "object"
+    },
+    "PlanApproval": {
+      "additionalProperties": false,
+      "description": "Operator approval binding immutable semantic and source plan identities.",
+      "properties": {
+        "approved_at": {
+          "format": "date-time",
+          "title": "Approved At",
+          "type": "string"
+        },
+        "operator_decision_ref": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Operator Decision Ref",
+          "type": "string"
+        },
+        "plan_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Plan Digest",
+          "type": "string"
+        },
+        "source_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Source Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_digest",
+        "source_digest",
+        "operator_decision_ref",
+        "approved_at"
+      ],
+      "title": "PlanApproval",
+      "type": "object"
+    },
+    "PlanSource": {
+      "additionalProperties": false,
+      "description": "An immutable source document that informed normalized work.",
+      "properties": {
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/yaml"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "root": {
+          "enum": [
+            "plans",
+            "specifications"
+          ],
+          "title": "Root",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "source_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "root",
+        "relative_path",
+        "sha256",
+        "media_type"
+      ],
+      "title": "PlanSource",
+      "type": "object"
+    },
+    "PlanStep": {
+      "additionalProperties": false,
+      "description": "A fully actionable step with dependencies and acceptance obligations.",
+      "properties": {
+        "acceptance_criteria": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceCriterion"
+          },
+          "title": "Acceptance Criteria",
+          "type": "array"
+        },
+        "authorization": {
+          "$ref": "#/$defs/StepAuthorization"
+        },
+        "depends_on": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "evidence_requirements": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRequirement"
+          },
+          "title": "Evidence Requirements",
+          "type": "array"
+        },
+        "ordinal": {
+          "minimum": 1,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "produced_outputs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactReference"
+          },
+          "title": "Produced Outputs",
+          "type": "array"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_inputs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactReference"
+          },
+          "title": "Required Inputs",
+          "type": "array"
+        },
+        "resource_locks": {
+          "items": {
+            "$ref": "#/$defs/ResourceLock"
+          },
+          "title": "Resource Locks",
+          "type": "array"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "review": {
+          "$ref": "#/$defs/ReviewObligation"
+        },
+        "risk_tags": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Risk Tags",
+          "type": "array"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordinal",
+        "step_id",
+        "title",
+        "repo_id",
+        "depends_on",
+        "required_inputs",
+        "produced_outputs",
+        "resource_locks",
+        "risk_tags",
+        "authorization",
+        "acceptance_criteria",
+        "evidence_requirements",
+        "review",
+        "retry"
+      ],
+      "title": "PlanStep",
+      "type": "object"
+    },
+    "RepositoryCoordinate": {
+      "additionalProperties": false,
+      "description": "Repository revision captured before a dispatch is prepared.",
+      "properties": {
+        "base_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Base Revision",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "base_revision"
+      ],
+      "title": "RepositoryCoordinate",
+      "type": "object"
+    },
+    "ResourceLock": {
+      "additionalProperties": false,
+      "description": "A normalized exclusive resource lock held during one step.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "resource_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Resource Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource_id",
+        "mode"
+      ],
+      "title": "ResourceLock",
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "additionalProperties": false,
+      "description": "Step-local retry and escalation rules, with no runtime defaults.",
+      "properties": {
+        "escalation_role_key": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Escalation Role Key"
+        },
+        "max_executor_attempts": {
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Max Executor Attempts",
+          "type": "integer"
+        },
+        "max_reviewer_attempts": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Max Reviewer Attempts",
+          "type": "integer"
+        },
+        "on_blocked": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Blocked",
+          "type": "string"
+        },
+        "on_changes_requested": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Changes Requested",
+          "type": "string"
+        },
+        "on_failed": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Failed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "max_executor_attempts",
+        "max_reviewer_attempts",
+        "on_failed",
+        "on_blocked",
+        "on_changes_requested",
+        "escalation_role_key"
+      ],
+      "title": "RetryPolicy",
+      "type": "object"
+    },
+    "ReviewObligation": {
+      "additionalProperties": false,
+      "description": "Typed review obligation, independent of the selected review profile.",
+      "properties": {
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "required_acceptances": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Required Acceptances",
+          "type": "integer"
+        },
+        "reviewer_role_keys": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Reviewer Role Keys",
+          "type": "array"
+        }
+      },
+      "required": [
+        "required",
+        "reviewer_role_keys",
+        "required_acceptances"
+      ],
+      "title": "ReviewObligation",
+      "type": "object"
+    },
+    "RunStatus": {
+      "enum": [
+        "NEW",
+        "READY",
+        "RUNNING",
+        "WAITING_OPERATOR",
+        "HALTED",
+        "FAILED",
+        "SUCCEEDED",
+        "CANCELLED"
+      ],
+      "title": "RunStatus",
+      "type": "string"
+    },
+    "StepAuthorization": {
+      "additionalProperties": false,
+      "description": "Structured authorization request constrained by repository policy.",
+      "properties": {
+        "authorized_actions": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Authorized Actions",
+          "type": "array"
+        },
+        "requires_operator_approval": {
+          "title": "Requires Operator Approval",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "authorized_actions",
+        "requires_operator_approval"
+      ],
+      "title": "StepAuthorization",
+      "type": "object"
+    },
+    "StepRecord": {
+      "additionalProperties": false,
+      "description": "Mutable run status for one immutable normalized plan step.",
+      "properties": {
+        "accepted_artifact_ids": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Accepted Artifact Ids",
+          "type": "array"
+        },
+        "active_dispatch_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Active Dispatch Id"
+        },
+        "executor_attempts": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Executor Attempts",
+          "type": "integer"
+        },
+        "last_event": {
+          "$ref": "#/$defs/TransitionEvent"
+        },
+        "operator_gate_resolved": {
+          "title": "Operator Gate Resolved",
+          "type": "boolean"
+        },
+        "result_digests": {
+          "items": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "title": "Result Digests",
+          "type": "array"
+        },
+        "review_acceptances": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Review Acceptances",
+          "type": "integer"
+        },
+        "reviewer_attempts": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Reviewer Attempts",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/StepStatus"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "waiver_decision_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Waiver Decision Ref"
+        }
+      },
+      "required": [
+        "step_id",
+        "state",
+        "executor_attempts",
+        "reviewer_attempts",
+        "active_dispatch_id",
+        "accepted_artifact_ids",
+        "review_acceptances",
+        "operator_gate_resolved",
+        "waiver_decision_ref",
+        "result_digests",
+        "last_event"
+      ],
+      "title": "StepRecord",
+      "type": "object"
+    },
+    "StepStatus": {
+      "enum": [
+        "PENDING",
+        "READY",
+        "EXECUTING",
+        "EXECUTED",
+        "REVIEW_REQUIRED",
+        "REVIEWING",
+        "CHANGES_REQUESTED",
+        "BLOCKED",
+        "ACCEPTED",
+        "WAIVED",
+        "FAILED"
+      ],
+      "title": "StepStatus",
+      "type": "string"
+    },
+    "TransitionEvent": {
+      "additionalProperties": false,
+      "description": "Correlated transition provenance required by every state change.",
+      "properties": {
+        "actor": {
+          "enum": [
+            "dispatcher",
+            "supervisor",
+            "executor",
+            "reviewer",
+            "operator"
+          ],
+          "title": "Actor",
+          "type": "string"
+        },
+        "correlation_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "event_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 5000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "actor",
+        "reason",
+        "correlation_id",
+        "occurred_at"
+      ],
+      "title": "TransitionEvent",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Schema-v1 run state containing its immutable normalized plan and digest.",
+  "properties": {
+    "config_digest": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Config Digest",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "dispatches": {
+      "patternProperties": {
+        "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+          "$ref": "#/$defs/DispatchRecord"
+        }
+      },
+      "title": "Dispatches",
+      "type": "object"
+    },
+    "operator_request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OperatorRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plan": {
+      "$ref": "#/$defs/NormalizedPlan"
+    },
+    "plan_approval": {
+      "$ref": "#/$defs/PlanApproval"
+    },
+    "plan_digest": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Plan Digest",
+      "type": "string"
+    },
+    "project_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/RunStatus"
+    },
+    "state_schema_version": {
+      "const": 1,
+      "title": "State Schema Version",
+      "type": "integer"
+    },
+    "steps": {
+      "patternProperties": {
+        "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+          "$ref": "#/$defs/StepRecord"
+        }
+      },
+      "title": "Steps",
+      "type": "object"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "state_schema_version",
+    "run_id",
+    "project_id",
+    "config_digest",
+    "plan",
+    "plan_digest",
+    "plan_approval",
+    "state",
+    "sequence",
+    "steps",
+    "dispatches",
+    "operator_request",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "RunRecord",
+  "type": "object"
+}

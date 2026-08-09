@@ -1,0 +1,20 @@
+---
+title: Dispatcher architecture
+---
+flowchart TD
+    OP["Operator / YAML config"] --> SW
+    SW["Dispatcher orchestrator<br/>(routing, state, opencode calls)"]
+    SW --> SUP["Supervisor session (persistent)<br/>opencode -s &lt;id&gt;<br/>GPT-5.6 Sol xhigh"]
+    SW --> E1["Executor primary (resumable)<br/>GPT-5.6 Terra xhigh"]
+    SW --> E2["Executor contingency<br/>Claude Sonnet 5<br/>used after 2 stalls"]
+    SW --> R1["Reviewer primary (fresh)<br/>Kimi K3 max"]
+    SW --> R2["Reviewer tiebreak<br/>DeepSeek V4 Flash"]
+    SW --> R3["Reviewer high-risk<br/>Claude Sonnet 5"]
+    SUP --> SW
+    E1 --> SW
+    E2 --> SW
+    R1 --> SW
+    R2 --> SW
+    R3 --> SW
+    SW --> ST[("state/ sessions/ transcripts/ audit.jsonl")]
+    ST --> SW

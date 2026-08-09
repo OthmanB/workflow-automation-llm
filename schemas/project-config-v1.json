@@ -1,0 +1,606 @@
+{
+  "$defs": {
+    "EvidencePolicy": {
+      "additionalProperties": false,
+      "description": "Explicit evidence integrity requirements used by normalized plans.",
+      "properties": {
+        "allow_unexpected_writes": {
+          "title": "Allow Unexpected Writes",
+          "type": "boolean"
+        },
+        "hash_algorithm": {
+          "const": "sha256",
+          "title": "Hash Algorithm",
+          "type": "string"
+        },
+        "immutable": {
+          "title": "Immutable",
+          "type": "boolean"
+        },
+        "require_content_hashes": {
+          "title": "Require Content Hashes",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hash_algorithm",
+        "require_content_hashes",
+        "immutable",
+        "allow_unexpected_writes"
+      ],
+      "title": "EvidencePolicy",
+      "type": "object"
+    },
+    "ExecutionDefinition": {
+      "additionalProperties": false,
+      "description": "All active execution controls for the mock-only Phase 1 runtime.",
+      "properties": {
+        "default_repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Default Repo Id",
+          "type": "string"
+        },
+        "halt_mode": {
+          "enum": [
+            "ask_on_ambiguity",
+            "full_auto"
+          ],
+          "title": "Halt Mode",
+          "type": "string"
+        },
+        "max_output_bytes": {
+          "maximum": 104857600,
+          "minimum": 1024,
+          "title": "Max Output Bytes",
+          "type": "integer"
+        },
+        "max_rounds_per_step": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Rounds Per Step",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "mock_only",
+          "title": "Mode",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "response_template": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "title": "Response Template",
+          "type": "string"
+        },
+        "scheduling": {
+          "const": "sequential",
+          "title": "Scheduling",
+          "type": "string"
+        },
+        "termination_grace_seconds": {
+          "maximum": 3600,
+          "minimum": 1,
+          "title": "Termination Grace Seconds",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "underspec_mode": {
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "title": "Underspec Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "protocol_version",
+        "scheduling",
+        "default_repo_id",
+        "timeout_seconds",
+        "termination_grace_seconds",
+        "max_output_bytes",
+        "max_rounds_per_step",
+        "halt_mode",
+        "underspec_mode",
+        "response_template"
+      ],
+      "title": "ExecutionDefinition",
+      "type": "object"
+    },
+    "PermissionPoliciesDefinition": {
+      "additionalProperties": false,
+      "description": "Explicit policy layers and named rules with no implicit fallback.",
+      "properties": {
+        "global_policy": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Global Policy",
+          "type": "string"
+        },
+        "policies": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/PermissionPolicy"
+            }
+          },
+          "title": "Policies",
+          "type": "object"
+        },
+        "project_policy": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Project Policy",
+          "type": "string"
+        },
+        "role_class_policies": {
+          "$ref": "#/$defs/RoleClassPolicies"
+        }
+      },
+      "required": [
+        "global_policy",
+        "project_policy",
+        "role_class_policies",
+        "policies"
+      ],
+      "title": "PermissionPoliciesDefinition",
+      "type": "object"
+    },
+    "PermissionPolicy": {
+      "additionalProperties": false,
+      "description": "Named semantic permission rules compiled to exact OpenCode patterns.",
+      "properties": {
+        "actions": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "enum": [
+                "allow",
+                "ask",
+                "deny"
+              ],
+              "type": "string"
+            }
+          },
+          "title": "Actions",
+          "type": "object"
+        },
+        "default": {
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "title": "Default",
+          "type": "string"
+        }
+      },
+      "required": [
+        "default",
+        "actions"
+      ],
+      "title": "PermissionPolicy",
+      "type": "object"
+    },
+    "PreflightDefinition": {
+      "additionalProperties": false,
+      "description": "Optional preflight policy; absence means preflight is disabled.",
+      "properties": {
+        "credentials": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Credentials",
+          "type": "array"
+        },
+        "disk_space_min_mb": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Disk Space Min Mb",
+          "type": "integer"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "models_smoke_test": {
+          "title": "Models Smoke Test",
+          "type": "boolean"
+        },
+        "require_git_remote": {
+          "title": "Require Git Remote",
+          "type": "boolean"
+        },
+        "smoke_prompt": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Smoke Prompt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "models_smoke_test",
+        "smoke_prompt",
+        "credentials",
+        "require_git_remote",
+        "disk_space_min_mb"
+      ],
+      "title": "PreflightDefinition",
+      "type": "object"
+    },
+    "ProfileSelection": {
+      "additionalProperties": false,
+      "description": "One profile from an explicit, versioned profiles document.",
+      "properties": {
+        "profile_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Profile Id",
+          "type": "string"
+        },
+        "profiles_file": {
+          "title": "Profiles File",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profiles_file",
+        "profile_id"
+      ],
+      "title": "ProfileSelection",
+      "type": "object"
+    },
+    "ProjectDefinition": {
+      "additionalProperties": false,
+      "description": "Project identity independent of a repository working directory.",
+      "properties": {
+        "description": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "project_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "name",
+        "description"
+      ],
+      "title": "ProjectDefinition",
+      "type": "object"
+    },
+    "RemoteDefinition": {
+      "additionalProperties": false,
+      "description": "Exact Git remote expected for one registered repository.",
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "url": {
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url"
+      ],
+      "title": "RemoteDefinition",
+      "type": "object"
+    },
+    "RepositoryDefinition": {
+      "additionalProperties": false,
+      "description": "One repository registered to a project under a stable identifier.",
+      "properties": {
+        "allow_shared_writable_roots": {
+          "title": "Allow Shared Writable Roots",
+          "type": "boolean"
+        },
+        "default_branch": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Default Branch",
+          "type": "string"
+        },
+        "evidence_roots": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence Roots",
+          "type": "array"
+        },
+        "expected_remote": {
+          "$ref": "#/$defs/RemoteDefinition"
+        },
+        "permission_policy": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Permission Policy",
+          "type": "string"
+        },
+        "root": {
+          "title": "Root",
+          "type": "string"
+        },
+        "writable_roots": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Writable Roots",
+          "type": "array"
+        }
+      },
+      "required": [
+        "root",
+        "expected_remote",
+        "default_branch",
+        "evidence_roots",
+        "writable_roots",
+        "permission_policy",
+        "allow_shared_writable_roots"
+      ],
+      "title": "RepositoryDefinition",
+      "type": "object"
+    },
+    "RoleClassPolicies": {
+      "additionalProperties": false,
+      "description": "Required policy layer for each role class.",
+      "properties": {
+        "executor": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Executor",
+          "type": "string"
+        },
+        "reviewer": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Reviewer",
+          "type": "string"
+        },
+        "supervisor": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Supervisor",
+          "type": "string"
+        }
+      },
+      "required": [
+        "supervisor",
+        "executor",
+        "reviewer"
+      ],
+      "title": "RoleClassPolicies",
+      "type": "object"
+    },
+    "RoleDefinition": {
+      "additionalProperties": false,
+      "description": "Configured model role and its named permission policy.",
+      "properties": {
+        "display": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Display",
+          "type": "string"
+        },
+        "model": {
+          "pattern": "^[^/\\s]+/[^/\\s]+$",
+          "title": "Model",
+          "type": "string"
+        },
+        "permission_policy": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Permission Policy",
+          "type": "string"
+        },
+        "variant": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Variant",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "variant",
+        "display",
+        "permission_policy"
+      ],
+      "title": "RoleDefinition",
+      "type": "object"
+    },
+    "RolesDefinition": {
+      "additionalProperties": false,
+      "description": "One supervisor and independently addressable executor/reviewer pools.",
+      "properties": {
+        "executors": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/RoleDefinition"
+            }
+          },
+          "title": "Executors",
+          "type": "object"
+        },
+        "reviewers": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/RoleDefinition"
+            }
+          },
+          "title": "Reviewers",
+          "type": "object"
+        },
+        "supervisor": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/RoleDefinition"
+            }
+          },
+          "title": "Supervisor",
+          "type": "object"
+        }
+      },
+      "required": [
+        "supervisor",
+        "executors",
+        "reviewers"
+      ],
+      "title": "RolesDefinition",
+      "type": "object"
+    },
+    "SourcesDefinition": {
+      "additionalProperties": false,
+      "description": "Authoritative project-level source directories and selected documents.",
+      "properties": {
+        "plan_files": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Plan Files",
+          "type": "array"
+        },
+        "plans_dir": {
+          "title": "Plans Dir",
+          "type": "string"
+        },
+        "roles_files": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Roles Files",
+          "type": "array"
+        },
+        "specifications_dir": {
+          "title": "Specifications Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "specifications_dir",
+        "plans_dir",
+        "plan_files",
+        "roles_files"
+      ],
+      "title": "SourcesDefinition",
+      "type": "object"
+    },
+    "StateDefinition": {
+      "additionalProperties": false,
+      "description": "Persistent state location, explicitly configured for every project.",
+      "properties": {
+        "directory": {
+          "title": "Directory",
+          "type": "string"
+        },
+        "lease_heartbeat_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Lease Heartbeat Seconds",
+          "type": "integer"
+        },
+        "lease_stale_after_seconds": {
+          "maximum": 604800,
+          "minimum": 2,
+          "title": "Lease Stale After Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "directory",
+        "lease_heartbeat_seconds",
+        "lease_stale_after_seconds"
+      ],
+      "title": "StateDefinition",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Versioned, project-neutral configuration schema for Phase 1.",
+  "properties": {
+    "evidence": {
+      "$ref": "#/$defs/EvidencePolicy"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionDefinition"
+    },
+    "permission_policies": {
+      "$ref": "#/$defs/PermissionPoliciesDefinition"
+    },
+    "preflight": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PreflightDefinition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "profile": {
+      "$ref": "#/$defs/ProfileSelection"
+    },
+    "project": {
+      "$ref": "#/$defs/ProjectDefinition"
+    },
+    "repositories": {
+      "patternProperties": {
+        "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+          "$ref": "#/$defs/RepositoryDefinition"
+        }
+      },
+      "title": "Repositories",
+      "type": "object"
+    },
+    "roles": {
+      "$ref": "#/$defs/RolesDefinition"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "sources": {
+      "$ref": "#/$defs/SourcesDefinition"
+    },
+    "state": {
+      "$ref": "#/$defs/StateDefinition"
+    }
+  },
+  "required": [
+    "schema_version",
+    "project",
+    "sources",
+    "state",
+    "repositories",
+    "roles",
+    "profile",
+    "execution",
+    "permission_policies",
+    "evidence"
+  ],
+  "title": "ProjectConfigModel",
+  "type": "object"
+}

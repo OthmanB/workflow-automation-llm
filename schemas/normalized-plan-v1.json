@@ -1,0 +1,431 @@
+{
+  "$defs": {
+    "AcceptanceCriterion": {
+      "additionalProperties": false,
+      "description": "A check that must pass before a step can be accepted.",
+      "properties": {
+        "criterion_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Criterion Id",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "criterion_id",
+        "description"
+      ],
+      "title": "AcceptanceCriterion",
+      "type": "object"
+    },
+    "ArtifactReference": {
+      "additionalProperties": false,
+      "description": "A required input or produced output identified independently of prose.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "producer_step_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Producer Step Id"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "producer_step_id",
+        "description"
+      ],
+      "title": "ArtifactReference",
+      "type": "object"
+    },
+    "EvidenceRequirement": {
+      "additionalProperties": false,
+      "description": "An evidence artifact required for step acceptance.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/json",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relative_path",
+        "media_type"
+      ],
+      "title": "EvidenceRequirement",
+      "type": "object"
+    },
+    "PlanSource": {
+      "additionalProperties": false,
+      "description": "An immutable source document that informed normalized work.",
+      "properties": {
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/yaml"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "root": {
+          "enum": [
+            "plans",
+            "specifications"
+          ],
+          "title": "Root",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "source_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "root",
+        "relative_path",
+        "sha256",
+        "media_type"
+      ],
+      "title": "PlanSource",
+      "type": "object"
+    },
+    "PlanStep": {
+      "additionalProperties": false,
+      "description": "A fully actionable step with dependencies and acceptance obligations.",
+      "properties": {
+        "acceptance_criteria": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceCriterion"
+          },
+          "title": "Acceptance Criteria",
+          "type": "array"
+        },
+        "authorization": {
+          "$ref": "#/$defs/StepAuthorization"
+        },
+        "depends_on": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "evidence_requirements": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRequirement"
+          },
+          "title": "Evidence Requirements",
+          "type": "array"
+        },
+        "ordinal": {
+          "minimum": 1,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "produced_outputs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactReference"
+          },
+          "title": "Produced Outputs",
+          "type": "array"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "required_inputs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactReference"
+          },
+          "title": "Required Inputs",
+          "type": "array"
+        },
+        "resource_locks": {
+          "items": {
+            "$ref": "#/$defs/ResourceLock"
+          },
+          "title": "Resource Locks",
+          "type": "array"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "review": {
+          "$ref": "#/$defs/ReviewObligation"
+        },
+        "risk_tags": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Risk Tags",
+          "type": "array"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordinal",
+        "step_id",
+        "title",
+        "repo_id",
+        "depends_on",
+        "required_inputs",
+        "produced_outputs",
+        "resource_locks",
+        "risk_tags",
+        "authorization",
+        "acceptance_criteria",
+        "evidence_requirements",
+        "review",
+        "retry"
+      ],
+      "title": "PlanStep",
+      "type": "object"
+    },
+    "ResourceLock": {
+      "additionalProperties": false,
+      "description": "A normalized exclusive resource lock held during one step.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "resource_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Resource Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource_id",
+        "mode"
+      ],
+      "title": "ResourceLock",
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "additionalProperties": false,
+      "description": "Step-local retry and escalation rules, with no runtime defaults.",
+      "properties": {
+        "escalation_role_key": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Escalation Role Key"
+        },
+        "max_executor_attempts": {
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Max Executor Attempts",
+          "type": "integer"
+        },
+        "max_reviewer_attempts": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Max Reviewer Attempts",
+          "type": "integer"
+        },
+        "on_blocked": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Blocked",
+          "type": "string"
+        },
+        "on_changes_requested": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Changes Requested",
+          "type": "string"
+        },
+        "on_failed": {
+          "enum": [
+            "halt",
+            "retry",
+            "escalate"
+          ],
+          "title": "On Failed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "max_executor_attempts",
+        "max_reviewer_attempts",
+        "on_failed",
+        "on_blocked",
+        "on_changes_requested",
+        "escalation_role_key"
+      ],
+      "title": "RetryPolicy",
+      "type": "object"
+    },
+    "ReviewObligation": {
+      "additionalProperties": false,
+      "description": "Typed review obligation, independent of the selected review profile.",
+      "properties": {
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "required_acceptances": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Required Acceptances",
+          "type": "integer"
+        },
+        "reviewer_role_keys": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Reviewer Role Keys",
+          "type": "array"
+        }
+      },
+      "required": [
+        "required",
+        "reviewer_role_keys",
+        "required_acceptances"
+      ],
+      "title": "ReviewObligation",
+      "type": "object"
+    },
+    "StepAuthorization": {
+      "additionalProperties": false,
+      "description": "Structured authorization request constrained by repository policy.",
+      "properties": {
+        "authorized_actions": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Authorized Actions",
+          "type": "array"
+        },
+        "requires_operator_approval": {
+          "title": "Requires Operator Approval",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "authorized_actions",
+        "requires_operator_approval"
+      ],
+      "title": "StepAuthorization",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Immutable execution plan, with semantic digest independent of source format.",
+  "properties": {
+    "plan_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Plan Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/PlanSource"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/PlanStep"
+      },
+      "title": "Steps",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "plan_id",
+    "sources",
+    "steps"
+  ],
+  "title": "NormalizedPlan",
+  "type": "object"
+}
