@@ -543,16 +543,81 @@
       "additionalProperties": false,
       "description": "Repository revision captured before a dispatch is prepared.",
       "properties": {
+        "base_branch": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Branch"
+        },
         "base_revision": {
           "maxLength": 200,
           "minLength": 1,
           "title": "Base Revision",
           "type": "string"
         },
+        "remote_name": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Name"
+        },
+        "remote_url": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Url"
+        },
         "repo_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Repo Id",
           "type": "string"
+        },
+        "working_branch": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Working Branch"
+        },
+        "worktree_id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Worktree Id"
         }
       },
       "required": [

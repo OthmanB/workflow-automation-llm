@@ -90,6 +90,19 @@
           "default": null,
           "title": "Rationale"
         },
+        "repo_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repo Id"
+        },
         "session_mode": {
           "enum": [
             "new",

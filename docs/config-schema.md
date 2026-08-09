@@ -34,6 +34,8 @@ repositories:
     default_branch: main
     evidence_roots: [evidence]
     writable_roots: [.]
+    external_roots: []
+    commit_policy: required
     permission_policy: repository
     allow_shared_writable_roots: false
 
@@ -133,10 +135,18 @@ preflight:
   absolute paths are rejected.
 - Repository evidence and writable roots are relative to their repository root,
   must exist, and cannot escape through a symlink.
+- `external_roots` are config-relative watched directories outside registered
+  repositories. They must exist, be unique, and not overlap a registered
+  repository. Any change observed in one during a dispatch blocks acceptance.
+- `commit_policy` is required. `required` accepts only a clean worktree whose
+  executor result names the inspected head SHA. `prohibited` accepts only a
+  dirty worktree whose result names the dispatcher-computed content patch hash.
 - Registered repository roots must be unique. Overlapping writable roots are
   rejected unless every affected repository explicitly allows sharing.
 - Every repository must match the exact configured Git remote URL before
   preflight or mock execution begins.
+- Before each worker dispatch, the registered root must be the exact Git
+  worktree top level, be on its configured default branch, and be clean.
 - Every configured role, repository, and explicit global/project/role-class
   layer must refer to an existing named permission policy. The dispatcher
   compiles layers in global, project, repository, role-class, concrete-role,

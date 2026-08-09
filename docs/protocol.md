@@ -30,6 +30,7 @@ Every command has `protocol_version: 1` and one `action`.
   "step_id": "prepare-fixture",
   "target_role": "executor-role",
   "session_mode": "new",
+  "repo_id": "application",
   "prompt": "Perform the approved task and return the schema-v1 executor result.",
   "rationale": "Optional explanation"
 }
@@ -37,8 +38,10 @@ Every command has `protocol_version: 1` and one `action`.
 
 `target_role` must resolve to a configured executor or reviewer role. The
 dispatcher determines role kind, repository, policy, and logical session from
-the normalized plan and durable run state. A command cannot include a raw
-OpenCode session ID, `repo_id`, permission decision, or batch request.
+the normalized plan and durable run state. `repo_id` is optional and, when
+present, is only a consistency assertion: it must equal the normalized step's
+repository ID and can never choose a working directory. A command cannot
+include a raw OpenCode session ID, permission decision, or batch request.
 
 ### Ask Operator
 
@@ -92,6 +95,11 @@ Executor results are typed JSON objects discriminated by `outcome`:
 `blocked` results require nonempty `blockers`. `failed` results require a stable
 `failure_code`. The dispatcher rejects a result whose dispatch ID, attempt, step
 ID, or repository ID differs from the active dispatch.
+
+Before result acceptance, the dispatcher inspects the registered worktree
+itself. Required evidence hashes and sizes must match its content manifest;
+symlink evidence, changed external watch roots, changed repository identity,
+or writes outside configured writable roots halt acceptance.
 
 ## Reviewer results
 

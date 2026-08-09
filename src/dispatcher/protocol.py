@@ -22,6 +22,7 @@ class DispatchCommand(ContractModel):
     step_id: Identifier
     target_role: Identifier
     session_mode: Literal["new", "resume", "fork"]
+    repo_id: Identifier | None = None
     prompt: Annotated[str, Field(min_length=1, max_length=50_000)]
     rationale: Annotated[str, Field(min_length=1, max_length=5000)] | None = None
 

@@ -796,20 +796,20 @@ policy.
 
 **Actions:**
 
-- [ ] Derive `repo_id` from the normalized step.
-- [ ] Treat a supervisor-provided repository value as a consistency assertion,
+- [x] Derive `repo_id` from the normalized step.
+- [x] Treat a supervisor-provided repository value as a consistency assertion,
   not authority.
-- [ ] Select working directory, remote expectations, permission policy,
+- [x] Select working directory, remote expectations, permission policy,
   evidence roots, and resource locks from the repository registry.
-- [ ] Verify repository identity and clean/expected baseline before dispatch.
-- [ ] Refuse unregistered nested, sibling, or symlink-resolved directories.
-- [ ] Add two-repository integration fixtures and wrong-repository tests.
+- [x] Verify repository identity and clean/expected baseline before dispatch.
+- [x] Refuse unregistered nested, sibling, or symlink-resolved directories.
+- [x] Add two-repository integration fixtures and wrong-repository tests.
 
 **Acceptance criteria:**
 
-- [ ] A step cannot execute in a different repository than its normalized plan
+- [x] A step cannot execute in a different repository than its normalized plan
   declaration.
-- [ ] Per-repository permissions are selected by exact ID.
+- [x] Per-repository permissions are selected by exact ID.
 
 ### DISP-501: Bind work to immutable repository coordinates
 
@@ -817,20 +817,20 @@ policy.
 
 **Actions:**
 
-- [ ] Record base branch, base SHA, working branch, worktree identity, and
+- [x] Record base branch, base SHA, working branch, worktree identity, and
   expected remote before execution.
-- [ ] Record resulting head SHA or content-addressed patch after execution.
-- [ ] Require review dispatches to reference those exact coordinates.
-- [ ] Detect repository movement between execution, review, and acceptance.
-- [ ] Reject acceptance after unreviewed changes.
-- [ ] Define behavior for uncommitted work and require a patch hash if commits
+- [x] Record resulting head SHA or content-addressed patch after execution.
+- [x] Require review dispatches to reference those exact coordinates.
+- [x] Detect repository movement between execution, review, and acceptance.
+- [x] Reject acceptance after unreviewed changes.
+- [x] Define behavior for uncommitted work and require a patch hash if commits
   are prohibited.
-- [ ] Add moving-head, wrong-branch, uncommitted-change, and stale-review tests.
+- [x] Add moving-head, wrong-branch, uncommitted-change, and stale-review tests.
 
 **Acceptance criteria:**
 
-- [ ] Accepted work is reproducibly identifiable after the run.
-- [ ] Two reviewers in a multi-review step always review the same coordinates.
+- [x] Accepted work is reproducibly identifiable after the run.
+- [x] Two reviewers in a multi-review step always review the same coordinates.
 
 ### DISP-502: Replace filename evidence diff with content manifests
 
@@ -838,31 +838,31 @@ policy.
 
 **Actions:**
 
-- [ ] Snapshot authorized roots with relative path, file type, size, metadata,
+- [x] Snapshot authorized roots with relative path, file type, size, metadata,
   and cryptographic hash.
-- [ ] Record created, modified, deleted, and unexpected paths.
-- [ ] Use attempt-specific evidence identities or immutable hashes.
-- [ ] Validate required evidence against the executor or reviewer result.
-- [ ] Detect writes outside authorized roots using repository status and
+- [x] Record created, modified, deleted, and unexpected paths.
+- [x] Use attempt-specific evidence identities or immutable hashes.
+- [x] Validate required evidence against the executor or reviewer result.
+- [x] Detect writes outside authorized roots using repository status and
   configured external roots.
-- [ ] Do not attribute concurrent unrelated changes without a matching isolated
+- [x] Do not attribute concurrent unrelated changes without a matching isolated
   worktree or dispatch correlation.
-- [ ] Add create, modify, delete, rename, symlink, unexpected-write, and
+- [x] Add create, modify, delete, rename, symlink, unexpected-write, and
   concurrent-write tests.
 
 **Acceptance criteria:**
 
-- [ ] Modified evidence is never omitted.
-- [ ] Unexpected repository writes halt acceptance.
-- [ ] Final reports include content hashes for every required artifact.
+- [x] Modified evidence is never omitted.
+- [x] Unexpected repository writes halt acceptance.
+- [x] Final reports include content hashes for every required artifact.
 
 ### Phase 5 gate
 
-- [ ] A disposable two-repository plan executes sequentially with exact
+- [x] A disposable two-repository plan executes sequentially with exact
   repository routing.
-- [ ] Reviews are revision-bound.
-- [ ] Evidence manifests detect all tested change types.
-- [ ] Repository and external-path escape tests pass.
+- [x] Reviews are revision-bound.
+- [x] Evidence manifests detect all tested change types.
+- [x] Repository and external-path escape tests pass.
 
 ## 11. Phase 6: Policy, review profiles, and operator controls
 

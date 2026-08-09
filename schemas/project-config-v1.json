@@ -318,6 +318,14 @@
           "title": "Allow Shared Writable Roots",
           "type": "boolean"
         },
+        "commit_policy": {
+          "enum": [
+            "required",
+            "prohibited"
+          ],
+          "title": "Commit Policy",
+          "type": "string"
+        },
         "default_branch": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Default Branch",
@@ -333,6 +341,14 @@
         },
         "expected_remote": {
           "$ref": "#/$defs/RemoteDefinition"
+        },
+        "external_roots": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "External Roots",
+          "type": "array"
         },
         "permission_policy": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
@@ -358,6 +374,8 @@
         "default_branch",
         "evidence_roots",
         "writable_roots",
+        "external_roots",
+        "commit_policy",
         "permission_policy",
         "allow_shared_writable_roots"
       ],

@@ -176,6 +176,11 @@ class RepositoryCoordinate(ContractModel):
 
     repo_id: Identifier
     base_revision: Annotated[str, Field(min_length=1, max_length=200)]
+    base_branch: Identifier | None = None
+    working_branch: Identifier | None = None
+    worktree_id: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")] | None = None
+    remote_name: Identifier | None = None
+    remote_url: Annotated[str, Field(min_length=1)] | None = None
 
 
 class DispatchIntent(ContractModel):

@@ -30,6 +30,8 @@ repositories:
       - markdown/reports
     writable_roots:
       - .
+    external_roots: []
+    commit_policy: required
     permission_policy: repository
     allow_shared_writable_roots: false
 

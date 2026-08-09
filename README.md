@@ -6,7 +6,8 @@ so the operator no longer has to copy supervisor decisions into slave sessions
 by hand.
 
 > **Proof-of-concept safety notice:** real OpenCode dispatch execution is
-> disabled while the sequential integration gate is being closed. Only
+> disabled while model-backed execution remains outside the tested safety
+> boundary. Only
 > deterministic fixtures, `--mock`, preflight, and state-inspection commands
 > are available for development and inspection. Do not rely on the current
 > permission, resume, review, or completion behavior for repository-mutating
@@ -58,6 +59,8 @@ decides who talks to whom, with what prompt, and records everything.
 | [`markdown/plans/dispatcher-remediation-plan-2026-08-09.md`](markdown/plans/dispatcher-remediation-plan-2026-08-09.md) | Gated remediation implementation plan |
 | [`markdown/reports/dispatcher-phase-0-execution-report-2026-08-09.md`](markdown/reports/dispatcher-phase-0-execution-report-2026-08-09.md) | Phase 0 changes, verification evidence, and remaining gate |
 | [`markdown/reports/dispatcher-phase-1-execution-report-2026-08-09.md`](markdown/reports/dispatcher-phase-1-execution-report-2026-08-09.md) | Phase 1 contract implementation and verification evidence |
+| [`markdown/reports/dispatcher-phase-4-execution-report-2026-08-10.md`](markdown/reports/dispatcher-phase-4-execution-report-2026-08-10.md) | Phase 4 sequential integration closure |
+| [`markdown/reports/dispatcher-phase-5-execution-report-2026-08-10.md`](markdown/reports/dispatcher-phase-5-execution-report-2026-08-10.md) | Phase 5 multi-repository and evidence-integrity closure |
 
 Diagrams: [`docs/diagrams/architecture.mmd`](docs/diagrams/architecture.mmd),
 [`docs/diagrams/loop.mmd`](docs/diagrams/loop.mmd).
@@ -80,7 +83,7 @@ deliberately blocked until every workflow gate is wired through that facade.
 | Durable resume and crash recovery | Partial | Transactional adapter lifecycle and major crash windows are tested; every-transition injection remains open |
 | Reviewer and completion enforcement | Implemented in the sequential coordinator | Real model-backed execution remains disabled |
 | Historical baseline | Partial | Read-only inspect and explicit approval keep unverifiable work pending by default |
-| Multi-repository execution | Unavailable | All sessions currently use one project root |
+| Multi-repository execution and evidence manifests | Implemented in the sequential coordinator | Disposable fake-OpenCode fixtures only; real model execution remains disabled |
 | Profiles, budgets, and operator gates | Design only | Configuration is not mechanically enforced |
 | Batch and parallel execution | Design only | Explicitly deferred until sequential correctness is proven |
 

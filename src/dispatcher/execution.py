@@ -216,6 +216,7 @@ class SequentialExecutionCoordinator:
                     review_target=current.review_target,
                     session_mode=current.session_mode,
                     session_id=current.session_id,
+                    repository_before=current.repository_before,
                 )
                 self.workflow.fail_dispatch(
                     current,

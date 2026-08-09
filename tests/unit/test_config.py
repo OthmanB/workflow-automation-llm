@@ -85,6 +85,8 @@ def test_invalid_schema_values_fail_with_exact_field_paths(
         ("state", "lease_heartbeat_seconds"),
         ("profile", "profiles_file"),
         ("execution", "timeout_seconds"),
+        ("repositories", "fixture-repo", "commit_policy"),
+        ("repositories", "fixture-repo", "external_roots"),
         ("permission_policies", "policies", "executor", "default"),
     ],
 )
@@ -155,6 +157,8 @@ def test_two_sibling_repositories_validate_with_exact_ids(project: FixtureProjec
         "default_branch": "main",
         "evidence_roots": ["evidence"],
         "writable_roots": ["."],
+        "external_roots": [],
+        "commit_policy": "required",
         "permission_policy": "executor",
         "allow_shared_writable_roots": False,
     }

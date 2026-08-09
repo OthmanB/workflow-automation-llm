@@ -91,6 +91,8 @@ class RepositoryDefinition(ContractModel):
     default_branch: Identifier
     evidence_roots: list[Annotated[str, Field(min_length=1)]]
     writable_roots: list[Annotated[str, Field(min_length=1)]]
+    external_roots: list[Annotated[str, Field(min_length=1)]]
+    commit_policy: Literal["required", "prohibited"]
     permission_policy: Identifier
     allow_shared_writable_roots: bool
 
@@ -370,6 +372,10 @@ class Config:
         root = Path(repository.root)
         return [root / relative_root for relative_root in repository.evidence_roots]
 
+    def repository_external_dirs(self, repo_id: str) -> list[Path]:
+        """Return resolved directories watched for writes outside the repository."""
+        return [Path(path) for path in self.repository(repo_id).external_roots]
+
     def role(self, role_key: str) -> RoleDefinition:
         try:
             return self.model.all_roles()[role_key]
@@ -449,6 +455,7 @@ class Config:
 
         resolved_roots: dict[str, Path] = {}
         writable_roots: list[tuple[str, Path, bool]] = []
+        external_roots: list[tuple[str, Path]] = []
         for repo_id, repository in self.model.repositories.items():
             root = Path(repository.root)
             _require_directory(root, f"repositories.{repo_id}.root")
@@ -466,10 +473,18 @@ class Config:
                         writable_roots.append(
                             (repo_id, resolved, repository.allow_shared_writable_roots)
                         )
+            for external_root in repository.external_roots:
+                resolved_external = Path(external_root)
+                _require_directory(
+                    resolved_external,
+                    f"repositories.{repo_id}.external_roots",
+                )
+                external_roots.append((repo_id, resolved_external))
 
         if len(set(resolved_roots.values())) != len(resolved_roots):
             raise ConfigError("repository roots must be unique after path resolution")
         _validate_writable_root_overlaps(writable_roots)
+        _validate_external_root_overlaps(resolved_roots, external_roots)
 
 
 def load_config(config_path: str | Path) -> Config:
@@ -511,6 +526,14 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
         for repository in resolved["repositories"].values():
             if isinstance(repository, dict):
                 resolve_at(repository, "root")
+                external_roots = repository.get("external_roots")
+                if isinstance(external_roots, list):
+                    repository["external_roots"] = [
+                        str((Path(value) if Path(value).is_absolute() else base_dir / value).resolve())
+                        if isinstance(value, str)
+                        else value
+                        for value in external_roots
+                    ]
     return resolved
 
 
@@ -581,6 +604,23 @@ def _validate_writable_root_overlaps(entries: list[tuple[str, Path, bool]]) -> N
                 raise ConfigError(
                     "repository writable roots overlap without explicit permission: "
                     f"{left_id}={left_path}, {right_id}={right_path}"
+                )
+
+
+def _validate_external_root_overlaps(
+    repository_roots: dict[str, Path],
+    external_roots: list[tuple[str, Path]],
+) -> None:
+    seen: set[Path] = set()
+    for repo_id, external_root in external_roots:
+        if external_root in seen:
+            raise ConfigError(f"external roots must be unique after path resolution: {external_root}")
+        seen.add(external_root)
+        for registered_id, repository_root in repository_roots.items():
+            if external_root.is_relative_to(repository_root) or repository_root.is_relative_to(external_root):
+                raise ConfigError(
+                    f"repositories.{repo_id}.external_roots overlaps registered repository "
+                    f"{registered_id}: {external_root}"
                 )
 
 

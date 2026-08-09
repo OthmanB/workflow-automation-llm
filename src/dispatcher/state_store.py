@@ -33,7 +33,7 @@ from .workflow import (
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -90,6 +90,8 @@ class DispatchPayload:
     forwarding_payload: str | None = None
     process_id: int | None = None
     session_metadata: Mapping[str, Any] | None = None
+    repository_before: Mapping[str, Any] | None = None
+    repository_after: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -406,6 +408,7 @@ class StateStore:
         dispatch: DispatchRecord,
         prompt: str,
         policy: Mapping[str, Any],
+        repository_before: Mapping[str, Any],
         session_metadata: Mapping[str, Any] | None = None,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> int:
@@ -418,6 +421,8 @@ class StateStore:
             raise StateStoreError("dispatch policy does not match durable policy_digest")
         if record.dispatches.get(dispatch.dispatch_id) != dispatch:
             raise StateStoreError("run record does not contain the exact prepared dispatch")
+        if repository_before.get("repo_id") != dispatch.intent.repository.repo_id:
+            raise StateStoreError("prepared repository snapshot does not match dispatch repository")
         return self.save_run(
             record,
             expected_generation=expected_generation,
@@ -426,6 +431,7 @@ class StateStore:
                 dispatch.dispatch_id: DispatchPayload(
                     prompt=prompt,
                     policy=policy,
+                    repository_before=repository_before,
                     session_metadata=session_metadata,
                 )
             },
@@ -484,6 +490,7 @@ class StateStore:
         forwarding_payload: str | None = None,
         process_id: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        repository_after: Mapping[str, Any] | None = None,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> tuple[RunRecord, int]:
         """Atomically transition a dispatch and its durable external payloads."""
@@ -493,6 +500,8 @@ class StateStore:
             raise StateStoreError(f"run record does not contain dispatch: {dispatch_id}") from exc
         if target is DispatchStatus.COMPLETED and result is None:
             raise StateStoreError("COMPLETED dispatch transition requires the exact result payload")
+        if target is DispatchStatus.COMPLETED and repository_after is None:
+            raise StateStoreError("COMPLETED dispatch transition requires the inspected repository snapshot")
         if target is DispatchStatus.RUNNING and (process_id is None or process_id < 1):
             raise StateStoreError("RUNNING dispatch transition requires a positive process_id")
         if target is DispatchStatus.FORWARDED and forwarding_payload is None:
@@ -525,6 +534,10 @@ class StateStore:
             process_id=process_id if process_id is not None else payload.process_id,
             session_metadata=(
                 session_metadata if session_metadata is not None else payload.session_metadata
+            ),
+            repository_before=payload.repository_before,
+            repository_after=(
+                repository_after if repository_after is not None else payload.repository_after
             ),
         )
         generation = self.save_run(
@@ -584,6 +597,8 @@ class StateStore:
                     forwarding_payload=payload.forwarding_payload,
                     process_id=payload.process_id,
                     session_metadata=metadata,
+                    repository_before=payload.repository_before,
+                    repository_after=payload.repository_after,
                 )
             },
         )
@@ -593,7 +608,8 @@ class StateStore:
         """Return the exact private inputs and outputs associated with one dispatch."""
         row = self._ready_connection().execute(
             """
-            SELECT prompt, policy_json, result_json, forwarding_payload, process_id, session_metadata_json
+            SELECT prompt, policy_json, result_json, forwarding_payload, process_id, session_metadata_json,
+                   repository_before_json, repository_after_json
             FROM dispatch_payloads WHERE run_id = ? AND dispatch_id = ?
             """,
             (run_id, dispatch_id),
@@ -611,6 +627,16 @@ class StateStore:
             session_metadata=(
                 json.loads(row["session_metadata_json"])
                 if row["session_metadata_json"] is not None
+                else None
+            ),
+            repository_before=(
+                json.loads(row["repository_before_json"])
+                if row["repository_before_json"] is not None
+                else None
+            ),
+            repository_after=(
+                json.loads(row["repository_after_json"])
+                if row["repository_after_json"] is not None
                 else None
             ),
         )
@@ -1016,6 +1042,23 @@ class StateStore:
                 f"| `{dispatch.dispatch_id}` | `{dispatch.state.value}` | {dispatch.attempt} | "
                 f"`{dispatch.runtime_session_id or ''}` | `{revision}` |"
             )
+        lines.extend(
+            [
+                "",
+                "## Repository Coordinates",
+                "",
+                "| Dispatch | Repository | Base branch | Working branch | Base SHA | Worktree ID | Expected remote |",
+                "|---|---|---|---|---|---|---|",
+            ]
+        )
+        for dispatch in sorted(record.dispatches.values(), key=lambda value: value.dispatch_id):
+            coordinate = dispatch.intent.repository
+            lines.append(
+                f"| `{dispatch.dispatch_id}` | `{coordinate.repo_id}` | `{coordinate.base_branch or ''}` | "
+                f"`{coordinate.working_branch or ''}` | `{coordinate.base_revision}` | "
+                f"`{coordinate.worktree_id or ''}` | "
+                f"`{coordinate.remote_name or ''} {coordinate.remote_url or ''}` |"
+            )
         artifacts = self._ready_connection().execute(
             "SELECT kind, path, sha256 FROM artifacts WHERE run_id = ? ORDER BY path, artifact_id",
             (record.run_id,),
@@ -1036,6 +1079,35 @@ class StateStore:
                 lines.append(
                     f"| `{payload_row['dispatch_id']}` | `{evidence['artifact_id']}` | "
                     f"`{evidence['relative_path']}` | `{evidence['sha256']}` |"
+                )
+        lines.extend(
+            [
+                "",
+                "## Inspected Evidence Manifests",
+                "",
+                "| Dispatch | Manifest SHA-256 |",
+                "|---|---|",
+                "",
+                "| Dispatch | Path | Type | Size | SHA-256 |",
+                "|---|---|---|---:|---|",
+            ]
+        )
+        manifest_rows = self._ready_connection().execute(
+            "SELECT dispatch_id, repository_after_json FROM dispatch_payloads WHERE run_id = ? ORDER BY dispatch_id",
+            (record.run_id,),
+        ).fetchall()
+        for manifest_row in manifest_rows:
+            if manifest_row["repository_after_json"] is None:
+                continue
+            snapshot = json.loads(manifest_row["repository_after_json"])
+            if isinstance(snapshot, dict):
+                lines.append(
+                    f"| `{manifest_row['dispatch_id']}` | `{snapshot.get('manifest_sha256', '')}` |"
+                )
+            for entry in snapshot.get("evidence", []) if isinstance(snapshot, dict) else []:
+                lines.append(
+                    f"| `{manifest_row['dispatch_id']}` | `{entry['relative_path']}` | "
+                    f"`{entry['file_type']}` | {entry['size_bytes']} | `{entry['sha256']}` |"
                 )
         lines.extend(["", "## Reviews", "", "| Review | Dispatch | Verdict | Target revision |", "|---|---|---|---|"])
         reviews = self._ready_connection().execute(
@@ -1108,6 +1180,9 @@ class StateStore:
             version = 1
         if version == 1:
             self._apply_v2(connection)
+            version = 2
+        if version == 2:
+            self._apply_v3(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -1260,6 +1335,17 @@ class StateStore:
             """
         )
 
+    def _apply_v3(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            ALTER TABLE dispatch_payloads ADD COLUMN repository_before_json TEXT;
+            ALTER TABLE dispatch_payloads ADD COLUMN repository_after_json TEXT;
+            INSERT INTO schema_migrations(version, applied_at) VALUES (3, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
     def _write_snapshot(
         self,
         connection: sqlite3.Connection,
@@ -1374,15 +1460,18 @@ class StateStore:
             """
             INSERT INTO dispatch_payloads(
                 run_id, dispatch_id, prompt, policy_json, result_json,
-                forwarding_payload, process_id, session_metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                forwarding_payload, process_id, session_metadata_json,
+                repository_before_json, repository_after_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, dispatch_id) DO UPDATE SET
                 prompt = excluded.prompt,
                 policy_json = excluded.policy_json,
                 result_json = excluded.result_json,
                 forwarding_payload = excluded.forwarding_payload,
                 process_id = excluded.process_id,
-                session_metadata_json = excluded.session_metadata_json
+                session_metadata_json = excluded.session_metadata_json,
+                repository_before_json = excluded.repository_before_json,
+                repository_after_json = excluded.repository_after_json
             """,
             (
                 run_id,
@@ -1393,6 +1482,8 @@ class StateStore:
                 redact_text(payload.forwarding_payload) if payload.forwarding_payload is not None else None,
                 payload.process_id,
                 _json_text(payload.session_metadata) if payload.session_metadata is not None else None,
+                _json_text(payload.repository_before) if payload.repository_before is not None else None,
+                _json_text(payload.repository_after) if payload.repository_after is not None else None,
             ),
         )
         if cursor.rowcount != 1:

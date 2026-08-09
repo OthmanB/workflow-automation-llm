@@ -11,6 +11,7 @@ from helpers import FixtureProject, create_fixture_project, valid_plan_values
 
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.protocol import parse_supervisor_command
+from dispatcher.repository import EvidenceManifestEntry, RepositorySnapshot
 from dispatcher.results import parse_executor_result, parse_reviewer_result
 from dispatcher.sequential import (
     CompletionDecision,
@@ -90,7 +91,33 @@ def _workflow(project: FixtureProject, store: StateStore) -> SequentialWorkflow:
         project.config,
         store,
         owner_id="fixture-owner",
-        revision_resolver=lambda _workdir: "base-sha",
+        repository_inspector=lambda _config, _repo_id, require_clean: _repository_snapshot(),
+    )
+
+
+def _repository_snapshot() -> RepositorySnapshot:
+    return RepositorySnapshot(
+        repo_id="fixture-repo",
+        branch="main",
+        revision="base-sha",
+        worktree_id="b" * 64,
+        remote_name="origin",
+        remote_url="https://example.invalid/fixture.git",
+        clean=True,
+        evidence=(
+            EvidenceManifestEntry(
+                root="evidence",
+                relative_path="evidence/fixture.md",
+                file_type="file",
+                size_bytes=10,
+                mode=0o644,
+                mtime_ns=1,
+                sha256=_EVIDENCE_SHA,
+            ),
+        ),
+        external=(),
+        changes=(),
+        manifest_sha256="c" * 64,
     )
 
 
@@ -253,6 +280,21 @@ def test_unknown_step_and_missing_session_fail_before_dispatch_persistence(proje
             record.run_id,
             expected_generation=generation,
             supervisor_text=json.dumps(resume),
+        )
+
+    assert store.load_run(record.run_id)[0].dispatches == {}
+
+
+def test_supervisor_repository_assertion_cannot_override_normalized_step(project: FixtureProject) -> None:
+    store, workflow, record, generation = _activate_ready_run(project)
+    command = json.loads(_dispatch_command())
+    command["repo_id"] = "other-repo"
+
+    with pytest.raises(SequentialWorkflowError, match="does not match step repository"):
+        workflow.prepare_from_supervisor(
+            record.run_id,
+            expected_generation=generation,
+            supervisor_text=json.dumps(command),
         )
 
     assert store.load_run(record.run_id)[0].dispatches == {}

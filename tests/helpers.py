@@ -91,6 +91,8 @@ def create_fixture_project(
                 "default_branch": "main",
                 "evidence_roots": ["evidence"],
                 "writable_roots": ["."],
+                "external_roots": [],
+                "commit_policy": "required",
                 "permission_policy": "repository",
                 "allow_shared_writable_roots": False,
             }

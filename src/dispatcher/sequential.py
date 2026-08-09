@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, cast
+from typing import Any, Literal, Mapping, Protocol, cast
 
 from .config import Config
 from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
@@ -21,6 +20,13 @@ from .protocol import (
     HaltCommand,
     RequestCompletionCommand,
     parse_supervisor_command,
+)
+from .repository import (
+    RepositorySnapshot,
+    RepositoryValidationError,
+    inspect_repository,
+    validate_executor_snapshot,
+    validate_review_snapshot,
 )
 from .results import (
     ExecutorCompletedResult,
@@ -51,7 +57,17 @@ from .workflow import (
 )
 from .workflow import RepositoryCoordinate as DispatchRepositoryCoordinate
 
-RepositoryRevisionResolver = Callable[[Path], str]
+
+class RepositoryInspector(Protocol):
+    """Inspectable repository boundary used by production and deterministic tests."""
+
+    def __call__(
+        self,
+        config: Config,
+        repo_id: str,
+        *,
+        require_clean: bool,
+    ) -> RepositorySnapshot: ...
 
 
 class SequentialWorkflowError(ValueError):
@@ -73,6 +89,7 @@ class PreparedDispatch:
     review_target: ReviewTarget | None
     session_mode: Literal["new", "resume", "fork"]
     session_id: str | None
+    repository_before: RepositorySnapshot
 
 
 @dataclass(frozen=True)
@@ -98,12 +115,12 @@ class SequentialWorkflow:
         store: StateStore,
         *,
         owner_id: str,
-        revision_resolver: RepositoryRevisionResolver | None = None,
+        repository_inspector: RepositoryInspector = inspect_repository,
     ) -> None:
         self.config = config
         self.store = store
         self.owner_id = owner_id
-        self._revision_resolver = revision_resolver or _git_head_revision
+        self._repository_inspector = repository_inspector
 
     def render_bootstrap(self, run_id: str) -> tuple[str, Path]:
         """Render and persist a self-contained bootstrap from one approved run."""
@@ -238,9 +255,14 @@ class SequentialWorkflow:
         ):
             raise SequentialWorkflowError("sequential workflow already has an unresolved dispatch")
         step = _plan_step(record, command.step_id)
+        if command.repo_id is not None and command.repo_id != step.repo_id:
+            raise SequentialWorkflowError(
+                f"supervisor repository assertion {command.repo_id!r} does not match step repository {step.repo_id!r}"
+            )
         role_kind = self._role_kind(command.target_role)
         self._validate_step_readiness(record, step, role_kind, command.session_mode, command.target_role)
         workdir = self.config.repository_root(step.repo_id)
+        repository_before = self._inspect_repository(step.repo_id, require_clean=True)
         policy = generate_opencode_config(
             compile_effective_policy(
                 self.config,
@@ -250,7 +272,6 @@ class SequentialWorkflow:
             )
         )
         policy_rules = policy["permission"]
-        base_revision = self._revision_resolver(workdir)
         step_record = record.steps[step.step_id]
         attempt = step_record.executor_attempts + 1 if role_kind == "executor" else step_record.reviewer_attempts + 1
         dispatch_id = f"dispatch-{uuid.uuid4().hex}"
@@ -262,7 +283,7 @@ class SequentialWorkflow:
             role_kind=role_kind,
             step=step,
             task=command.prompt,
-            base_revision=base_revision,
+            repository=repository_before.dispatch_coordinate(),
             review_target=review_target,
         )
         dispatch = DispatchRecord(
@@ -278,7 +299,7 @@ class SequentialWorkflow:
                 prompt_sha256=_sha256_text(worker_prompt),
                 policy_digest=_sha256_json(policy),
                 expected_result_kind=role_kind,
-                repository=DispatchRepositoryCoordinate(repo_id=step.repo_id, base_revision=base_revision),
+                repository=repository_before.dispatch_coordinate(),
                 idempotency_key=f"idempotency-{uuid.uuid4().hex}",
             ),
             result_digest=None,
@@ -319,6 +340,7 @@ class SequentialWorkflow:
                 dispatch=dispatch,
                 prompt=worker_prompt,
                 policy=policy,
+                repository_before=repository_before.model_dump(mode="json"),
                 session_metadata={
                     "session_mode": command.session_mode,
                     "parent_session_id": session_id,
@@ -342,6 +364,7 @@ class SequentialWorkflow:
             review_target=review_target,
             session_mode=command.session_mode,
             session_id=session_id,
+            repository_before=repository_before,
         )
 
     def mark_running(
@@ -375,6 +398,7 @@ class SequentialWorkflow:
             review_target=prepared.review_target,
             session_mode=prepared.session_mode,
             session_id=prepared.session_id,
+            repository_before=prepared.repository_before,
         )
 
     def record_session_id(
@@ -419,6 +443,7 @@ class SequentialWorkflow:
             review_target=running.review_target,
             session_mode=running.session_mode,
             session_id=running.session_id,
+            repository_before=running.repository_before,
         )
 
     def apply_executor_result(
@@ -436,6 +461,17 @@ class SequentialWorkflow:
         _validate_executor_result(result, dispatch)
         step = _plan_step(record, dispatch.step_id)
         self._validate_executor_evidence(step, result)
+        repository_after = self._inspect_repository(dispatch.intent.repository.repo_id, require_clean=False)
+        try:
+            validate_executor_snapshot(
+                self.config,
+                coordinate=dispatch.intent.repository,
+                before=prepared.repository_before,
+                after=repository_after,
+                result=result,
+            )
+        except RepositoryValidationError as exc:
+            raise SequentialWorkflowError(str(exc)) from exc
         completion_event = self._event(record, "executor", "typed executor result received", dispatch.dispatch_id)
         record, generation = self.store.commit_dispatch_transition(
             record,
@@ -445,6 +481,7 @@ class SequentialWorkflow:
             event=completion_event,
             result_digest=_sha256_json(result.model_dump(mode="json")),
             result=result.model_dump(mode="json"),
+            repository_after=repository_after.model_dump(mode="json"),
         )
         step_record = record.steps[step.step_id]
         result_event = self._event(record, "dispatcher", f"executor outcome {result.outcome}", dispatch.dispatch_id)
@@ -522,10 +559,17 @@ class SequentialWorkflow:
             validate_reviewer_result_context(result, expectation)
         except ResultError as exc:
             raise SequentialWorkflowError(str(exc)) from exc
-        if result.review_target.result_revision is not None:
-            current_revision = self._revision_resolver(self.config.repository_root(result.repo_id))
-            if current_revision != result.review_target.result_revision:
-                raise SequentialWorkflowError("review target revision no longer matches the active repository")
+        repository_after = self._inspect_repository(dispatch.intent.repository.repo_id, require_clean=False)
+        try:
+            validate_review_snapshot(
+                self.config,
+                coordinate=dispatch.intent.repository,
+                before=prepared.repository_before,
+                after=repository_after,
+                review_target=result.review_target,
+            )
+        except RepositoryValidationError as exc:
+            raise SequentialWorkflowError(str(exc)) from exc
         completion_event = self._event(record, "reviewer", "typed reviewer result received", dispatch.dispatch_id)
         record, generation = self.store.commit_dispatch_transition(
             record,
@@ -535,6 +579,7 @@ class SequentialWorkflow:
             event=completion_event,
             result_digest=_sha256_json(result.model_dump(mode="json")),
             result=result.model_dump(mode="json"),
+            repository_after=repository_after.model_dump(mode="json"),
         )
         self.store.record_review(
             run_id=record.run_id,
@@ -827,6 +872,12 @@ class SequentialWorkflow:
             artifact_hashes=[artifact.sha256 for artifact in result.evidence],
         )
 
+    def _inspect_repository(self, repo_id: str, *, require_clean: bool) -> RepositorySnapshot:
+        try:
+            return self._repository_inspector(self.config, repo_id, require_clean=require_clean)
+        except RepositoryValidationError as exc:
+            raise SequentialWorkflowError(str(exc)) from exc
+
     def _validate_executor_evidence(self, step: PlanStep, result: ExecutorResult) -> None:
         expected = {item.artifact_id: item for item in step.evidence_requirements}
         actual = {item.artifact_id: item for item in result.evidence}
@@ -919,24 +970,6 @@ def _lease_keys(step: PlanStep) -> tuple[str, ...]:
     return tuple(sorted({f"repository:{step.repo_id}", *(f"resource:{lock.resource_id}" for lock in step.resource_locks)}))
 
 
-def _git_head_revision(workdir: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=workdir,
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise SequentialWorkflowError(f"could not resolve repository revision at {workdir}: {exc}") from exc
-    revision = result.stdout.strip()
-    if not revision:
-        raise SequentialWorkflowError(f"repository revision is empty at {workdir}")
-    return revision
-
-
 def _bootstrap_template() -> str:
     return resources.files("dispatcher").joinpath("templates/bootstrap_supervisor.md").read_text(encoding="utf-8")
 
@@ -1020,7 +1053,7 @@ def _worker_prompt(
     role_kind: Literal["executor", "reviewer"],
     step: PlanStep,
     task: str,
-    base_revision: str,
+    repository: DispatchRepositoryCoordinate,
     review_target: ReviewTarget | None,
 ) -> str:
     """Render the exact machine context a worker needs to return a typed result."""
@@ -1032,7 +1065,12 @@ def _worker_prompt(
             "attempt": attempt,
             "step_id": step.step_id,
             "repo_id": step.repo_id,
-            "base_revision": base_revision,
+            "base_revision": repository.base_revision,
+            "base_branch": repository.base_branch,
+            "working_branch": repository.working_branch,
+            "worktree_id": repository.worktree_id,
+            "remote_name": repository.remote_name,
+            "remote_url": repository.remote_url,
             "task": task,
             "authorized_actions": list(step.authorization.authorized_actions),
             "acceptance_criteria": [
