@@ -16,9 +16,12 @@ Repository = "https://github.com/OthmanB/workflow-automation-llm"
 [project.optional-dependencies]
 dev = [
     "build>=1.2,<2",
+    "hypothesis>=6.100,<7",
     "mypy>=1.17,<2",
+    "pip-audit>=2.8,<3",
     "pytest>=8.4,<9",
     "ruff>=0.12,<1",
+    "twine>=6,<7",
     "types-pyyaml>=6.0.12",
 ]
 
@@ -40,6 +43,7 @@ addopts = ["--strict-config", "--strict-markers", "-ra"]
 testpaths = ["tests"]
 pythonpath = ["tests"]
 xfail_strict = true
+markers = ["live_opencode: explicitly enabled read-only OpenCode compatibility smoke"]
 
 [tool.ruff]
 line-length = 100

@@ -1045,22 +1045,22 @@ execution is deferred rather than risking incorrect dependency propagation.
 
 **Actions:**
 
-- [ ] Add property tests for configuration, plan, and protocol parsing.
-- [ ] Add state-machine model tests covering random valid and invalid event
+- [x] Add property tests for configuration, plan, and protocol parsing.
+- [x] Add state-machine model tests covering random valid and invalid event
   sequences.
-- [ ] Add crash injection around every durable transition.
-- [ ] Add two-process and multi-repository concurrency tests.
-- [ ] Add secret scanning to CI for fixtures, diffs, and generated reports.
-- [ ] Add dependency vulnerability and package integrity checks.
-- [ ] Add deterministic end-to-end tests using disposable Git repositories and
+- [x] Add crash injection around every durable transition.
+- [x] Add two-process and multi-repository concurrency tests.
+- [x] Add secret scanning to CI for fixtures, diffs, and generated reports.
+- [x] Add dependency vulnerability and package integrity checks.
+- [x] Add deterministic end-to-end tests using disposable Git repositories and
   a fake OpenCode executable.
-- [ ] Add a separately gated live OpenCode smoke suite with harmless read-only
+- [x] Add a separately gated live OpenCode smoke suite with harmless read-only
   prompts.
 
 **Acceptance criteria:**
 
-- [ ] Every finding in the review maps to at least one regression test.
-- [ ] Live smoke tests are optional for ordinary CI but required for an
+- [x] Every finding in the review maps to at least one regression test.
+- [x] Live smoke tests are optional for ordinary CI but required for an
   OpenCode-version compatibility release.
 
 ### DISP-801: Add observability and support artifacts

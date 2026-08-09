@@ -315,6 +315,8 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
         policy=policy,
         repository_before={"repo_id": "fixture-repo"},
     )
+    store.close()
+    store = _store(project)
     assert store.classify_recovery(record.run_id)[0].disposition == (
         "operator_reconciliation_required"
     )
@@ -327,6 +329,8 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
     )
     running_record = prepared_record.model_copy(update={"dispatches": {running.dispatch_id: running}})
     generation = store.save_run(running_record, expected_generation=generation)
+    store.close()
+    store = _store(project)
     item = store.classify_recovery(record.run_id)[0]
     assert item.disposition == "operator_reconciliation_required"
     assert "automatic retry is forbidden" in item.detail
@@ -339,6 +343,8 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
     )
     completed_record = running_record.model_copy(update={"dispatches": {completed.dispatch_id: completed}})
     generation = store.save_run(completed_record, expected_generation=generation)
+    store.close()
+    store = _store(project)
     assert store.classify_recovery(record.run_id)[0].disposition == "forwarding_required"
 
     forwarded = transition_dispatch(
@@ -349,6 +355,8 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
     )
     forwarded_record = completed_record.model_copy(update={"dispatches": {forwarded.dispatch_id: forwarded}})
     store.save_run(forwarded_record, expected_generation=generation)
+    store.close()
+    store = _store(project)
     assert store.classify_recovery(record.run_id)[0].disposition == "acknowledgement_required"
 
 

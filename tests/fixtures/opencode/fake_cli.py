@@ -66,6 +66,28 @@ def _run() -> int:
         print("injected nonzero exit", file=sys.stderr, flush=True)
         return 78
 
+    if isinstance(payload, dict) and isinstance(payload.get("permission_probe"), str):
+        action = payload["permission_probe"]
+        decision = _permission_decision(policy, action)
+        call["permission_probe"] = {"action": action, "decision": decision}
+        call["head_after"] = _git_head(workdir)
+        _append_call(call)
+        _save_state(state)
+        if decision != "allow":
+            print(f"permission probe {action} was {decision}", file=sys.stderr, flush=True)
+            return 77
+        _event("text", session_id, {"type": "text", "text": json.dumps(call["permission_probe"])})
+        _event(
+            "step_finish",
+            session_id,
+            {
+                "type": "step-finish",
+                "cost": 0.0,
+                "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0},
+            },
+        )
+        return 0
+
     if role == "supervisor":
         response = _supervisor_response(state)
     elif role == "executor":
@@ -240,6 +262,11 @@ def _role(model: str) -> str:
     if model.endswith("/reviewer"):
         return "reviewer"
     raise RuntimeError(f"unsupported fake model: {model}")
+
+
+def _permission_decision(policy: dict[str, Any], action: str) -> str:
+    value = policy["permission"].get(action, policy["permission"].get("*", "deny"))
+    return value if isinstance(value, str) else "deny"
 
 
 def _option(args: list[str], name: str) -> str:
