@@ -203,7 +203,7 @@ def test_corruption_and_newer_schema_fail_with_recovery_guidance(
         _store(corrupt_project).initialize()
 
 
-def test_phase_five_manifest_columns_migrate_existing_phase_four_database(
+def test_workspace_group_table_migrates_existing_phase_three_database(
     project: FixtureProject,
 ) -> None:
     store = _store(project)
@@ -212,7 +212,8 @@ def test_phase_five_manifest_columns_migrate_existing_phase_four_database(
     with sqlite3.connect(store.database_path) as connection:
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_before_json")
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_after_json")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute("DROP TABLE workspace_groups")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
 
     migrated = _store(project)
     migrated.initialize()
@@ -222,10 +223,14 @@ def test_phase_five_manifest_columns_migrate_existing_phase_four_database(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'baselines'"
         ).fetchone()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(dispatch_payloads)").fetchall()}
+        workspace_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_groups'"
+        ).fetchone()
 
-    assert version == 3
+    assert version == 4
     assert table == ("baselines",)
     assert columns >= {"repository_before_json", "repository_after_json"}
+    assert workspace_table == ("workspace_groups",)
 
 
 def test_leases_are_single_writer_atomic_and_require_approved_stale_recovery(

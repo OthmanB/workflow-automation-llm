@@ -59,6 +59,12 @@ supervisor session. `recover` classifies unresolved dispatches. A `RUNNING`
 dispatch requires operator reconciliation because external side effects may
 have completed; it is never automatically retried.
 
+`recover` also reports unfinished workspace groups. `ACTIVE`, `INTEGRATING`,
+and `FAILED` groups require reconciliation because temporary child branches may
+contain unintegrated work. `CLEANUP_PENDING` means cleanup intent was persisted
+before a crash and can be resumed safely by the dispatcher-owned workspace
+manager. Do not remove Git worktrees or branches by hand.
+
 ## Operator Answer
 
 ```bash

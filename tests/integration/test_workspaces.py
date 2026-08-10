@@ -151,6 +151,71 @@ def test_workspace_merge_conflict_preserves_source_and_allows_reconciled_cleanup
     assert cleaned.group.state is WorkspaceGroupStatus.CLEANED
     assert _git(project.repository, "worktree", "list", "--porcelain").count("worktree ") == 1
 
+
+def test_workspace_recovery_classifies_active_and_pending_cleanup_after_restart(tmp_path: Path) -> None:
+    project = create_fixture_project(tmp_path)
+    _commit_fixture_repository(project.repository)
+    config = _worktree_config(project)
+    plan = NormalizedPlan.model_validate(valid_plan_values(project))
+    record = new_run_record(
+        run_id="workspace-recovery-run",
+        project_id=config.project_id,
+        config_digest=config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-workspace-recovery"),
+        event=_event(1),
+    )
+    store = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+    generation = store.create_run(record)
+    coordinator = WorkspaceCoordinator(config, store)
+    active = coordinator.prepare(
+        run_id=record.run_id,
+        expected_generation=generation,
+        repo_id="fixture-repo",
+        step_ids=["prepare-fixture"],
+    )
+    store.close()
+    restarted = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+
+    active_items = restarted.classify_workspace_recovery(record.run_id)
+
+    assert active_items[0].workspace_group_id == active.group.workspace_group_id
+    assert active_items[0].disposition == "operator_reconciliation_required"
+    reopened, generation = restarted.load_run(record.run_id)
+    group = reopened.workspace_groups[active.group.workspace_group_id]
+    pending = WorkspaceCoordinator(config, restarted).manager.begin_cleanup(group, event=_event(reopened.sequence + 1))
+    reopened, generation = restarted.save_workspace_group(
+        reopened,
+        expected_generation=generation,
+        group=pending,
+    )
+    restarted.close()
+    restarted = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+
+    pending_items = restarted.classify_workspace_recovery(record.run_id)
+
+    assert pending_items[0].disposition == "cleanup_required"
+    cleaned = WorkspaceCoordinator(config, restarted).cleanup(
+        run_id=reopened.run_id,
+        expected_generation=generation,
+        workspace_group_id=pending.workspace_group_id,
+        force=True,
+    )
+    assert cleaned.group.state is WorkspaceGroupStatus.CLEANED
+    assert _git(project.repository, "worktree", "list", "--porcelain").count("worktree ") == 1
+
 def _worktree_config(project):
     values = config_values(project)
     values["execution"]["concurrency"]["same_repository_mode"] = "worktree_barrier"

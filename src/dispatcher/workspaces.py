@@ -415,15 +415,18 @@ class WorkspaceCoordinator:
             group = record.workspace_groups[workspace_group_id]
         except KeyError as exc:
             raise WorkspaceError(f"unknown workspace group: {workspace_group_id}") from exc
-        pending = self.manager.begin_cleanup(
-            group,
-            event=self._event(record, workspace_group_id, "workspace cleanup requested"),
-        )
-        record, generation = self.store.save_workspace_group(
-            record,
-            expected_generation=generation,
-            group=pending,
-        )
+        if group.state is WorkspaceGroupStatus.CLEANUP_PENDING:
+            pending = group
+        else:
+            pending = self.manager.begin_cleanup(
+                group,
+                event=self._event(record, workspace_group_id, "workspace cleanup requested"),
+            )
+            record, generation = self.store.save_workspace_group(
+                record,
+                expected_generation=generation,
+                group=pending,
+            )
         try:
             cleaned = self.manager.cleanup(
                 pending,

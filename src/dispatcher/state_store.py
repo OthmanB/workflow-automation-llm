@@ -33,12 +33,13 @@ from .workflow import (
     StepStatus,
     TransitionEvent,
     WorkspaceGroup,
+    WorkspaceGroupStatus,
     transition_run,
     transition_step,
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -112,6 +113,16 @@ class RecoveryItem:
         "forwarding_required",
         "acknowledgement_required",
     ]
+    detail: str
+
+
+@dataclass(frozen=True)
+class WorkspaceRecoveryItem:
+    """A durable cleanup or reconciliation disposition for one workspace group."""
+
+    workspace_group_id: str
+    state: WorkspaceGroupStatus
+    disposition: Literal["cleanup_required", "operator_reconciliation_required"]
     detail: str
 
 
@@ -776,6 +787,33 @@ class StateStore:
                 )
         return items
 
+    def classify_workspace_recovery(self, run_id: str) -> list[WorkspaceRecoveryItem]:
+        """Classify incomplete temporary-worktree lifecycles without Git side effects."""
+        record, _generation = self.load_run(run_id)
+        items: list[WorkspaceRecoveryItem] = []
+        for group in sorted(record.workspace_groups.values(), key=lambda value: value.workspace_group_id):
+            if group.state is WorkspaceGroupStatus.CLEANED:
+                continue
+            if group.state is WorkspaceGroupStatus.CLEANUP_PENDING:
+                items.append(
+                    WorkspaceRecoveryItem(
+                        group.workspace_group_id,
+                        group.state,
+                        "cleanup_required",
+                        "workspace cleanup intent is durable; inspect and remove only owned temporary Git state",
+                    )
+                )
+            else:
+                items.append(
+                    WorkspaceRecoveryItem(
+                        group.workspace_group_id,
+                        group.state,
+                        "operator_reconciliation_required",
+                        "temporary workspace branches may contain unintegrated work; automatic retry is forbidden",
+                    )
+                )
+        return items
+
     def answer_operator_request(
         self,
         *,
@@ -1400,6 +1438,9 @@ class StateStore:
             version = 2
         if version == 2:
             self._apply_v3(connection)
+            version = 3
+        if version == 3:
+            self._apply_v4(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -1563,6 +1604,28 @@ class StateStore:
             """
         )
 
+    def _apply_v4(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE workspace_groups (
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                workspace_group_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                base_revision TEXT NOT NULL,
+                integration_branch TEXT NOT NULL,
+                lease_owner_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, workspace_group_id)
+            );
+            CREATE INDEX workspace_groups_recovery ON workspace_groups(run_id, state);
+            INSERT INTO schema_migrations(version, applied_at) VALUES (4, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
     def _write_snapshot(
         self,
         connection: sqlite3.Connection,
@@ -1653,6 +1716,33 @@ class StateStore:
                     dispatch.runtime_session_id,
                     generation,
                     dispatch.model_dump_json(),
+                ),
+            )
+        for group in record.workspace_groups.values():
+            connection.execute(
+                """
+                INSERT INTO workspace_groups(
+                    run_id, workspace_group_id, repo_id, state, base_revision,
+                    integration_branch, lease_owner_id, generation, record_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, workspace_group_id) DO UPDATE SET
+                    state = excluded.state,
+                    base_revision = excluded.base_revision,
+                    integration_branch = excluded.integration_branch,
+                    lease_owner_id = excluded.lease_owner_id,
+                    generation = excluded.generation,
+                    record_json = excluded.record_json
+                """,
+                (
+                    record.run_id,
+                    group.workspace_group_id,
+                    group.repo_id,
+                    group.state.value,
+                    group.base_revision,
+                    group.integration_branch,
+                    group.lease_owner_id,
+                    generation,
+                    group.model_dump_json(),
                 ),
             )
         connection.execute("DELETE FROM sessions WHERE run_id = ?", (record.run_id,))

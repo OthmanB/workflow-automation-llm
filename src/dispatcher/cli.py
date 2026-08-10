@@ -286,15 +286,25 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     try:
         store = state_mod.open_state_store(cfg)
         items = store.classify_recovery(args.run_id)
+        workspace_items = store.classify_workspace_recovery(args.run_id)
     except StateStoreError as exc:
         print(f"recover: FAILED - {exc}", file=sys.stderr)
         return 2
-    if not items:
-        print("recover: no unresolved dispatches")
+    if not items and not workspace_items:
+        print("recover: no unresolved dispatches or workspaces")
         return 0
     for item in items:
         print(f"{item.dispatch_id}: {item.state.value} -> {item.disposition}: {item.detail}")
-    return 1 if any(item.disposition == "operator_reconciliation_required" for item in items) else 0
+    for workspace_item in workspace_items:
+        print(
+            f"workspace {workspace_item.workspace_group_id}: {workspace_item.state.value} "
+            f"-> {workspace_item.disposition}: {workspace_item.detail}"
+        )
+    needs_reconciliation = any(item.disposition == "operator_reconciliation_required" for item in items)
+    needs_reconciliation = needs_reconciliation or any(
+        item.disposition == "operator_reconciliation_required" for item in workspace_items
+    )
+    return 1 if needs_reconciliation else 0
 
 
 def _cmd_support(args: argparse.Namespace) -> int:
