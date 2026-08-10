@@ -25,6 +25,26 @@ development validation but is not the authoritative sequential coordinator and
 does not authorize real OpenCode or repository-mutating execution. Omitting
 `--mock` exits `2` before configuration loading.
 
+## Real Operation Gate
+
+```bash
+dispatcher execute --config <private-v2.yaml> --run-id <run-id> \
+  --plan <plan.yaml> --repo-id <repo-id> \
+  --smoke-proof <proof.json> --smoke-model <provider/model> \
+  --permission-digest <sha256> --stall-policy-digest <sha256> \
+  --approval-ref <decision-ref> --confirm-real-operation
+```
+
+This is the only command that can request real OpenCode execution. It rejects
+public/mock configurations, stale plan or baseline hashes, unresolved recovery,
+unclean or wrong-branch repositories, missing or mismatched live-smoke proof,
+permission-policy drift, stall-policy drift, missing preflight, and missing
+operator confirmation before launching a process. The command runs preflight
+immediately before launch and records the approval reference in the audit log.
+
+This command has not been run by this project yet. A real-operation configuration
+must remain private and must never be added to the public example.
+
 ## Start
 
 ```bash

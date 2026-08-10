@@ -66,7 +66,7 @@ def create_fixture_project(
 
     config_path = root / "project.yaml"
     values: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "project": {
             "project_id": "fixture-project",
             "name": "Fixture Project",
@@ -136,7 +136,7 @@ def create_fixture_project(
             "profile_id": "balanced",
         },
         "execution": {
-            "mode": "mock_only",
+            "mode": "mock_workflow_test",
             "protocol_version": 1,
             "scheduling": "sequential",
             "concurrency": {

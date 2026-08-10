@@ -69,6 +69,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
+    execute_parser = sub.add_parser("execute", help="run one explicitly approved real-operation run")
+    execute_parser.add_argument("--config", required=True)
+    execute_parser.add_argument("--run-id", required=True)
+    execute_parser.add_argument("--plan", required=True)
+    execute_parser.add_argument("--repo-id", required=True)
+    execute_parser.add_argument("--smoke-proof", required=True)
+    execute_parser.add_argument("--smoke-model", required=True)
+    execute_parser.add_argument("--permission-digest", required=True)
+    execute_parser.add_argument("--stall-policy-digest", required=True)
+    execute_parser.add_argument("--approval-ref", required=True)
+    execute_parser.add_argument("--confirm-real-operation", action="store_true")
+    execute_parser.add_argument("--max-turns", type=int, default=20)
+    execute_parser.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
     # --- preflight ---
     pf_parser = sub.add_parser("preflight", help="run pre-flight checks only")
     pf_parser.add_argument("--config", required=True)
@@ -203,6 +219,67 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     orch = Orchestrator(cfg, run_session=run_session, resume=args.resume)
     return orch.run()
+
+
+def _cmd_execute(args: argparse.Namespace) -> int:
+    import os
+
+    from . import state as state_mod
+    from .config import load_config
+    from .execution import SequentialExecutionCoordinator
+    from .operation import RealOperationError, validate_real_operation_prerequisites
+    from .preflight import PreflightError, run_preflight
+    from .sequential import SequentialWorkflow
+    from .sessions import run_session
+    from .state_store import StateStoreError
+
+    try:
+        cfg = load_config(args.config)
+        _setup_logging(args.log_level or cfg.observability.log_level)
+        store = state_mod.open_state_store(cfg)
+        record, generation = store.load_run(args.run_id)
+        details = validate_real_operation_prerequisites(
+            config=cfg,
+            store=store,
+            record=record,
+            plan_path=args.plan,
+            repo_id=args.repo_id,
+            smoke_proof_path=args.smoke_proof,
+            smoke_model=args.smoke_model,
+            permission_digest=args.permission_digest,
+            stall_policy_digest=args.stall_policy_digest,
+            approval_ref=args.approval_ref,
+            confirm=args.confirm_real_operation,
+        )
+        if cfg.preflight is None or not cfg.preflight.enabled:
+            raise RealOperationError("real operation requires enabled preflight configuration")
+        run_preflight(cfg, cfg.state_dir, run_session=run_session, skip_smoke=False)
+        store.append_audit_event(
+            run_id=args.run_id,
+            event_id=f"audit-real-operation-{args.approval_ref}",
+            sequence=record.sequence + 1,
+            kind="real_operation_approved",
+            correlation_id=args.run_id,
+            causation_id=None,
+            payload={"approval_ref": args.approval_ref, **details},
+        )
+        workflow = SequentialWorkflow(cfg, store, owner_id=f"real-operation-{os.getpid()}")
+        coordinator = SequentialExecutionCoordinator(
+            cfg,
+            store,
+            workflow,
+            owner_id=f"real-operation-{os.getpid()}",
+        )
+        outcome = coordinator.run_to_completion(
+            args.run_id,
+            expected_generation=generation,
+            max_turns=args.max_turns,
+        )
+    except (RealOperationError, PreflightError, StateStoreError, OSError, ValueError) as exc:
+        print(f"execute: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"execute: completed accepted={outcome.accepted} report={outcome.report_path}")
+    return 0 if outcome.accepted else 1
 
 
 def _cmd_preflight(args: argparse.Namespace) -> int:
@@ -518,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.command == "run":
         return _cmd_run(args)
+    elif args.command == "execute":
+        return _cmd_execute(args)
     elif args.command == "preflight":
         return _cmd_preflight(args)
     elif args.command == "status":

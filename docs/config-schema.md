@@ -6,7 +6,7 @@ contract. Every field below is required unless marked optional; unknown fields
 and type coercion fail closed.
 
 ```yaml
-schema_version: 1
+schema_version: 2
 project: {project_id: example-project, name: Example Project, description: Public example}
 sources:
   specifications_dir: ./specifications
@@ -37,7 +37,7 @@ roles:
     reviewer-role: {model: provider/reviewer, variant: standard, display: Reviewer, permission_policy: reviewer}
 profile: {profiles_file: ./profiles.yaml, profile_id: balanced}
 execution:
-  mode: mock_only
+  mode: mock_workflow_test
   protocol_version: 1
   scheduling: sequential
   concurrency:
@@ -138,6 +138,10 @@ preflight:
   `ask` prevents `--auto`.
 - Observability retention only touches derived artifacts. It never deletes
   SQLite state, active-run artifacts, or unresolved dispatch data.
+- Schema v2 defines `mock_workflow_test` and `real_operation`. The public example
+  and ordinary development configurations must use `mock_workflow_test`.
+  `real_operation` is accepted only by the separately guarded `dispatcher
+  execute` command.
 
 ## Permission Examples
 

@@ -23,7 +23,7 @@ twine check --strict dist/*
 
 ## Execution Boundary
 
-The public configuration requires `execution.mode: mock_only`. Real OpenCode
+The public configuration requires `execution.mode: mock_workflow_test`. Real OpenCode
 dispatch and repository mutation are disabled. Fake OpenCode integration is
 the supported execution proof for normal development and CI.
 
@@ -38,6 +38,9 @@ DISPATCHER_LIVE_OPENCODE=1 DISPATCHER_LIVE_MODEL=<provider/model> \
 The smoke prompt only requests `LIVE_SMOKE_OK`, disables auto approval, and
 uses a deny-by-default permission payload. It must not be used as authorization
 for repository-mutating work.
+
+Schema v2 also defines `execution.mode: real_operation`, but that mode is
+private and can only be used through the guarded `dispatcher execute` command.
 
 ## Dependency and Secret Gates
 

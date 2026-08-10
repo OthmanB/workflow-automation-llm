@@ -47,7 +47,7 @@ def test_minimal_schema_v1_fixture_loads(project: FixtureProject) -> None:
         ),
         (
             lambda values: values["execution"].update({"mode": "real"}),
-            "execution.mode: Input should be 'mock_only'",
+            "execution.mode: Input should be 'mock_workflow_test' or 'real_operation'",
         ),
         (
             lambda values: values["execution"].update({"max_rounds_per_step": 0}),

@@ -205,7 +205,7 @@ class ConcurrencyDefinition(ContractModel):
 class ExecutionDefinition(ContractModel):
     """All active execution controls for the mock-only Phase 7 runtime."""
 
-    mode: Literal["mock_only"]
+    mode: Literal["mock_workflow_test", "real_operation"]
     protocol_version: Literal[1]
     scheduling: Literal["sequential", "bounded_parallel"]
     concurrency: ConcurrencyDefinition
@@ -327,7 +327,7 @@ class PreflightDefinition(ContractModel):
 class ProjectConfigModel(ContractModel):
     """Versioned, project-neutral configuration schema for Phase 1."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     project: ProjectDefinition
     sources: SourcesDefinition
     state: StateDefinition

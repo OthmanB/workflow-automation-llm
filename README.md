@@ -6,10 +6,12 @@ compilation, repository/evidence checks, workflow transitions, and durable
 recovery state. Supervisors propose typed JSON commands; they do not authorize
 or complete work by prose alone.
 
-> **Safety boundary:** real OpenCode and repository-mutating execution remain
-> disabled. The supported runtime is deterministic fake OpenCode, mock mode,
-> preflight, inspection, recovery, and derived support tooling. The opt-in live
-> smoke test is read-only and requires explicit environment gates.
+> **Safety boundary:** public configurations remain mock workflow test mode.
+> Real OpenCode and repository-mutating execution are available only through a
+> private, separately guarded command and have not been enabled here. The
+> supported default runtime is deterministic fake OpenCode, preflight,
+> inspection, recovery, and derived support tooling. The opt-in live smoke test
+> is read-only and requires explicit environment gates.
 
 ## Current Status
 
@@ -22,7 +24,7 @@ or complete work by prose alone.
 | Permission compilation | Implemented and fake-child tested | Live enforcement needs the opt-in compatibility suite |
 | Observability and support export | Implemented | Retention applies only to derived artifacts, never SQLite state |
 | Private reference migration | Deferred | Requires separate authorization; no private project data is present here |
-| Real OpenCode execution | Disabled | Read-only smoke is opt-in and not ordinary CI |
+| Real OpenCode execution | Guarded, not enabled | Requires private schema-v2 config and `dispatcher execute` |
 
 ## Documentation
 
@@ -47,6 +49,10 @@ plan are authoritative for current behavior.
 
 ```text
 dispatcher preflight --config <project.yaml>
+dispatcher execute --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
+  --repo-id <repo> --smoke-proof <proof.json> --smoke-model <provider/model> \
+  --permission-digest <sha256> --stall-policy-digest <sha256> \
+  --approval-ref <decision> --confirm-real-operation
 dispatcher start --config <project.yaml> --run-record <run.json>
 dispatcher status --config <project.yaml> [--run-id <id>] [--format text|json]
 dispatcher resume --config <project.yaml> --run-id <id>

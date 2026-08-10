@@ -13,15 +13,15 @@ database outside a separately approved lifecycle design.
 
 ## Project Configuration
 
-Replace ad-hoc paths and implicit defaults with a schema-v1 project YAML:
+Replace ad-hoc paths and implicit defaults with a schema-v2 project YAML:
 
 - register every repository with its root, remote, evidence roots, writable
   roots, commit policy, and permission policy;
 - register supervisor, executor, and reviewer roles by stable role key;
 - select a schema-v1 review profile;
 - declare budgets, bounded concurrency, and observability retention explicitly;
-- use `execution.mode: mock_only` until a future real-execution gate is
-  approved.
+- use `execution.mode: mock_workflow_test` until the private real-operation gate
+  is approved.
 
 Validate the result against `schemas/project-config-v1.json` and the public
 example before starting a run.

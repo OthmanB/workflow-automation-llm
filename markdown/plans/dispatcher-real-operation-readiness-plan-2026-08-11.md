@@ -195,7 +195,7 @@ execution:
 
 The live smoke test remains a test command, not a project execution mode.
 
-Because the current public schema uses `mock_only`, introduce this terminology
+Because the current public schema used `mock_only`, introduce this terminology
 through a versioned configuration migration rather than silently changing the
 meaning of schema v1.
 

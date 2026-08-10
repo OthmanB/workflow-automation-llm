@@ -26,6 +26,7 @@ def test_operations_document_every_supported_cli_command_and_unsupported_lifecyc
 
     for command in (
         "dispatcher run",
+        "dispatcher execute",
         "dispatcher preflight",
         "dispatcher start",
         "dispatcher status",
