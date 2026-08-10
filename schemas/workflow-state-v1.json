@@ -307,6 +307,19 @@
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Step Id",
           "type": "string"
+        },
+        "workspace_group_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Group Id"
         }
       },
       "required": [
@@ -448,7 +461,8 @@
             "budget",
             "escalation",
             "review_waiver",
-            "batch_reconciliation"
+            "batch_reconciliation",
+            "workspace_reconciliation"
           ],
           "title": "Kind",
           "type": "string"
@@ -711,7 +725,7 @@
         "base_branch": {
           "anyOf": [
             {
-              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$",
               "type": "string"
             },
             {
@@ -761,7 +775,7 @@
         "working_branch": {
           "anyOf": [
             {
-              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$",
               "type": "string"
             },
             {
@@ -1364,6 +1378,25 @@
           "title": "Integration Branch",
           "type": "string"
         },
+        "integration_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Integration Revision"
+        },
+        "integration_worktree_path": {
+          "minLength": 1,
+          "title": "Integration Worktree Path",
+          "type": "string"
+        },
         "last_event": {
           "$ref": "#/$defs/TransitionEvent"
         },
@@ -1397,6 +1430,7 @@
         "base_revision",
         "base_branch",
         "integration_branch",
+        "integration_worktree_path",
         "worktree_root",
         "lease_owner_id",
         "children",
@@ -1410,6 +1444,7 @@
       "enum": [
         "PREPARED",
         "ACTIVE",
+        "INTEGRATING",
         "CLEANUP_PENDING",
         "CLEANED",
         "FAILED"

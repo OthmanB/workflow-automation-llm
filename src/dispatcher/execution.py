@@ -7,7 +7,6 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .config import Config
@@ -176,7 +175,7 @@ class SequentialExecutionCoordinator:
         role = self.config.role(prepared.dispatch.role_key)
         repository = self.config.repository(prepared.dispatch.intent.repository.repo_id)
         snapshot_dirs = [
-            str(Path(repository.root) / evidence_root)
+            str(prepared.workdir / evidence_root)
             for evidence_root in repository.evidence_roots
         ]
         try:

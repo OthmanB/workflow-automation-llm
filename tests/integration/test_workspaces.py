@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,7 +83,6 @@ def test_workspace_groups_reject_serialized_and_patch_only_repository_modes(tmp_
             step_ids=["prepare-fixture"],
             event=_event(1),
         )
-
     values = config_values(project)
     values["execution"]["concurrency"]["same_repository_mode"] = "worktree_barrier"
     values["repositories"]["fixture-repo"]["commit_policy"] = "prohibited"
@@ -97,10 +97,93 @@ def test_workspace_groups_reject_serialized_and_patch_only_repository_modes(tmp_
         )
 
 
+def test_workspace_merge_conflict_preserves_source_and_allows_reconciled_cleanup(tmp_path: Path) -> None:
+    project = create_fixture_project(tmp_path)
+    _commit_fixture_repository(project.repository)
+    config = _worktree_config(project)
+    plan = _two_step_plan(project)
+    record = new_run_record(
+        run_id="workspace-conflict-run",
+        project_id=config.project_id,
+        config_digest=config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-workspace-conflict"),
+        event=_event(1),
+    )
+    store = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+    generation = store.create_run(record)
+    coordinator = WorkspaceCoordinator(config, store)
+    prepared = coordinator.prepare(
+        run_id=record.run_id,
+        expected_generation=generation,
+        repo_id="fixture-repo",
+        step_ids=["prepare-fixture", "prepare-second"],
+    )
+    for index, child in enumerate(prepared.group.children, start=1):
+        child_root = Path(child.worktree_path)
+        _git(child_root, "config", "user.email", "fixture@example.invalid")
+        _git(child_root, "config", "user.name", "Fixture")
+        (child_root / "initial.txt").write_text(f"child {index} change\n", encoding="utf-8")
+        _git(child_root, "add", "initial.txt")
+        _git(child_root, "commit", "-m", f"child {index} conflict")
+
+    with pytest.raises(WorkspaceError, match="workspace integration failed"):
+        coordinator.integrate(
+            run_id=prepared.record.run_id,
+            expected_generation=prepared.generation,
+            workspace_group_id=prepared.group.workspace_group_id,
+        )
+
+    failed, generation = store.load_run(record.run_id)
+    group = failed.workspace_groups[prepared.group.workspace_group_id]
+    assert group.state is WorkspaceGroupStatus.FAILED
+    assert _git(project.repository, "show", "HEAD:initial.txt") == "fixture"
+    cleaned = coordinator.cleanup(
+        run_id=failed.run_id,
+        expected_generation=generation,
+        workspace_group_id=group.workspace_group_id,
+        force=True,
+    )
+    assert cleaned.group.state is WorkspaceGroupStatus.CLEANED
+    assert _git(project.repository, "worktree", "list", "--porcelain").count("worktree ") == 1
+
 def _worktree_config(project):
     values = config_values(project)
     values["execution"]["concurrency"]["same_repository_mode"] = "worktree_barrier"
     return write_config(project, values)
+
+
+def _two_step_plan(project) -> NormalizedPlan:
+    values = valid_plan_values(project)
+    second = json.loads(json.dumps(values["steps"][0]))
+    second.update(
+        {
+            "ordinal": 2,
+            "step_id": "prepare-second",
+            "title": "Prepare second",
+            "produced_outputs": [
+                {
+                    "artifact_id": "second-output",
+                    "producer_step_id": None,
+                    "description": "Second output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "second-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "second-evidence",
+                    "relative_path": "second.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    values["steps"].append(second)
+    return NormalizedPlan.model_validate(values)
 
 
 def _commit_fixture_repository(root: Path) -> None:

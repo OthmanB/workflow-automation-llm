@@ -1012,7 +1012,7 @@ policy.
 
 - [x] Use the scheduler's ready set and resource locks.
 - [x] Enforce per-role and global concurrency limits from validated YAML.
-- [ ] Prefer isolated worktrees for concurrent repository work where supported.
+- [x] Prefer isolated worktrees for concurrent repository work where supported.
 - [x] Persist every child transition independently.
 - [x] Define coordinated cancellation and timeout behavior.
 - [x] Add crash, timeout, one-child failure, lock conflict, and concurrent state

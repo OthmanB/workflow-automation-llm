@@ -115,8 +115,10 @@ preflight:
   serialized.
 - `same_repository_mode: worktree_barrier` declares the owner-only root and
   branch prefix used for temporary same-repository worktrees. This manager
-  currently supports only `commit_policy: required`; it does not yet admit
-  same-repository batch dispatches until review and merge promotion are wired.
+  supports only `commit_policy: required`. Independent same-repository executor
+  children run behind one barrier, reviewers route to the same child worktree,
+  accepted child branches merge in deterministic order, and temporary branches
+  and worktrees are removed after promotion.
 - Review profiles declare `review_schedule`, `multi_review`, reviewer role
   keys, and required acceptance count. Mandatory plan or project review cannot
   be weakened by profile choice or an operator waiver.

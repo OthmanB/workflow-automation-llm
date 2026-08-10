@@ -30,6 +30,7 @@ from .repository import (
     RepositorySnapshot,
     RepositoryValidationError,
     inspect_repository,
+    inspect_workspace,
     validate_executor_snapshot,
     validate_review_snapshot,
 )
@@ -45,9 +46,10 @@ from .results import (
     validate_executor_result_context,
     validate_reviewer_result_context,
 )
-from .scheduler import SchedulingError, resource_keys, validate_batch
+from .scheduler import SchedulingError, resource_keys, validate_batch, validate_workspace_batch
 from .state_store import DispatchPayload, StateStore
 from .workflow import (
+    ACTIVE_DISPATCH_STATES,
     BatchRecord,
     BatchStatus,
     CompiledReviewObligation,
@@ -62,12 +64,16 @@ from .workflow import (
     TransitionEvent,
     UsageAmount,
     UsageLedger,
+    WorkspaceChild,
+    WorkspaceGroup,
+    WorkspaceGroupStatus,
     completion_obligations,
     transition_batch,
     transition_run,
     transition_step,
 )
 from .workflow import RepositoryCoordinate as DispatchRepositoryCoordinate
+from .workspaces import WorkspaceCoordinator, WorkspaceError
 
 
 class RepositoryInspector(Protocol):
@@ -160,6 +166,7 @@ class SequentialWorkflow:
         self.owner_id = owner_id
         self._repository_inspector = repository_inspector
         self._transition_lock = threading.RLock()
+        self.workspace_coordinator = WorkspaceCoordinator(config, store)
 
     def render_bootstrap(self, run_id: str) -> tuple[str, Path]:
         """Render and persist a self-contained bootstrap from one approved run."""
@@ -270,6 +277,8 @@ class SequentialWorkflow:
         if isinstance(command, DispatchCommand):
             return self.prepare_dispatch(record, generation, command)
         if isinstance(command, BatchDispatchCommand):
+            if self._is_workspace_batch_candidate(record, command):
+                return self.prepare_workspace_batch(record, generation, command)
             return self.prepare_batch(record, generation, command)
         if isinstance(command, RequestCompletionCommand):
             return self.evaluate_completion(record, generation)
@@ -324,8 +333,14 @@ class SequentialWorkflow:
             session_mode=command.session_mode,
         )
         self._validate_step_readiness(record, step, role_kind, command.session_mode, command.target_role)
-        workdir = self.config.repository_root(step.repo_id)
-        repository_before = self._inspect_repository(step.repo_id, require_clean=True)
+        workspace_group = self._workspace_group_for_step(record, step.step_id)
+        workspace_child = _workspace_child(workspace_group, step.step_id) if workspace_group is not None else None
+        workdir = Path(workspace_child.worktree_path) if workspace_child is not None else self.config.repository_root(step.repo_id)
+        repository_before = (
+            self._inspect_workspace(step.repo_id, workspace_child, require_clean=True)
+            if workspace_child is not None
+            else self._inspect_repository(step.repo_id, require_clean=True)
+        )
         policy = generate_opencode_config(
             compile_effective_policy(
                 self.config,
@@ -346,11 +361,14 @@ class SequentialWorkflow:
             role_kind=role_kind,
             step=step,
             task=command.prompt,
-            repository=repository_before.dispatch_coordinate(),
+            repository=repository_before.dispatch_coordinate(
+                base_branch=workspace_group.base_branch if workspace_group is not None else None
+            ),
             review_target=review_target,
         )
         dispatch = DispatchRecord(
             dispatch_id=dispatch_id,
+            workspace_group_id=workspace_group.workspace_group_id if workspace_group is not None else None,
             step_id=step.step_id,
             role_key=command.target_role,
             role_kind=role_kind,
@@ -362,7 +380,9 @@ class SequentialWorkflow:
                 prompt_sha256=_sha256_text(worker_prompt),
                 policy_digest=_sha256_json(policy),
                 expected_result_kind=role_kind,
-                repository=repository_before.dispatch_coordinate(),
+                repository=repository_before.dispatch_coordinate(
+                    base_branch=workspace_group.base_branch if workspace_group is not None else None
+                ),
                 idempotency_key=f"idempotency-{uuid.uuid4().hex}",
             ),
             result_digest=None,
@@ -390,7 +410,7 @@ class SequentialWorkflow:
         updated = record.model_copy(
             update={"steps": steps, "dispatches": dispatches, "sequence": event.sequence, "updated_at": event.occurred_at}
         )
-        lease_keys = _lease_keys(step)
+        lease_keys = _lease_keys(step, include_repository=workspace_group is None)
         lease_owner_id = _dispatch_lease_owner_id(self.owner_id, dispatch_id)
         session_id = self._owned_session_id(record.run_id, role_kind, command.target_role, command.session_mode)
         self.store.acquire_resource_leases(
@@ -433,19 +453,64 @@ class SequentialWorkflow:
             repository_before=repository_before,
         )
 
-    def prepare_batch(
+    def prepare_workspace_batch(
         self,
         record: RunRecord,
         generation: int,
         command: BatchDispatchCommand,
     ) -> PreparedBatch:
+        """Prepare one same-repository executor barrier in durable child worktrees."""
+        try:
+            children = validate_workspace_batch(self.config, record, tuple(command.children))
+        except SchedulingError as exc:
+            raise SequentialWorkflowError(f"workspace batch is not schedulable: {exc}") from exc
+        repo_id = _plan_step(record, children[0].step_id).repo_id
+        try:
+            outcome = self.workspace_coordinator.prepare(
+                run_id=record.run_id,
+                expected_generation=generation,
+                repo_id=repo_id,
+                step_ids=[child.step_id for child in children],
+            )
+            return self.prepare_batch(
+                outcome.record,
+                outcome.generation,
+                command,
+                workspace_group=outcome.group,
+            )
+        except Exception as exc:
+            if "outcome" in locals():
+                try:
+                    self.workspace_coordinator.cleanup(
+                        run_id=outcome.record.run_id,
+                        expected_generation=outcome.generation,
+                        workspace_group_id=outcome.group.workspace_group_id,
+                        force=True,
+                    )
+                except WorkspaceError:
+                    pass
+            if isinstance(exc, SequentialWorkflowError):
+                raise
+            raise SequentialWorkflowError(f"workspace batch preparation failed: {exc}") from exc
+
+    def prepare_batch(
+        self,
+        record: RunRecord,
+        generation: int,
+        command: BatchDispatchCommand,
+        *,
+        workspace_group: WorkspaceGroup | None = None,
+    ) -> PreparedBatch:
         """Atomically prepare every independently valid child in a protocol-v2 batch."""
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a batch")
-        try:
-            children = validate_batch(self.config, record, tuple(command.children))
-        except SchedulingError as exc:
-            raise SequentialWorkflowError(f"batch is not schedulable: {exc}") from exc
+        if workspace_group is None:
+            try:
+                children = validate_batch(self.config, record, tuple(command.children))
+            except SchedulingError as exc:
+                raise SequentialWorkflowError(f"batch is not schedulable: {exc}") from exc
+        else:
+            children = tuple(sorted(command.children, key=lambda child: _plan_step(record, child.step_id).ordinal))
 
         batch_id = f"batch-{uuid.uuid4().hex}"
         working = record
@@ -466,8 +531,13 @@ class SequentialWorkflow:
                 session_mode=child.session_mode,
             )
             self._validate_step_readiness(working, step, role_kind, child.session_mode, child.target_role)
-            workdir = self.config.repository_root(step.repo_id)
-            repository_before = self._inspect_repository(step.repo_id, require_clean=True)
+            workspace_child = _workspace_child(workspace_group, step.step_id) if workspace_group is not None else None
+            workdir = Path(workspace_child.worktree_path) if workspace_child is not None else self.config.repository_root(step.repo_id)
+            repository_before = (
+                self._inspect_workspace(step.repo_id, workspace_child, require_clean=True)
+                if workspace_child is not None
+                else self._inspect_repository(step.repo_id, require_clean=True)
+            )
             policy = generate_opencode_config(
                 compile_effective_policy(
                     self.config,
@@ -496,12 +566,15 @@ class SequentialWorkflow:
                 role_kind=role_kind,
                 step=step,
                 task=child.prompt,
-                repository=repository_before.dispatch_coordinate(),
+                repository=repository_before.dispatch_coordinate(
+                    base_branch=workspace_group.base_branch if workspace_group is not None else None
+                ),
                 review_target=review_target,
             )
             dispatch = DispatchRecord(
                 dispatch_id=dispatch_id,
                 batch_id=batch_id,
+                workspace_group_id=workspace_group.workspace_group_id if workspace_group is not None else None,
                 step_id=step.step_id,
                 role_key=child.target_role,
                 role_kind=role_kind,
@@ -513,7 +586,9 @@ class SequentialWorkflow:
                     prompt_sha256=_sha256_text(worker_prompt),
                     policy_digest=_sha256_json(policy),
                     expected_result_kind=role_kind,
-                    repository=repository_before.dispatch_coordinate(),
+                    repository=repository_before.dispatch_coordinate(
+                        base_branch=workspace_group.base_branch if workspace_group is not None else None
+                    ),
                     idempotency_key=f"idempotency-{uuid.uuid4().hex}",
                 ),
                 result_digest=None,
@@ -547,7 +622,7 @@ class SequentialWorkflow:
                     "updated_at": event.occurred_at,
                 }
             )
-            lease_keys = _lease_keys(step)
+            lease_keys = _lease_keys(step, include_repository=workspace_group is None)
             prepared_children.append(
                 PreparedDispatch(
                     run_id=record.run_id,
@@ -750,7 +825,7 @@ class SequentialWorkflow:
         _validate_executor_result(result, dispatch)
         step = _plan_step(record, dispatch.step_id)
         self._validate_executor_evidence(step, result)
-        repository_after = self._inspect_repository(dispatch.intent.repository.repo_id, require_clean=False)
+        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
         try:
             validate_executor_snapshot(
                 self.config,
@@ -870,7 +945,7 @@ class SequentialWorkflow:
             validate_reviewer_result_context(result, expectation)
         except ResultError as exc:
             raise SequentialWorkflowError(str(exc)) from exc
-        repository_after = self._inspect_repository(dispatch.intent.repository.repo_id, require_clean=False)
+        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
         try:
             validate_review_snapshot(
                 self.config,
@@ -1034,13 +1109,70 @@ class SequentialWorkflow:
         if generation != expected_generation:
             raise SequentialWorkflowError("forwarding acknowledgement generation is stale")
         event = self._event(record, "supervisor", "supervisor forwarding acknowledged", dispatch_id)
-        return self.store.commit_dispatch_transition(
+        updated, next_generation = self.store.commit_dispatch_transition(
             record,
             expected_generation=generation,
             dispatch_id=dispatch_id,
             target=DispatchStatus.ACKNOWLEDGED,
             event=event,
         )
+        dispatch = updated.dispatches[dispatch_id]
+        if dispatch.workspace_group_id is None:
+            return updated, next_generation
+        return self._maybe_integrate_workspace_group(updated, next_generation, dispatch.workspace_group_id)
+
+    def _maybe_integrate_workspace_group(
+        self,
+        record: RunRecord,
+        generation: int,
+        workspace_group_id: str,
+    ) -> tuple[RunRecord, int]:
+        try:
+            group = record.workspace_groups[workspace_group_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError("workspace group disappeared before integration") from exc
+        if group.state is not WorkspaceGroupStatus.ACTIVE:
+            return record, generation
+        group_steps = {child.step_id for child in group.children}
+        if any(record.steps[step_id].state is not StepStatus.ACCEPTED for step_id in group_steps):
+            return record, generation
+        if any(
+            dispatch.workspace_group_id == workspace_group_id and dispatch.state in ACTIVE_DISPATCH_STATES
+            for dispatch in record.dispatches.values()
+        ):
+            return record, generation
+        try:
+            outcome = self.workspace_coordinator.integrate(
+                run_id=record.run_id,
+                expected_generation=generation,
+                workspace_group_id=workspace_group_id,
+            )
+            return outcome.record, outcome.generation
+        except WorkspaceError:
+            failed_record, failed_generation = self.store.load_run(record.run_id)
+            request_event = self._event(
+                failed_record,
+                "dispatcher",
+                "workspace integration requires operator reconciliation",
+                workspace_group_id,
+            )
+            request = OperatorRequest(
+                request_id=f"request-{uuid.uuid4().hex}",
+                question=(
+                    f"Workspace group {workspace_group_id} could not be integrated. "
+                    "Reconcile the temporary branches before continuing."
+                ),
+                allowed_answers=["reconcile", "halt"],
+                context_ref=workspace_group_id,
+                resume_to=RunStatus.RUNNING,
+                expires_at=None,
+                required_role=None,
+                kind="workspace_reconciliation",
+                step_id=None,
+            )
+            waiting = transition_run(failed_record, RunStatus.WAITING_OPERATOR, request_event, operator_request=request)
+            waiting_generation = self.store.save_run(waiting, expected_generation=failed_generation)
+            return waiting, waiting_generation
 
     @_serialized_transition
     def fail_dispatch(
@@ -1555,6 +1687,69 @@ class SequentialWorkflow:
         except RepositoryValidationError as exc:
             raise SequentialWorkflowError(str(exc)) from exc
 
+    def _inspect_workspace(self, repo_id: str, child: WorkspaceChild, *, require_clean: bool) -> RepositorySnapshot:
+        try:
+            return inspect_workspace(
+                self.config,
+                repo_id,
+                root=Path(child.worktree_path),
+                expected_branch=child.branch,
+                require_clean=require_clean,
+            )
+        except RepositoryValidationError as exc:
+            raise SequentialWorkflowError(str(exc)) from exc
+
+    def _inspect_dispatch_repository(
+        self,
+        record: RunRecord,
+        dispatch: DispatchRecord,
+        *,
+        require_clean: bool,
+    ) -> RepositorySnapshot:
+        group = self._workspace_group_for_step(record, dispatch.step_id, dispatch.workspace_group_id)
+        if group is None:
+            return self._inspect_repository(dispatch.intent.repository.repo_id, require_clean=require_clean)
+        return self._inspect_workspace(
+            dispatch.intent.repository.repo_id,
+            _workspace_child(group, dispatch.step_id),
+            require_clean=require_clean,
+        )
+
+    def _workspace_group_for_step(
+        self,
+        record: RunRecord,
+        step_id: str,
+        workspace_group_id: str | None = None,
+    ) -> WorkspaceGroup | None:
+        if workspace_group_id is not None:
+            try:
+                group = record.workspace_groups[workspace_group_id]
+            except KeyError as exc:
+                raise SequentialWorkflowError("dispatch references an unknown workspace group") from exc
+            if step_id not in {child.step_id for child in group.children}:
+                raise SequentialWorkflowError("workspace group does not own dispatch step")
+            return group
+        groups = [
+            group
+            for group in record.workspace_groups.values()
+            if group.state in {WorkspaceGroupStatus.ACTIVE, WorkspaceGroupStatus.INTEGRATING}
+            and step_id in {child.step_id for child in group.children}
+        ]
+        if len(groups) > 1:
+            raise SequentialWorkflowError("multiple active workspace groups own one step")
+        return groups[0] if groups else None
+
+    def _is_workspace_batch_candidate(self, record: RunRecord, command: BatchDispatchCommand) -> bool:
+        if self.config.execution.concurrency.same_repository_mode != "worktree_barrier":
+            return False
+        if len(command.children) < 2:
+            return False
+        try:
+            repo_ids = {_plan_step(record, child.step_id).repo_id for child in command.children}
+        except SequentialWorkflowError:
+            return False
+        return len(repo_ids) == 1
+
     def _validate_executor_evidence(self, step: PlanStep, result: ExecutorResult) -> None:
         expected = {item.artifact_id: item for item in step.evidence_requirements}
         actual = {item.artifact_id: item for item in result.evidence}
@@ -1643,8 +1838,18 @@ def _plan_step(record: RunRecord, step_id: str) -> PlanStep:
     raise SequentialWorkflowError(f"supervisor requested unknown plan step: {step_id}")
 
 
-def _lease_keys(step: PlanStep) -> tuple[str, ...]:
-    return resource_keys(step.repo_id, tuple(lock.resource_id for lock in step.resource_locks))
+def _lease_keys(step: PlanStep, *, include_repository: bool = True) -> tuple[str, ...]:
+    keys = set(resource_keys(step.repo_id, tuple(lock.resource_id for lock in step.resource_locks)))
+    if not include_repository:
+        keys.discard(f"repository:{step.repo_id}")
+    return tuple(sorted(keys))
+
+
+def _workspace_child(group: WorkspaceGroup, step_id: str) -> WorkspaceChild:
+    for child in group.children:
+        if child.step_id == step_id:
+            return child
+    raise SequentialWorkflowError(f"workspace group {group.workspace_group_id} does not own step {step_id}")
 
 
 def _dispatch_lease_owner_id(owner_id: str, dispatch_id: str) -> str:

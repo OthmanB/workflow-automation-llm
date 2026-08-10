@@ -8,7 +8,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -19,6 +19,9 @@ from .workflow import RepositoryCoordinate
 
 class RepositoryValidationError(ValueError):
     """A repository does not match its registered dispatch boundary."""
+
+
+GitBranch = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")]
 
 
 class EvidenceManifestEntry(ContractModel):
@@ -63,7 +66,7 @@ class RepositorySnapshot(ContractModel):
     """Immutable observation of one exact registered repository worktree."""
 
     repo_id: Identifier
-    branch: Identifier
+    branch: GitBranch
     revision: str = Field(min_length=1, max_length=200)
     worktree_id: str = Field(pattern=r"^[a-f0-9]{64}$")
     remote_name: Identifier
@@ -80,12 +83,12 @@ class RepositorySnapshot(ContractModel):
             raise ValueError("clean repository snapshot cannot contain changes")
         return self
 
-    def dispatch_coordinate(self) -> RepositoryCoordinate:
+    def dispatch_coordinate(self, *, base_branch: str | None = None) -> RepositoryCoordinate:
         """Return the durable pre-dispatch coordinate derived from this snapshot."""
         return RepositoryCoordinate(
             repo_id=self.repo_id,
             base_revision=self.revision,
-            base_branch=self.branch,
+            base_branch=base_branch or self.branch,
             working_branch=self.branch,
             worktree_id=self.worktree_id,
             remote_name=self.remote_name,
@@ -101,16 +104,51 @@ def inspect_repository(
 ) -> RepositorySnapshot:
     """Inspect one configured root and reject any identity or baseline mismatch."""
     repository = config.repository(repo_id)
-    root = config.repository_root(repo_id).resolve()
+    return _inspect_repository_at(
+        config,
+        repo_id,
+        root=config.repository_root(repo_id).resolve(),
+        expected_branch=repository.default_branch,
+        require_clean=require_clean,
+    )
+
+
+def inspect_workspace(
+    config: Config,
+    repo_id: str,
+    *,
+    root: Path,
+    expected_branch: str,
+    require_clean: bool,
+) -> RepositorySnapshot:
+    """Inspect one linked worktree without requiring the repository default branch."""
+    return _inspect_repository_at(
+        config,
+        repo_id,
+        root=root.resolve(),
+        expected_branch=expected_branch,
+        require_clean=require_clean,
+    )
+
+
+def _inspect_repository_at(
+    config: Config,
+    repo_id: str,
+    *,
+    root: Path,
+    expected_branch: str,
+    require_clean: bool,
+) -> RepositorySnapshot:
+    repository = config.repository(repo_id)
     top_level = _git(root, "rev-parse", "--show-toplevel")
     if Path(top_level).resolve() != root:
         raise RepositoryValidationError(
             f"repository {repo_id} root is not the registered Git worktree: {root}"
         )
     branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
-    if branch != repository.default_branch:
+    if branch != expected_branch:
         raise RepositoryValidationError(
-            f"repository {repo_id} branch mismatch: expected {repository.default_branch!r}, found {branch!r}"
+            f"repository {repo_id} branch mismatch: expected {expected_branch!r}, found {branch!r}"
         )
     remote_url = _git(root, "remote", "get-url", repository.expected_remote.name)
     if remote_url != repository.expected_remote.url:
@@ -239,7 +277,6 @@ def _validate_snapshot_identity(coordinate: RepositoryCoordinate, snapshot: Repo
     mismatches = []
     for field, expected, actual in (
         ("repo_id", coordinate.repo_id, snapshot.repo_id),
-        ("branch", coordinate.base_branch, snapshot.branch),
         ("working_branch", coordinate.working_branch, snapshot.branch),
         ("worktree_id", coordinate.worktree_id, snapshot.worktree_id),
         ("remote_name", coordinate.remote_name, snapshot.remote_name),

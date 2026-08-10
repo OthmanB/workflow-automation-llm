@@ -18,7 +18,7 @@ or complete work by prose alone.
 | Schema-v1 config, plans, commands, results, and state | Implemented | Unknown or missing fields fail closed |
 | SQLite state, leases, recovery, and evidence | Implemented | `RUNNING` work is never retried automatically |
 | Review profiles, budgets, and operator gates | Implemented | Measured worker usage only; live execution remains disabled |
-| Cross-repository bounded batches | Implemented | Same-repository work remains serialized pending a worktree/merge lifecycle |
+| Bounded worktree barriers | Implemented | Same-repository writes require clean `commit_policy: required` repositories; patch-only barriers remain unsupported |
 | Permission compilation | Implemented and fake-child tested | Live enforcement needs the opt-in compatibility suite |
 | Observability and support export | Implemented | Retention applies only to derived artifacts, never SQLite state |
 | Private reference migration | Deferred | Requires separate authorization; no private project data is present here |

@@ -61,6 +61,7 @@ class BatchStatus(str, Enum):
 class WorkspaceGroupStatus(str, Enum):
     PREPARED = "PREPARED"
     ACTIVE = "ACTIVE"
+    INTEGRATING = "INTEGRATING"
     CLEANUP_PENDING = "CLEANUP_PENDING"
     CLEANED = "CLEANED"
     FAILED = "FAILED"
@@ -153,7 +154,10 @@ BATCH_TRANSITIONS: dict[BatchStatus, frozenset[BatchStatus]] = {
 
 WORKSPACE_GROUP_TRANSITIONS: dict[WorkspaceGroupStatus, frozenset[WorkspaceGroupStatus]] = {
     WorkspaceGroupStatus.PREPARED: frozenset({WorkspaceGroupStatus.ACTIVE, WorkspaceGroupStatus.FAILED}),
-    WorkspaceGroupStatus.ACTIVE: frozenset({WorkspaceGroupStatus.CLEANUP_PENDING, WorkspaceGroupStatus.FAILED}),
+    WorkspaceGroupStatus.ACTIVE: frozenset(
+        {WorkspaceGroupStatus.INTEGRATING, WorkspaceGroupStatus.CLEANUP_PENDING, WorkspaceGroupStatus.FAILED}
+    ),
+    WorkspaceGroupStatus.INTEGRATING: frozenset({WorkspaceGroupStatus.CLEANUP_PENDING, WorkspaceGroupStatus.FAILED}),
     WorkspaceGroupStatus.CLEANUP_PENDING: frozenset({WorkspaceGroupStatus.CLEANED, WorkspaceGroupStatus.FAILED}),
     WorkspaceGroupStatus.CLEANED: frozenset(),
     WorkspaceGroupStatus.FAILED: frozenset({WorkspaceGroupStatus.CLEANUP_PENDING}),
@@ -198,6 +202,7 @@ class OperatorRequest(ContractModel):
         "escalation",
         "review_waiver",
         "batch_reconciliation",
+        "workspace_reconciliation",
     ] = "underspecification"
     step_id: Identifier | None = None
     reassignment_role_key: Identifier | None = None
@@ -218,8 +223,8 @@ class RepositoryCoordinate(ContractModel):
 
     repo_id: Identifier
     base_revision: Annotated[str, Field(min_length=1, max_length=200)]
-    base_branch: Identifier | None = None
-    working_branch: Identifier | None = None
+    base_branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")] | None = None
+    working_branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")] | None = None
     worktree_id: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")] | None = None
     remote_name: Identifier | None = None
     remote_url: Annotated[str, Field(min_length=1)] | None = None
@@ -240,6 +245,7 @@ class DispatchRecord(ContractModel):
 
     dispatch_id: Identifier
     batch_id: Identifier | None = None
+    workspace_group_id: Identifier | None = None
     step_id: Identifier
     role_key: Identifier
     role_kind: Literal["executor", "reviewer"]
@@ -314,6 +320,8 @@ class WorkspaceGroup(ContractModel):
     base_revision: Annotated[str, Field(min_length=1, max_length=200)]
     base_branch: Identifier
     integration_branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")]
+    integration_worktree_path: Annotated[str, Field(min_length=1)]
+    integration_revision: Annotated[str, Field(min_length=1, max_length=200)] | None = None
     worktree_root: Annotated[str, Field(min_length=1)]
     lease_owner_id: Identifier
     children: tuple[WorkspaceChild, ...]
@@ -333,6 +341,8 @@ class WorkspaceGroup(ContractModel):
             raise ValueError("workspace group children must have unique branches")
         if len(paths) != len(set(paths)):
             raise ValueError("workspace group children must have unique paths")
+        if self.integration_worktree_path in paths:
+            raise ValueError("workspace integration path must differ from child paths")
         return self
 
 

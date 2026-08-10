@@ -75,6 +75,7 @@ class WorktreeManager:
             base_revision=snapshot.revision,
             base_branch=snapshot.branch,
             integration_branch=_branch_name(concurrency.worktree_branch_prefix, workspace_group_id, "integration"),
+            integration_worktree_path=str((group_root / "integration").resolve()),
             worktree_root=str(group_root),
             lease_owner_id=f"workspace-{workspace_group_id}",
             children=children,
@@ -135,9 +136,48 @@ class WorktreeManager:
             updated_children.append(child.model_copy(update={"head_revision": head}))
         return group.model_copy(update={"children": tuple(updated_children)})
 
+    def begin_integration(self, group: WorkspaceGroup, *, event: TransitionEvent) -> WorkspaceGroup:
+        """Persist the point after which the source branch may be promoted."""
+        if group.state is not WorkspaceGroupStatus.ACTIVE:
+            raise WorkspaceError("only active workspace groups can begin integration")
+        return transition_workspace_group(group, WorkspaceGroupStatus.INTEGRATING, event)
+
+    def integrate(self, group: WorkspaceGroup, *, event: TransitionEvent) -> WorkspaceGroup:
+        """Merge child branches in order, then fast-forward the source default branch once."""
+        if group.state is not WorkspaceGroupStatus.INTEGRATING:
+            raise WorkspaceError("workspace integration intent must be recorded before merging")
+        self._validate_group(group)
+        source = self.config.repository_root(group.repo_id)
+        snapshot = inspect_repository(self.config, group.repo_id, require_clean=True)
+        if snapshot.revision != group.base_revision or snapshot.branch != group.base_branch:
+            raise WorkspaceError("repository moved after workspace group preparation")
+        integration_path = Path(group.integration_worktree_path)
+        if integration_path.exists() or self._branch_exists(source, group.integration_branch):
+            raise WorkspaceError("workspace integration branch or path already exists")
+        integration_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._git(
+                source,
+                "worktree",
+                "add",
+                "-b",
+                group.integration_branch,
+                str(integration_path),
+                group.base_revision,
+            )
+            for child in group.children:
+                self._git(integration_path, "merge", "--no-ff", "--no-edit", child.branch)
+            self._git(source, "merge", "--ff-only", group.integration_branch)
+        except Exception as exc:
+            if isinstance(exc, WorkspaceError):
+                raise
+            raise WorkspaceError(f"workspace integration failed: {exc}") from exc
+        revision = self._git(source, "rev-parse", "HEAD")
+        return group.model_copy(update={"integration_revision": revision, "last_event": event})
+
     def begin_cleanup(self, group: WorkspaceGroup, *, event: TransitionEvent) -> WorkspaceGroup:
         """Persist the intent to remove only this manager's temporary workspaces."""
-        if group.state not in {WorkspaceGroupStatus.ACTIVE, WorkspaceGroupStatus.FAILED}:
+        if group.state not in {WorkspaceGroupStatus.ACTIVE, WorkspaceGroupStatus.INTEGRATING, WorkspaceGroupStatus.FAILED}:
             raise WorkspaceError("workspace group is not eligible for cleanup")
         return transition_workspace_group(group, WorkspaceGroupStatus.CLEANUP_PENDING, event)
 
@@ -159,6 +199,23 @@ class WorktreeManager:
                     continue
             try:
                 args = ("branch", "-D", child.branch) if force else ("branch", "-d", child.branch)
+                self._git(source, *args)
+            except WorkspaceError as exc:
+                errors.append(str(exc))
+        integration_path = Path(group.integration_worktree_path)
+        if integration_path.exists():
+            try:
+                args = ("worktree", "remove", "--force", str(integration_path)) if force else (
+                    "worktree",
+                    "remove",
+                    str(integration_path),
+                )
+                self._git(source, *args)
+            except WorkspaceError as exc:
+                errors.append(str(exc))
+        if self._branch_exists(source, group.integration_branch):
+            try:
+                args = ("branch", "-D", group.integration_branch) if force else ("branch", "-d", group.integration_branch)
                 self._git(source, *args)
             except WorkspaceError as exc:
                 errors.append(str(exc))
@@ -192,6 +249,10 @@ class WorktreeManager:
                 Path(child.worktree_path).resolve().relative_to(group_root)
             except ValueError as exc:
                 raise WorkspaceError("workspace child path escapes group root") from exc
+        try:
+            Path(group.integration_worktree_path).resolve().relative_to(group_root)
+        except ValueError as exc:
+            raise WorkspaceError("workspace integration path escapes group root") from exc
 
     def _rollback_created(self, source: Path, children: Iterable[WorkspaceChild]) -> None:
         for child in reversed(tuple(children)):
@@ -225,6 +286,13 @@ class WorktreeManager:
             detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
             raise WorkspaceError(f"git {' '.join(args)} failed: {detail}") from exc
         return result.stdout.strip()
+
+    def _branch_exists(self, cwd: Path, branch: str) -> bool:
+        try:
+            self._git(cwd, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+        except WorkspaceError:
+            return False
+        return True
 
 
 def _branch_name(prefix: str, group_id: str, name: str) -> str:
@@ -384,6 +452,58 @@ class WorkspaceCoordinator:
                 group=failed,
             )
             raise WorkspaceError(f"workspace cleanup failed: {exc}") from exc
+
+    def integrate(
+        self,
+        *,
+        run_id: str,
+        expected_generation: int,
+        workspace_group_id: str,
+    ) -> WorkspaceOutcome:
+        """Persist integration intent, promote the source branch, then remove temporary Git state."""
+        record, generation = self.store.load_run(run_id)
+        if generation != expected_generation:
+            raise WorkspaceError("run generation changed before workspace integration")
+        try:
+            group = record.workspace_groups[workspace_group_id]
+        except KeyError as exc:
+            raise WorkspaceError(f"unknown workspace group: {workspace_group_id}") from exc
+        integrating = self.manager.begin_integration(
+            group,
+            event=self._event(record, workspace_group_id, "workspace integration requested"),
+        )
+        record, generation = self.store.save_workspace_group(
+            record,
+            expected_generation=generation,
+            group=integrating,
+        )
+        try:
+            integrated = self.manager.integrate(
+                integrating,
+                event=self._event(record, workspace_group_id, "workspace integration promoted"),
+            )
+            record, generation = self.store.save_workspace_group(
+                record,
+                expected_generation=generation,
+                group=integrated,
+            )
+        except Exception as exc:
+            failed = transition_workspace_group(
+                integrating,
+                WorkspaceGroupStatus.FAILED,
+                self._event(record, workspace_group_id, f"workspace integration failed: {type(exc).__name__}"),
+            )
+            record, _generation = self.store.save_workspace_group(
+                record,
+                expected_generation=generation,
+                group=failed,
+            )
+            raise WorkspaceError(f"workspace integration failed: {exc}") from exc
+        return self.cleanup(
+            run_id=run_id,
+            expected_generation=generation,
+            workspace_group_id=workspace_group_id,
+        )
 
     @staticmethod
     def _event(record: RunRecord, correlation_id: str, reason: str) -> TransitionEvent:

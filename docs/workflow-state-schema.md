@@ -75,10 +75,10 @@ after every started child reaches a durable outcome.
 | `CLEANED` | Every owned worktree and branch was removed. |
 | `FAILED` | Provisioning or cleanup needs explicit recovery. |
 
-Workspace groups are not yet scheduler-admitted dispatch batches. They are the
-durable ownership layer for a future same-repository barrier: temporary child
-branches start from one base revision, remain available through review/rework,
-and are removed only after a later integration decision.
+Workspace groups are scheduler-admitted only for independent, commit-required
+same-repository executor children. Temporary child branches start from one base
+revision, remain available through review/rework, merge in deterministic order
+only after acceptance, and are removed after integration or reconciled cleanup.
 
 ## Run Policy and Usage
 
