@@ -13,41 +13,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
 
-# Configure coloured logging.
-try:
-    import colorlog  # type: ignore
+from .observability import (
+    configure_logging,
+    export_support_bundle,
+    log_event,
+    prune_derived_artifacts,
+    status_snapshot,
+)
 
-    _handler = colorlog.StreamHandler()
-    _handler.setFormatter(
-        colorlog.ColoredFormatter(
-            "%(log_color)s%(levelname)-8s%(reset)s %(message)s",
-            log_colors={
-                "DEBUG": "cyan",
-                "INFO": "green",
-                "WARNING": "yellow",
-                "ERROR": "red",
-                "CRITICAL": "red,bg_white",
-            },
-        )
-    )
-    _root_logger = colorlog.getLogger()
-except ImportError:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(
-        logging.Formatter("%(levelname)-8s %(message)s")
-    )
-    _root_logger = logging.getLogger()
-
-_root_logger.addHandler(_handler)
-logger = logging.getLogger("dispatcher")
+logger = logging.getLogger("dispatcher.cli")
 
 
 def _setup_logging(level: str) -> None:
-    _root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    configure_logging(level)
     # Keep opencode subprocess noise down.
     logging.getLogger("opencode").setLevel(logging.WARNING)
 
@@ -82,7 +65,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the model smoke test (useful after first run)",
     )
     run_parser.add_argument(
-        "--log-level", default="INFO",
+        "--log-level", default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
@@ -91,15 +74,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pf_parser.add_argument("--config", required=True)
     pf_parser.add_argument("--skip-smoke", action="store_true")
     pf_parser.add_argument(
-        "--log-level", default="INFO",
+        "--log-level", default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
     # --- status ---
     st_parser = sub.add_parser("status", help="show current run status")
     st_parser.add_argument("--config", required=True)
+    st_parser.add_argument("--run-id")
+    st_parser.add_argument("--format", choices=["text", "json"], default="text")
     st_parser.add_argument(
-        "--log-level", default="INFO",
+        "--log-level", default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
@@ -108,14 +93,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start_parser.add_argument("--config", required=True)
     start_parser.add_argument("--run-record", required=True)
     start_parser.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     resume_parser = sub.add_parser("resume", help="validate a resumable durable run without executing it")
     resume_parser.add_argument("--config", required=True)
     resume_parser.add_argument("--run-id", required=True)
     resume_parser.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     # --- recover ---
@@ -123,7 +108,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     recover_parser.add_argument("--config", required=True)
     recover_parser.add_argument("--run-id", required=True)
     recover_parser.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     # --- answer ---
@@ -134,7 +119,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     answer_parser.add_argument("--answer", required=True)
     answer_parser.add_argument("--actor-id", required=True)
     answer_parser.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    support_parser = sub.add_parser("support", help="export a sanitized derived support bundle")
+    support_parser.add_argument("--config", required=True)
+    support_parser.add_argument("--run-id", required=True)
+    support_parser.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+    prune_parser = sub.add_parser("prune", help="apply derived-artifact retention")
+    prune_parser.add_argument("--config", required=True)
+    prune_parser.add_argument("--apply", action="store_true")
+    prune_parser.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     # --- baseline ---
@@ -145,7 +144,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     baseline_inspect.add_argument("--plan", required=True)
     baseline_inspect.add_argument("--output")
     baseline_inspect.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     baseline_approve = baseline_sub.add_parser("approve", help="persist an approved baseline candidate")
     baseline_approve.add_argument("--config", required=True)
@@ -153,14 +152,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     baseline_approve.add_argument("--candidate", required=True)
     baseline_approve.add_argument("--operator-decision-ref", required=True)
     baseline_approve.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     return parser.parse_args(argv)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    _setup_logging(args.log_level)
     if not args.mock:
         logger.error(
             "real OpenCode execution is disabled during remediation Phase 2; "
@@ -173,6 +171,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from .preflight import run_preflight
 
     cfg = load_config(args.config)
+    _setup_logging(args.log_level or cfg.observability.log_level)
 
     logger.info("project: %s  profile: %s  root: %s",
                  cfg.project_name,
@@ -197,7 +196,7 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     from .preflight import run_preflight
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
 
     try:
         run_preflight(
@@ -218,18 +217,24 @@ def _cmd_status(args: argparse.Namespace) -> int:
     from .config import load_config
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
 
     database_path = Path(cfg.state_dir) / "dispatcher.sqlite3"
     if database_path.exists():
         store = state_mod.open_state_store(cfg)
-        latest = store.latest_run(cfg.project_id)
-        if latest is not None:
-            record, generation = latest
-            print(f"Project: {record.project_id}")
-            print(f"Run: {record.run_id}  state={record.state.value}  generation={generation}")
-            print(f"Current step: {next(iter(record.steps), '(not started)')}")
-            return 0
+        snapshot = status_snapshot(cfg, store, args.run_id)
+        if args.format == "json":
+            print(json.dumps(snapshot, indent=2, sort_keys=True))
+        else:
+            _print_status_text(snapshot)
+        run = snapshot["run"]
+        log_event(
+            logger,
+            "status snapshot rendered",
+            project_id=cfg.project_id,
+            run_id=run["run_id"] if isinstance(run, dict) else None,
+        )
+        return 0
 
     s = state_mod.load_state(cfg.state_dir)
     sessions = state_mod.load_sessions(cfg.state_dir)
@@ -254,13 +259,30 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_status_text(snapshot: dict[str, object]) -> None:
+    run = snapshot["run"]
+    print(f"Project: {snapshot['project_id']}")
+    if run is None:
+        print("Run: (none)")
+        return
+    assert isinstance(run, dict)
+    print(f"Run: {run['run_id']}  state={run['state']}  generation={run['generation']}")
+    ready = snapshot["ready_steps"]
+    print(f"Ready steps: {', '.join(ready) if isinstance(ready, list) and ready else '(none)'}")
+    active = snapshot["active_dispatches"]
+    print(f"Active dispatches: {len(active) if isinstance(active, list) else 0}")
+    waiting = snapshot["waiting_operator"]
+    if isinstance(waiting, dict):
+        print(f"Waiting operator: {waiting['kind']} request={waiting['request_id']}")
+
+
 def _cmd_recover(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
     from .state_store import StateStoreError
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         store = state_mod.open_state_store(cfg)
         items = store.classify_recovery(args.run_id)
@@ -275,6 +297,44 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     return 1 if any(item.disposition == "operator_reconciliation_required" for item in items) else 0
 
 
+def _cmd_support(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import ConfigError, load_config
+    from .state_store import StateStoreError
+
+    try:
+        cfg = load_config(args.config)
+        _setup_logging(args.log_level or cfg.observability.log_level)
+        bundle = export_support_bundle(cfg, state_mod.open_state_store(cfg), args.run_id)
+    except (ConfigError, StateStoreError, OSError, ValueError) as exc:
+        print(f"support: FAILED - {exc}", file=sys.stderr)
+        return 2
+    log_event(logger, "support bundle exported", project_id=cfg.project_id, run_id=args.run_id)
+    print(f"support: exported  {bundle}")
+    return 0
+
+
+def _cmd_prune(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import ConfigError, load_config
+    from .state_store import StateStoreError
+
+    if not args.apply:
+        print("prune: use --apply to modify derived artifacts", file=sys.stderr)
+        return 2
+    try:
+        cfg = load_config(args.config)
+        _setup_logging(args.log_level or cfg.observability.log_level)
+        actions = prune_derived_artifacts(cfg, state_mod.open_state_store(cfg))
+    except (ConfigError, StateStoreError, OSError, ValueError) as exc:
+        print(f"prune: FAILED - {exc}", file=sys.stderr)
+        return 2
+    for action in actions:
+        print(f"prune: {action.action}  {action.path}")
+    log_event(logger, "derived artifact retention applied", project_id=cfg.project_id)
+    return 0
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
@@ -282,7 +342,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     from .workflow import RunRecord, RunStatus
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         record = RunRecord.model_validate_json(Path(args.run_record).read_text(encoding="utf-8"))
         if record.project_id != cfg.project_id or record.config_digest != cfg.config_digest:
@@ -303,7 +363,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     from .state_store import StateStoreError
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         record, generation = state_mod.open_state_store(cfg).resume_run(
             project_id=cfg.project_id,
@@ -322,7 +382,7 @@ def _cmd_answer(args: argparse.Namespace) -> int:
     from .state_store import StateStoreError
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         store = state_mod.open_state_store(cfg)
         _record, generation = store.load_run(args.run_id)
@@ -349,7 +409,7 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     from .state_store import StateStoreError
 
     cfg = load_config(args.config)
-    _setup_logging(args.log_level)
+    _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         plan = load_normalized_plan(args.plan, cfg)
         if args.baseline_command == "inspect":
@@ -392,6 +452,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_recover(args)
     elif args.command == "answer":
         return _cmd_answer(args)
+    elif args.command == "support":
+        return _cmd_support(args)
+    elif args.command == "prune":
+        return _cmd_prune(args)
     elif args.command == "baseline":
         return _cmd_baseline(args)
     return 1

@@ -1069,23 +1069,23 @@ execution is deferred rather than risking incorrect dependency propagation.
 
 **Actions:**
 
-- [ ] Emit structured logs with timestamp, level, module, function, project ID,
+- [x] Emit structured logs with timestamp, level, module, function, project ID,
   run ID, dispatch ID, and step ID.
-- [ ] Add status views for run, ready steps, active dispatches, waiting
+- [x] Add status views for run, ready steps, active dispatches, waiting
   decisions, budgets, locks, and terminal outcome.
 - [ ] Add health and readiness checks for a supervised deployment mode if one
   is introduced.
-- [ ] Export sanitized run reports, audit JSONL, and evidence manifests.
-- [ ] Add bounded retention and archival configuration in YAML.
-- [ ] Ensure observability failures that threaten state integrity are fatal;
+- [x] Export sanitized run reports, audit JSONL, and evidence manifests.
+- [x] Add bounded retention and archival configuration in YAML.
+- [x] Ensure observability failures that threaten state integrity are fatal;
   secondary presentation failures may be reported without changing workflow
   truth.
 
 **Acceptance criteria:**
 
-- [ ] An operator can correlate every log, transcript, dispatch, result, review,
+- [x] An operator can correlate every log, transcript, dispatch, result, review,
   and artifact from the run ID.
-- [ ] Sanitized support bundles pass secret scanning.
+- [x] Sanitized support bundles pass secret scanning.
 
 ### DISP-802: Migrate the private reference project
 

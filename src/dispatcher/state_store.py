@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -40,6 +41,7 @@ CURRENT_SCHEMA_VERSION = 3
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
+logger = logging.getLogger("dispatcher.state_store")
 
 
 class StateStoreError(RuntimeError):
@@ -248,6 +250,17 @@ class StateStore:
             if fault_hook is not None:
                 fault_hook()
         self._secure_database_files()
+        logger.info(
+            "run generation committed",
+            extra={
+                "dispatcher_context": {
+                    "project_id": record.project_id,
+                    "run_id": record.run_id,
+                    "dispatch_id": None,
+                    "step_id": None,
+                }
+            },
+        )
         return generation
 
     def load_run(self, run_id: str) -> tuple[RunRecord, int]:
@@ -300,6 +313,15 @@ class StateStore:
                     row["session_json"]
                 )
         return sessions
+
+    def leases_for_run(self, run_id: str) -> tuple[Lease, ...]:
+        """Return every durable lease currently associated with one run."""
+        with self._connection_lock:
+            rows = self._ready_connection().execute(
+                "SELECT * FROM leases WHERE run_id = ? ORDER BY resource_key",
+                (run_id,),
+            ).fetchall()
+        return tuple(self._lease_from_row(row) for row in rows)
 
     def acquire_run_lease(
         self,
@@ -582,6 +604,17 @@ class StateStore:
             expected_generation=expected_generation,
             sessions=sessions,
             dispatch_payloads={dispatch_id: replacement},
+        )
+        logger.info(
+            "dispatch transitioned",
+            extra={
+                "dispatcher_context": {
+                    "project_id": updated.project_id,
+                    "run_id": updated.run_id,
+                    "dispatch_id": dispatch_id,
+                    "step_id": transitioned.step_id,
+                }
+            },
         )
         return updated, generation
 
@@ -1082,7 +1115,7 @@ class StateStore:
                         "kind": row["kind"],
                         "correlation_id": row["correlation_id"],
                         "causation_id": row["causation_id"],
-                        "payload": json.loads(row["payload_json"]),
+                        "payload": redact_value(json.loads(row["payload_json"])),
                         "created_at": row["created_at"],
                     },
                     ensure_ascii=False,

@@ -166,6 +166,19 @@ def create_fixture_project(
             "max_context_tokens": 100000,
             "on_limit": "halt",
         },
+        "observability": {
+            "log_format": "json",
+            "log_level": "INFO",
+            "retention": {
+                "mode": "archive",
+                "archive_directory": str(root / "archive"),
+                "max_transcripts_per_run": 100,
+                "max_reports": 100,
+                "max_audit_exports": 100,
+                "max_support_bundles": 50,
+                "max_archived_artifacts": 1000,
+            },
+        },
         "permission_policies": {
             "global_policy": "global",
             "project_policy": "project",

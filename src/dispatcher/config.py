@@ -238,6 +238,26 @@ class BudgetDefinition(ContractModel):
     on_limit: Literal["halt", "ask"]
 
 
+class RetentionDefinition(ContractModel):
+    """Bounded retention for derived, non-authoritative observability artifacts."""
+
+    mode: Literal["archive", "delete"]
+    archive_directory: Annotated[str, Field(min_length=1)]
+    max_transcripts_per_run: Annotated[int, Field(ge=0, le=100_000)]
+    max_reports: Annotated[int, Field(ge=0, le=100_000)]
+    max_audit_exports: Annotated[int, Field(ge=0, le=100_000)]
+    max_support_bundles: Annotated[int, Field(ge=0, le=100_000)]
+    max_archived_artifacts: Annotated[int, Field(ge=0, le=1_000_000)]
+
+
+class ObservabilityDefinition(ContractModel):
+    """Explicit structured logging and derived-artifact retention controls."""
+
+    log_format: Literal["json"]
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+    retention: RetentionDefinition
+
+
 class PermissionPolicy(ContractModel):
     """Named semantic permission rules compiled to exact OpenCode patterns."""
 
@@ -302,6 +322,7 @@ class ProjectConfigModel(ContractModel):
     execution: ExecutionDefinition
     review_policy: ReviewPolicyDefinition
     budget: BudgetDefinition
+    observability: ObservabilityDefinition
     permission_policies: PermissionPoliciesDefinition
     evidence: EvidencePolicy
     preflight: PreflightDefinition | None = None
@@ -389,6 +410,10 @@ class Config:
     @property
     def execution(self) -> ExecutionDefinition:
         return self.model.execution
+
+    @property
+    def observability(self) -> ObservabilityDefinition:
+        return self.model.observability
 
     @property
     def profile_id(self) -> str:
@@ -531,6 +556,10 @@ class Config:
 
         _require_file(Path(self.model.profile.profiles_file), "profile.profiles_file")
         _require_writable_parent(Path(self.model.state.directory), "state.directory")
+        _require_writable_parent(
+            Path(self.model.observability.retention.archive_directory),
+            "observability.retention.archive_directory",
+        )
 
         resolved_roots: dict[str, Path] = {}
         writable_roots: list[tuple[str, Path, bool]] = []
@@ -599,6 +628,10 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
         resolve_at(sources, "plans_dir")
     if isinstance(resolved.get("state"), dict):
         resolve_at(resolved["state"], "directory")
+    if isinstance(resolved.get("observability"), dict):
+        retention = resolved["observability"].get("retention")
+        if isinstance(retention, dict):
+            resolve_at(retention, "archive_directory")
     if isinstance(resolved.get("profile"), dict):
         resolve_at(resolved["profile"], "profiles_file")
     if isinstance(resolved.get("repositories"), dict):

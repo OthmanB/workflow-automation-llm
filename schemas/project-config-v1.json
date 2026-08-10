@@ -209,6 +209,37 @@
       "title": "ExecutionDefinition",
       "type": "object"
     },
+    "ObservabilityDefinition": {
+      "additionalProperties": false,
+      "description": "Explicit structured logging and derived-artifact retention controls.",
+      "properties": {
+        "log_format": {
+          "const": "json",
+          "title": "Log Format",
+          "type": "string"
+        },
+        "log_level": {
+          "enum": [
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ],
+          "title": "Log Level",
+          "type": "string"
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionDefinition"
+        }
+      },
+      "required": [
+        "log_format",
+        "log_level",
+        "retention"
+      ],
+      "title": "ObservabilityDefinition",
+      "type": "object"
+    },
     "PermissionPoliciesDefinition": {
       "additionalProperties": false,
       "description": "Explicit policy layers and named rules with no implicit fallback.",
@@ -473,6 +504,66 @@
       "title": "RepositoryDefinition",
       "type": "object"
     },
+    "RetentionDefinition": {
+      "additionalProperties": false,
+      "description": "Bounded retention for derived, non-authoritative observability artifacts.",
+      "properties": {
+        "archive_directory": {
+          "minLength": 1,
+          "title": "Archive Directory",
+          "type": "string"
+        },
+        "max_archived_artifacts": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Archived Artifacts",
+          "type": "integer"
+        },
+        "max_audit_exports": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Audit Exports",
+          "type": "integer"
+        },
+        "max_reports": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Reports",
+          "type": "integer"
+        },
+        "max_support_bundles": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Support Bundles",
+          "type": "integer"
+        },
+        "max_transcripts_per_run": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Transcripts Per Run",
+          "type": "integer"
+        },
+        "mode": {
+          "enum": [
+            "archive",
+            "delete"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "archive_directory",
+        "max_transcripts_per_run",
+        "max_reports",
+        "max_audit_exports",
+        "max_support_bundles",
+        "max_archived_artifacts"
+      ],
+      "title": "RetentionDefinition",
+      "type": "object"
+    },
     "ReviewPolicyDefinition": {
       "additionalProperties": false,
       "description": "Project-wide review constraints combined with selected profile policy.",
@@ -686,6 +777,9 @@
     "execution": {
       "$ref": "#/$defs/ExecutionDefinition"
     },
+    "observability": {
+      "$ref": "#/$defs/ObservabilityDefinition"
+    },
     "permission_policies": {
       "$ref": "#/$defs/PermissionPoliciesDefinition"
     },
@@ -744,6 +838,7 @@
     "execution",
     "review_policy",
     "budget",
+    "observability",
     "permission_policies",
     "evidence"
   ],
