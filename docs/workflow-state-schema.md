@@ -25,13 +25,15 @@ dispatcher finds no unmet completion obligations.
 | `READY` | `EXECUTING`, `BLOCKED`, `WAIVED`, `FAILED` |
 | `EXECUTING` | `EXECUTED`, `BLOCKED`, `FAILED` |
 | `EXECUTED` | `REVIEW_REQUIRED`, `ACCEPTED` |
-| `REVIEW_REQUIRED` | `REVIEWING`, `BLOCKED`, `FAILED` |
+| `REVIEW_REQUIRED` | `REVIEWING`, `ACCEPTED` by approved non-mandatory review waiver, `BLOCKED`, `FAILED` |
 | `REVIEWING` | `ACCEPTED`, `CHANGES_REQUESTED`, `BLOCKED`, `FAILED`, `REVIEW_REQUIRED` |
-| `CHANGES_REQUESTED` | `READY`, `BLOCKED`, `FAILED` |
+| `CHANGES_REQUESTED` | `READY`, `REVIEW_REQUIRED` for immutable tie-break, `BLOCKED`, `FAILED` |
 | `BLOCKED` | `READY`, `WAIVED`, `FAILED` |
 | `ACCEPTED`, `WAIVED`, `FAILED` | none |
 
-A waiver always records an operator decision reference.
+A step waiver always records an operator decision reference. A non-mandatory
+review waiver records a separate decision reference while preserving the
+accepted executor evidence.
 
 ## Dispatch states
 
@@ -49,6 +51,27 @@ the private SQLite authority at `state.directory/dispatcher.sqlite3`; the
 legacy `run-record.json` checkpoint and Markdown/JSONL artifacts are derived
 exports only. A `RUNNING` dispatch always requires operator reconciliation
 after process loss and is never retried implicitly.
+
+## Batch states
+
+| State | Allowed next states |
+|---|---|
+| `PREPARED` | `RUNNING`, `FAILED` |
+| `RUNNING` | `JOINED`, `FAILED` |
+| `JOINED`, `FAILED` | none |
+
+A batch correlates independently durable child dispatches. Children are
+prepared all-or-none and retain their normal dispatch lifecycle. A failed child
+is named in the batch result and creates one durable reconciliation request only
+after every started child reaches a durable outcome.
+
+## Run Policy and Usage
+
+Activation persists an immutable `RunPolicy` with compiled review obligations,
+profile digest, policy digest, and underspecification mode. Run state also
+persists cumulative worker usage by run, step, role, and session. Enabled
+budgets reject dispatches at their exact configured boundary and fail closed
+when required measured usage is absent.
 
 ## Completion guard
 

@@ -7,6 +7,11 @@
 > [`markdown/plans/dispatcher-remediation-plan-2026-08-09.md`](../markdown/plans/dispatcher-remediation-plan-2026-08-09.md),
 > based on the findings in
 > [`markdown/reviews/dispatcher-project-review-2026-08-09.md`](../markdown/reviews/dispatcher-project-review-2026-08-09.md).
+>
+> **Do not use the phase descriptions below as current operations guidance.**
+> They preserve the original planning context. Current supported behavior is
+> documented in the schema guides, [`operations.md`](operations.md), and the
+> remediation plan.
 
 ## Phase 0 — Decisions (now resolved) and the design review gate
 

@@ -1,0 +1,106 @@
+# Operations Guide
+
+The SQLite database at `state.directory/dispatcher.sqlite3` is authoritative.
+Reports, audit JSONL, transcripts, and support bundles are derived artifacts.
+Never edit or delete the database manually.
+
+## Preflight
+
+```bash
+dispatcher preflight --config <project.yaml>
+```
+
+Runs configuration, path, repository, credential, disk, and optional model
+checks. Exit `0` means the selected checks passed; exit `1` means preflight
+failed. It does not create a run or launch an approved worker dispatch.
+
+## Mock Run
+
+```bash
+dispatcher run --config <project.yaml> --mock --skip-smoke
+```
+
+This invokes the legacy mock harness only. It is useful for deterministic
+development validation but is not the authoritative sequential coordinator and
+does not authorize real OpenCode or repository-mutating execution. Omitting
+`--mock` exits `2` before configuration loading.
+
+## Start
+
+```bash
+dispatcher start --config <project.yaml> --run-record <run.json>
+```
+
+Requires a schema-valid `NEW` run record whose project ID and config digest
+match the selected project. Persists generation one in SQLite. Exit `0` means
+the run was persisted; exit `2` means validation, ownership, or state checks
+failed. It does not launch a session.
+
+## Status
+
+```bash
+dispatcher status --config <project.yaml> --run-id <run-id> --format json
+```
+
+The JSON view reports run state and generation, ready and blocked steps with
+reasons, active dispatches and batches, waiting operator metadata, usage, and
+leases. The text view is a concise rendering of the same derived snapshot. It
+does not mutate run state.
+
+## Resume and Recovery
+
+```bash
+dispatcher resume --config <project.yaml> --run-id <run-id>
+dispatcher recover --config <project.yaml> --run-id <run-id>
+```
+
+`resume` validates one non-terminal, sole active run and does not create a
+supervisor session. `recover` classifies unresolved dispatches. A `RUNNING`
+dispatch requires operator reconciliation because external side effects may
+have completed; it is never automatically retried.
+
+## Operator Answer
+
+```bash
+dispatcher answer --config <project.yaml> --run-id <run-id> \
+  --request-id <request-id> --answer <value> --actor-id <operator-id>
+```
+
+The request ID, allowed answer, expiration, and required role are validated
+inside one SQLite transaction. A successful answer moves the run to the
+request's exact durable resume state. Duplicate, expired, or unauthorized
+answers fail with exit `2`.
+
+## Support and Retention
+
+```bash
+dispatcher support --config <project.yaml> --run-id <run-id>
+dispatcher prune --config <project.yaml> --apply
+```
+
+`support` writes a private bundle containing redacted status, report, audit,
+and manifest files. It never copies the database, raw prompts, child
+environment, or source configuration.
+
+`prune` requires `--apply` and follows the explicit `observability.retention`
+YAML policy. It archives or deletes only derived artifacts, skips active-run
+artifacts, and never removes SQLite rows or unresolved dispatch data.
+
+## Baseline
+
+```bash
+dispatcher baseline inspect --config <project.yaml> --plan <plan.yaml>
+dispatcher baseline approve --config <project.yaml> --plan <plan.yaml> \
+  --candidate <candidate.json> --operator-decision-ref <decision-id>
+```
+
+Inspection is read-only. Approval requires an explicit operator decision and
+persists a baseline candidate for the exact project and plan digest. Private
+reference migration remains separately authorized work and is not performed by
+the public example.
+
+## Unsupported Lifecycle Operations
+
+There is no `cancel` command and no authoritative-state `archive` command.
+Do not simulate either by deleting state files. Halt or recovery decisions must
+be recorded through the dispatcher-owned workflow and operator-gate paths.

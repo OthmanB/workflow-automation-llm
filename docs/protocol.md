@@ -19,7 +19,8 @@ whitespace. The parser rejects Markdown fences, comments, duplicate keys,
 unknown fields, a second object, and all trailing prose. The dispatcher does
 not parse natural-language fallback commands.
 
-Every command has `protocol_version: 1` and one `action`.
+Single-step commands use `protocol_version: 1`. The only protocol-v2 command is
+the explicit all-or-none batch request described below.
 
 ### Dispatch
 
@@ -41,7 +42,36 @@ dispatcher determines role kind, repository, policy, and logical session from
 the normalized plan and durable run state. `repo_id` is optional and, when
 present, is only a consistency assertion: it must equal the normalized step's
 repository ID and can never choose a working directory. A command cannot
-include a raw OpenCode session ID, permission decision, or batch request.
+include a raw OpenCode session ID or permission decision.
+
+### Dispatch Batch
+
+```json
+{
+  "protocol_version": 2,
+  "action": "dispatch_batch",
+  "children": [
+    {
+      "step_id": "prepare-a",
+      "target_role": "executor-a",
+      "session_mode": "new",
+      "prompt": "Perform the approved independent task."
+    },
+    {
+      "step_id": "prepare-b",
+      "target_role": "executor-b",
+      "session_mode": "new",
+      "prompt": "Perform the second approved independent task."
+    }
+  ]
+}
+```
+
+Every child must be independently valid and target a distinct step. The
+dispatcher validates dependencies, inputs, capacities, fresh session mode,
+repository/resource locks, and all child policies before it persists or starts
+any child. Batch workers receive independent dispatch IDs under one durable
+batch ID. Same-repository parallel work remains rejected.
 
 ### Ask Operator
 
@@ -56,6 +86,14 @@ include a raw OpenCode session ID, permission decision, or batch request.
 ```
 
 The dispatcher persists the question before entering `WAITING_OPERATOR`.
+
+### Review Waiver
+
+`request_review_waiver` is available only for a `REVIEW_REQUIRED` step whose
+compiled review obligation is non-mandatory and explicitly waivable. The
+operator receives a durable `waive` or `halt` choice; an accepted waiver keeps
+the executor evidence and records the operator decision reference. Mandatory
+plan or project review cannot be waived.
 
 ### Halt
 
@@ -79,6 +117,14 @@ The dispatcher persists the question before entering `WAITING_OPERATOR`.
 
 This is a request, not an authority to end a run. The dispatcher allows
 `SUCCEEDED` only after it evaluates every completion invariant.
+
+## Operator Requests
+
+The dispatcher, not the supervisor, creates typed requests for
+underspecification, risk gates, budget limits, escalation, review waiver, and
+batch reconciliation. Each request persists allowed answers, context,
+expiration, required role, and resume state. Use `dispatcher answer` to apply
+one validated decision transactionally.
 
 ## Executor results
 

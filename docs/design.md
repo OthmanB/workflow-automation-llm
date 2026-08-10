@@ -1,7 +1,8 @@
 # Design: an automated supervisor → executor → reviewer loop over `opencode` sessions
 
 **Status:** historical design / brainstorm — updated 2026-08-09 after operator
-review. Schema-v1 contracts in `docs/config-schema.md`,
+review. It is not an operations guide and must not be used to infer supported
+commands, state authority, or execution permissions. Schema-v1 contracts in `docs/config-schema.md`,
 `docs/normalized-plan-schema.md`, `docs/protocol.md`, and
 `docs/workflow-state-schema.md` supersede its legacy envelope, singular-root,
 and reference-parser proposals. Real dispatch remains disabled.

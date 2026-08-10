@@ -1121,23 +1121,23 @@ in core code.
 
 **Actions:**
 
-- [ ] Publish installation and pinned OpenCode compatibility instructions.
-- [ ] Publish project configuration and normalized-plan authoring guides.
-- [ ] Publish start, resume, recover, answer, cancel, archive, and baseline
+- [x] Publish installation and pinned OpenCode compatibility instructions.
+- [x] Publish project configuration and normalized-plan authoring guides.
+- [x] Publish start, resume, recover, answer, cancel, archive, and baseline
   procedures.
-- [ ] Publish permission-policy examples with tested allow, ask, and deny
+- [x] Publish permission-policy examples with tested allow, ask, and deny
   behavior.
-- [ ] Publish crash-recovery and uncertain-side-effect procedures.
-- [ ] Publish multi-repository, evidence, review, and parallelism constraints.
-- [ ] Publish a migration guide from the proof-of-concept state and config.
-- [ ] Update README and roadmap capability matrices from automated feature
+- [x] Publish crash-recovery and uncertain-side-effect procedures.
+- [x] Publish multi-repository, evidence, review, and parallelism constraints.
+- [x] Publish a migration guide from the proof-of-concept state and config.
+- [x] Update README and roadmap capability matrices from automated feature
   metadata or release checks where practical.
 
 **Acceptance criteria:**
 
-- [ ] A new project can be configured without reading private-project-specific
+- [x] A new project can be configured without reading private-project-specific
   documentation.
-- [ ] Every operational command documents preconditions, state transitions,
+- [x] Every operational command documents preconditions, state transitions,
   and exit codes.
 
 ### Final release gate

@@ -55,8 +55,9 @@ artifacts, unordered competing write locks, invalid review counts, and invalid
 retry escalation references.
 
 `validate_plan_for_config()` additionally rejects unknown repository IDs,
-reviewer keys that are not configured reviewers, and authorization actions that
-exceed the selected repository permission policy.
+reviewer keys that are not configured reviewers, authorization actions that
+exceed the selected repository permission policy, and concurrency/retry
+contracts that cannot be satisfied by configured roles.
 
 ## Import adapters
 
@@ -68,5 +69,7 @@ compares table step IDs, titles, repositories, and exact Markdown hash against
 the same complete YAML sidecar. Tier 2-specific parsing is isolated in
 `src/dispatcher/importers.py`; it is not part of the dispatcher core.
 
-The reference project is intentionally not treated as an accepted execution
-baseline until Phase 4's baseline import and operator approval procedure.
+Historical work is intentionally not treated as accepted execution baseline
+state without a baseline inspection and explicit operator approval for the
+exact plan digest. Private-reference migration remains separately authorized
+Phase 8 work and is not performed by the public example.
