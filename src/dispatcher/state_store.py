@@ -39,7 +39,7 @@ from .workflow import (
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -1104,23 +1104,17 @@ class StateStore:
         candidate: Mapping[str, Any],
         operator_decision_ref: str,
     ) -> None:
-        """Persist an operator-approved historical baseline before any new run."""
+        """Append one immutable operator-approved historical baseline before any new run."""
         candidate_json = _json_text(candidate)
         candidate_digest = hashlib.sha256(candidate_json.encode("utf-8")).hexdigest()
         connection = self._ready_connection()
         with self._transaction(connection):
             connection.execute(
                 """
-                INSERT INTO baselines(
-                    project_id, plan_digest, source_digest, candidate_json,
-                    candidate_digest, operator_decision_ref, approved_at
+                INSERT INTO baseline_approvals(
+                    project_id, plan_digest, source_digest, approval_json,
+                    approval_digest, operator_decision_ref, approved_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, plan_digest) DO UPDATE SET
-                    source_digest = excluded.source_digest,
-                    candidate_json = excluded.candidate_json,
-                    candidate_digest = excluded.candidate_digest,
-                    operator_decision_ref = excluded.operator_decision_ref,
-                    approved_at = excluded.approved_at
                 """,
                 (
                     project_id,
@@ -1137,17 +1131,18 @@ class StateStore:
         """Load one approved baseline or return ``None`` when no approval exists."""
         row = self._ready_connection().execute(
             """
-            SELECT candidate_json, candidate_digest, source_digest, operator_decision_ref, approved_at
-            FROM baselines WHERE project_id = ? AND plan_digest = ?
+            SELECT approval_json, approval_digest, source_digest, operator_decision_ref, approved_at
+            FROM baseline_approvals WHERE project_id = ? AND plan_digest = ?
+            ORDER BY approved_at DESC, approval_digest DESC LIMIT 1
             """,
             (project_id, plan_digest),
         ).fetchone()
         if row is None:
             return None
-        candidate = json.loads(row["candidate_json"])
-        actual_digest = hashlib.sha256(row["candidate_json"].encode("utf-8")).hexdigest()
-        if actual_digest != row["candidate_digest"]:
-            raise StateStoreCorruptionError("approved baseline digest does not match stored candidate")
+        candidate = json.loads(row["approval_json"])
+        actual_digest = hashlib.sha256(row["approval_json"].encode("utf-8")).hexdigest()
+        if actual_digest != row["approval_digest"]:
+            raise StateStoreCorruptionError("approved baseline digest does not match stored approval")
         return {
             "candidate": candidate,
             "source_digest": row["source_digest"],
@@ -1441,6 +1436,9 @@ class StateStore:
             version = 3
         if version == 3:
             self._apply_v4(connection)
+            version = 4
+        if version == 4:
+            self._apply_v5(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -1622,6 +1620,26 @@ class StateStore:
             );
             CREATE INDEX workspace_groups_recovery ON workspace_groups(run_id, state);
             INSERT INTO schema_migrations(version, applied_at) VALUES (4, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
+    def _apply_v5(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE baseline_approvals (
+                project_id TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                source_digest TEXT NOT NULL,
+                approval_json TEXT NOT NULL,
+                approval_digest TEXT NOT NULL,
+                operator_decision_ref TEXT NOT NULL,
+                approved_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, plan_digest, approval_digest)
+            );
+            CREATE INDEX baseline_approvals_latest ON baseline_approvals(project_id, plan_digest, approved_at);
+            INSERT INTO schema_migrations(version, applied_at) VALUES (5, '{_utc_now()}');
             COMMIT;
             """
         )

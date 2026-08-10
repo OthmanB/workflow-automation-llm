@@ -97,13 +97,22 @@ artifacts, and never removes SQLite rows or unresolved dispatch data.
 ```bash
 dispatcher baseline inspect --config <project.yaml> --plan <plan.yaml>
 dispatcher baseline approve --config <project.yaml> --plan <plan.yaml> \
-  --candidate <candidate.json> --operator-decision-ref <decision-id>
+  --observation <observation.json> --decisions <decisions.json> \
+  --approval-decision-ref <decision-id>
+dispatcher start --config <project.yaml> --run-record <run.json> \
+  --use-approved-baseline
 ```
 
-Inspection is read-only. Approval requires an explicit operator decision and
-persists a baseline candidate for the exact project and plan digest. Private
-reference migration remains separately authorized work and is not performed by
-the public example.
+Inspection is read-only and records observed revisions, evidence hashes, and
+review-proof files. Approval requires an explicit PENDING, ACCEPTED, or WAIVED
+decision for every step. Accepted requires the current evidence and review proof
+required by compiled policy; Waived requires its own operator decision reference.
+For generic historical review proof, place a proof file at
+`<evidence-root>/reviews/<step-id>.*`; the inspector hashes it without trusting
+its prose content. Approval records accepted reviewer role keys explicitly.
+`start --use-approved-baseline` hydrates those durable states into a new run.
+Private reference migration remains separately authorized work and is not
+performed by the public example.
 
 ## Unsupported Lifecycle Operations
 

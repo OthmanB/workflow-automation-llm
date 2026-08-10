@@ -84,7 +84,8 @@ def test_baseline_cli_inspect_and_approve_are_read_only_until_approval(tmp_path:
     project = create_fixture_project(tmp_path)
     (project.evidence / "fixture.md").write_text("fixture evidence\n", encoding="utf-8")
     plan_path = tmp_path / "plan.yaml"
-    candidate_path = tmp_path / "baseline.json"
+    observation_path = tmp_path / "baseline-observation.json"
+    decisions_path = tmp_path / "baseline-decisions.json"
     plan_path.write_text(yaml.safe_dump(valid_plan_values(project), sort_keys=False), encoding="utf-8")
 
     assert (
@@ -97,10 +98,27 @@ def test_baseline_cli_inspect_and_approve_are_read_only_until_approval(tmp_path:
                 "--plan",
                 str(plan_path),
                 "--output",
-                str(candidate_path),
+                str(observation_path),
             ]
         )
         == 0
+    )
+    observation = json.loads(observation_path.read_text(encoding="utf-8"))
+    decisions_path.write_text(
+        json.dumps(
+            {
+                "decisions": [
+                    {
+                        "step_id": step["step_id"],
+                        "state": "ACCEPTED",
+                        "reason": "fixture evidence is present",
+                        "operator_decision_ref": "decision-step-accept",
+                    }
+                    for step in observation["steps"]
+                ]
+            }
+        ),
+        encoding="utf-8",
     )
     assert (
         main(
@@ -111,10 +129,44 @@ def test_baseline_cli_inspect_and_approve_are_read_only_until_approval(tmp_path:
                 str(project.config_path),
                 "--plan",
                 str(plan_path),
-                "--candidate",
-                str(candidate_path),
-                "--operator-decision-ref",
+                "--observation",
+                str(observation_path),
+                "--decisions",
+                str(decisions_path),
+                "--approval-decision-ref",
                 "decision-approve-baseline",
+            ]
+        )
+        == 0
+    )
+    baseline_plan = NormalizedPlan.model_validate(valid_plan_values(project))
+    baseline_record = new_run_record(
+        run_id="baseline-start-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=baseline_plan,
+        plan_approval=approve_plan(baseline_plan, "decision-baseline-start"),
+        event=TransitionEvent(
+            event_id="event-baseline-start",
+            sequence=1,
+            actor="dispatcher",
+            reason="baseline start fixture",
+            correlation_id="baseline-start-run",
+            occurred_at=datetime.now(UTC),
+        ),
+    )
+    record_path = tmp_path / "baseline-start-run.json"
+    record_path.write_text(baseline_record.model_dump_json(), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "start",
+                "--config",
+                str(project.config_path),
+                "--run-record",
+                str(record_path),
+                "--use-approved-baseline",
             ]
         )
         == 0

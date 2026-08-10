@@ -213,6 +213,7 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_before_json")
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_after_json")
         connection.execute("DROP TABLE workspace_groups")
+        connection.execute("DROP TABLE baseline_approvals")
         connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
 
     migrated = _store(project)
@@ -226,11 +227,15 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
         workspace_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_groups'"
         ).fetchone()
+        approval_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'baseline_approvals'"
+        ).fetchone()
 
-    assert version == 4
+    assert version == 5
     assert table == ("baselines",)
     assert columns >= {"repository_before_json", "repository_after_json"}
     assert workspace_table == ("workspace_groups",)
+    assert approval_table == ("baseline_approvals",)
 
 
 def test_leases_are_single_writer_atomic_and_require_approved_stale_recovery(

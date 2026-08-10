@@ -758,11 +758,11 @@ completed work.
 
 - [x] Add `dispatcher baseline inspect` to read the normalized plan, Git
   history, and configured evidence sources without changing state.
-- [x] Produce a candidate baseline containing each step's proposed status,
+- [x] Produce a read-only baseline observation containing each step's revision,
   repository revision, evidence hashes, review evidence, and detected gaps.
 - [x] Never infer that a continuous historical prefix is accepted solely because a later checkpoint is
   present; validate every preceding step independently.
-- [x] Add `dispatcher baseline approve` to record an operator-approved baseline
+- [x] Add `dispatcher baseline approve` to record explicit operator decisions and an immutable baseline
   before the first new run.
 - [x] Mark unsupported or unverifiable historical work as `PENDING` or
   explicitly `WAIVED`, never silently accepted.

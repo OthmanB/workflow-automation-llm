@@ -33,9 +33,17 @@ inputs/outputs, repository and resource ownership, authorization, acceptance,
 evidence, review, and retry policy. A plan requires an explicit approval before
 run creation.
 
-Historical work is not automatically trusted. Use baseline inspection and an
-operator-approved candidate for the exact plan digest. Do not import private
-reference data into this public repository.
+Historical work is not automatically trusted. Baseline inspection records facts
+only; an operator must supply one PENDING, ACCEPTED, or WAIVED decision for each
+step. Accepted requires current required evidence and review proof, while Waived
+requires its own operator decision reference. Start a new run with
+`--use-approved-baseline` only after that immutable approval exists. Do not
+import private reference data into this public repository.
+
+Approvals are append-only. If repository revision, evidence, review proof, plan,
+or sources change, the previous approval no longer validates; inspect again and
+record a new explicit approval. Historical review proof follows the public
+convention `<evidence-root>/reviews/<step-id>.*`.
 
 ## Operational Migration
 

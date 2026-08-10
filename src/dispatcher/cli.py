@@ -92,6 +92,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start_parser = sub.add_parser("start", help="persist a new approved run without executing it")
     start_parser.add_argument("--config", required=True)
     start_parser.add_argument("--run-record", required=True)
+    start_parser.add_argument("--use-approved-baseline", action="store_true")
     start_parser.add_argument(
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -139,18 +140,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # --- baseline ---
     baseline_parser = sub.add_parser("baseline", help="inspect or approve historical project baseline")
     baseline_sub = baseline_parser.add_subparsers(dest="baseline_command", required=True)
-    baseline_inspect = baseline_sub.add_parser("inspect", help="produce a read-only baseline candidate")
+    baseline_inspect = baseline_sub.add_parser("inspect", help="produce read-only historical observations")
     baseline_inspect.add_argument("--config", required=True)
     baseline_inspect.add_argument("--plan", required=True)
     baseline_inspect.add_argument("--output")
     baseline_inspect.add_argument(
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
-    baseline_approve = baseline_sub.add_parser("approve", help="persist an approved baseline candidate")
+    baseline_approve = baseline_sub.add_parser("approve", help="persist explicit approved baseline decisions")
     baseline_approve.add_argument("--config", required=True)
     baseline_approve.add_argument("--plan", required=True)
-    baseline_approve.add_argument("--candidate", required=True)
-    baseline_approve.add_argument("--operator-decision-ref", required=True)
+    baseline_approve.add_argument("--observation", required=True)
+    baseline_approve.add_argument("--decisions", required=True)
+    baseline_approve.add_argument("--approval-decision-ref", required=True)
     baseline_approve.add_argument(
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -347,6 +349,7 @@ def _cmd_prune(args: argparse.Namespace) -> int:
 
 def _cmd_start(args: argparse.Namespace) -> int:
     from . import state as state_mod
+    from .baseline import BaselineError, hydrate_run_from_baseline, validate_approved_baseline
     from .config import load_config
     from .state_store import StateStoreError
     from .workflow import RunRecord, RunStatus
@@ -359,8 +362,12 @@ def _cmd_start(args: argparse.Namespace) -> int:
             raise StateStoreError("run record project or config digest does not match --config")
         if record.state is not RunStatus.NEW:
             raise StateStoreError("start requires a NEW run record; use resume, recover, or explicit archive")
-        generation = state_mod.open_state_store(cfg).create_run(record)
-    except (OSError, ValueError, StateStoreError) as exc:
+        store = state_mod.open_state_store(cfg)
+        if args.use_approved_baseline:
+            approval = validate_approved_baseline(plan=record.plan, config=cfg, store=store)
+            record = hydrate_run_from_baseline(record, approval)
+        generation = store.create_run(record)
+    except (BaselineError, OSError, ValueError, StateStoreError) as exc:
         print(f"start: FAILED - {exc}", file=sys.stderr)
         return 2
     print(f"start: persisted  run={record.run_id} generation={generation}")
@@ -412,7 +419,13 @@ def _cmd_answer(args: argparse.Namespace) -> int:
 
 def _cmd_baseline(args: argparse.Namespace) -> int:
     from . import state as state_mod
-    from .baseline import BaselineCandidate, BaselineError, approve_baseline, inspect_baseline
+    from .baseline import (
+        BaselineDecision,
+        BaselineError,
+        BaselineObservation,
+        approve_baseline,
+        inspect_baseline,
+    )
     from .config import load_config
     from .plan import load_normalized_plan
     from .security import atomic_write_private_text
@@ -423,21 +436,27 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     try:
         plan = load_normalized_plan(args.plan, cfg)
         if args.baseline_command == "inspect":
-            candidate = inspect_baseline(plan, cfg)
-            payload = candidate.model_dump_json(indent=2) + "\n"
+            observation = inspect_baseline(plan, cfg)
+            payload = observation.model_dump_json(indent=2) + "\n"
             if args.output:
                 atomic_write_private_text(args.output, payload)
-                print(f"baseline: candidate written to {args.output}")
+                print(f"baseline: observation written to {args.output}")
             else:
                 print(payload, end="")
             return 0
-        candidate = BaselineCandidate.model_validate_json(Path(args.candidate).read_text(encoding="utf-8"))
+        observation = BaselineObservation.model_validate_json(Path(args.observation).read_text(encoding="utf-8"))
+        raw_decisions = json.loads(Path(args.decisions).read_text(encoding="utf-8"))
+        if isinstance(raw_decisions, dict):
+            raw_decisions = raw_decisions.get("decisions")
+        if not isinstance(raw_decisions, list):
+            raise BaselineError("baseline decisions file must be a JSON list or an object with decisions")
         approve_baseline(
-            candidate,
+            observation,
+            decisions=tuple(BaselineDecision.model_validate(item) for item in raw_decisions),
             plan=plan,
             config=cfg,
             store=state_mod.open_state_store(cfg),
-            operator_decision_ref=args.operator_decision_ref,
+            approval_decision_ref=args.approval_decision_ref,
         )
         print(f"baseline: approved  project={cfg.project_id} plan={plan.plan_id}")
         return 0
