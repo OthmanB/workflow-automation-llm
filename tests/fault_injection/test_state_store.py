@@ -414,6 +414,28 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
         )
 
 
+def test_authoritative_run_report_includes_audit_event_summary(project: FixtureProject) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    store.append_audit_event(
+        run_id=record.run_id,
+        event_id="audit-summary-event",
+        sequence=2,
+        kind="operator_decision",
+        correlation_id="fixture-correlation",
+        causation_id=None,
+        payload={"token": "must-not-appear-in-summary"},
+    )
+
+    report = store.export_run_report(record.run_id).read_text(encoding="utf-8")
+
+    assert "## Audit Events" in report
+    assert "operator_decision" in report
+    assert "fixture-correlation" in report
+    assert "must-not-appear-in-summary" not in report
+
+
 @pytest.mark.parametrize(
     ("expires_at", "required_role", "actor_id", "message"),
     [

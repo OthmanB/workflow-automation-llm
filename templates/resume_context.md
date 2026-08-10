@@ -1,3 +1,5 @@
+<!-- Historical, unused legacy template. SQLite state plus `dispatcher resume`
+and `dispatcher recover` are authoritative. Do not introduce new runtime use. -->
 # Resume — {project_name}
 
 Resuming run at step `{current_step}`.

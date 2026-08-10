@@ -1226,6 +1226,27 @@ class StateStore:
         lines.extend(["", "## Artifacts", "", "| Kind | Path | SHA-256 |", "|---|---|---|"])
         for artifact in artifacts:
             lines.append(f"| `{artifact['kind']}` | `{artifact['path']}` | `{artifact['sha256']}` |")
+        audit_rows = self._ready_connection().execute(
+            """
+            SELECT sequence, kind, correlation_id, causation_id, created_at
+            FROM audit_events WHERE run_id = ? ORDER BY sequence, created_at, event_id
+            """,
+            (record.run_id,),
+        ).fetchall()
+        lines.extend(
+            [
+                "",
+                "## Audit Events",
+                "",
+                "| Sequence | Kind | Correlation | Causation | Recorded at |",
+                "|---:|---|---|---|---|",
+            ]
+        )
+        for audit in audit_rows:
+            lines.append(
+                f"| {audit['sequence']} | `{audit['kind']}` | `{audit['correlation_id']}` | "
+                f"`{audit['causation_id'] or ''}` | `{audit['created_at']}` |"
+            )
         lines.extend(["", "## Typed Evidence", "", "| Dispatch | Artifact | Path | SHA-256 |", "|---|---|---|---|"])
         payload_rows = self._ready_connection().execute(
             "SELECT dispatch_id, result_json FROM dispatch_payloads WHERE run_id = ? ORDER BY dispatch_id",

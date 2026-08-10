@@ -1,3 +1,6 @@
+<!-- Legacy mock-loop template. The authoritative sequential coordinator uses
+src/dispatcher/templates/bootstrap_supervisor.md. Do not use this file for
+real execution or as current protocol documentation. -->
 # Supervisor — {project_name}
 
 You are the **supervisor** for the project `{project_name}`.

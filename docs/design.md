@@ -6,6 +6,11 @@ commands, state authority, or execution permissions. Schema-v1 contracts in `doc
 `docs/normalized-plan-schema.md`, `docs/protocol.md`, and
 `docs/workflow-state-schema.md` supersede its legacy envelope, singular-root,
 and reference-parser proposals. Real dispatch remains disabled.
+
+Legacy references to `state.json`, prose envelopes, fixed model assignments,
+or root-level template placeholders are historical context only. The current
+SQLite authority, strict JSON protocol, repository registry, and operations
+guide take precedence.
 **Reference material examined:**
 sanitized role, plan, and evidence files from a multi-step reference project,
 the repository instructions,

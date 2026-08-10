@@ -717,7 +717,7 @@ directory hints.
 - [x] Treat supervisor completion as a request, not a terminal command.
 - [x] Evaluate every completion invariant from DISP-105.
 - [x] Return a structured unmet-obligations response when completion is denied.
-- [ ] Generate the final report from authoritative run, step, review, evidence,
+- [x] Generate the final report from authoritative run, step, review, evidence,
   and audit data.
 - [x] Commit `SUCCEEDED` and a terminal audit event only after report generation
   succeeds.

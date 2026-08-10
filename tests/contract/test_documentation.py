@@ -53,3 +53,21 @@ def test_current_docs_preserve_mock_only_and_private_migration_boundaries() -> N
     assert "Private reference migration" in combined
     assert "separately authorized" in combined
     assert "dispatcher.sqlite3` is authoritative" in combined
+
+
+def test_legacy_templates_and_diagrams_are_explicitly_non_operational() -> None:
+    root = PROJECT_ROOT
+
+    assert "Legacy mock-loop template" in (root / "templates" / "bootstrap_supervisor.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Historical, unused legacy template" in (root / "templates" / "resume_context.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Historical diagram" in (root / "docs" / "diagrams" / "architecture.mmd").read_text(
+        encoding="utf-8"
+    )
+    assert "Historical diagram" in (root / "docs" / "diagrams" / "loop.mmd").read_text(encoding="utf-8")
+    assert "sanitized public schema-v1 reference" in (root / "config" / "projects" / "README.md").read_text(
+        encoding="utf-8"
+    )
