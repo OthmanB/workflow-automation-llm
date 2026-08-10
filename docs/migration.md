@@ -43,7 +43,9 @@ import private reference data into this public repository.
 Approvals are append-only. If repository revision, evidence, review proof, plan,
 or sources change, the previous approval no longer validates; inspect again and
 record a new explicit approval. Historical review proof follows the public
-convention `<evidence-root>/reviews/<step-id>.*`.
+convention `<evidence-root>/reviews/<step-id>.*`. Legacy step-prefixed review
+files matching `<evidence-root>/<lowercase-step-id>*review*` are observed too,
+but never automatically accepted.
 
 ## Operational Migration
 

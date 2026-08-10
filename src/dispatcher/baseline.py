@@ -356,14 +356,25 @@ def _inspect_review_proof(
     observed: list[BaselineEvidence] = []
     for evidence_root in evidence_roots:
         review_root = root / evidence_root / "reviews"
-        if not review_root.is_dir():
-            continue
-        for index, path in enumerate(sorted(review_root.glob(f"{step_id}.*")), start=1):
+        if review_root.is_dir():
+            for index, path in enumerate(sorted(review_root.glob(f"{step_id}.*")), start=1):
+                if not path.is_file():
+                    continue
+                observed.append(
+                    BaselineEvidence(
+                        artifact_id=f"review-proof-{step_id}-{index}",
+                        relative_path=str(path.relative_to(root)),
+                        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                        size_bytes=path.stat().st_size,
+                    )
+                )
+        legacy_root = root / evidence_root
+        for path in sorted(legacy_root.glob(f"{step_id.lower()}*review*")):
             if not path.is_file():
                 continue
             observed.append(
                 BaselineEvidence(
-                    artifact_id=f"review-proof-{step_id}-{index}",
+                    artifact_id=f"review-proof-{step_id}-{len(observed) + 1}",
                     relative_path=str(path.relative_to(root)),
                     sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                     size_bytes=path.stat().st_size,

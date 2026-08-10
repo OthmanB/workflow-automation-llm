@@ -103,8 +103,7 @@ def test_accepted_baseline_requires_review_proof_and_hydrates_new_run(project: F
             approval_decision_ref="decision-missing-review",
         )
 
-    review_proof = project.evidence / "reviews" / "prepare-fixture.json"
-    review_proof.parent.mkdir()
+    review_proof = project.evidence / "prepare-fixture-kimi-review.md"
     review_proof.write_text("historical review proof\n", encoding="utf-8")
     observation = inspect_baseline(plan, project.config)
     approval = approve_baseline(

@@ -110,6 +110,9 @@ required by compiled policy; Waived requires its own operator decision reference
 For generic historical review proof, place a proof file at
 `<evidence-root>/reviews/<step-id>.*`; the inspector hashes it without trusting
 its prose content. Approval records accepted reviewer role keys explicitly.
+For established legacy evidence, the inspector also observes
+`<evidence-root>/<lowercase-step-id>*review*` files; an operator still decides
+whether those hashes constitute sufficient review proof.
 `start --use-approved-baseline` hydrates those durable states into a new run.
 Private reference migration remains separately authorized work and is not
 performed by the public example.
