@@ -384,11 +384,16 @@ def run_session(
             on_session_identified=session_identified,
         )
         if exit_code != 0:
+            category: FailureCategory = (
+                "interrupted"
+                if exit_code in {-signal.SIGINT, -signal.SIGTERM}
+                else classify_provider_failure("", stderr)
+            )
             raise OpenCodeProcessError(
                 f"OpenCode exited with status {exit_code}: {stderr or '[no stderr]'}",
                 exit_code=exit_code,
                 stderr=stderr,
-                category=classify_provider_failure("", stderr),
+                category=category,
                 stdout_log_path=str(stdout_log),
                 stderr_log_path=str(stderr_log),
             )
@@ -720,7 +725,10 @@ def _start_stdin_writer(stream: Any, prompt: bytes) -> None:
         except BrokenPipeError:
             pass
         finally:
-            stream.close()
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
     threading.Thread(target=write_prompt, name="opencode-stdin", daemon=True).start()
 
