@@ -88,7 +88,7 @@ class RepositoryDefinition(ContractModel):
 
     root: str
     expected_remote: RemoteDefinition
-    default_branch: Identifier
+    default_branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")]
     evidence_roots: list[Annotated[str, Field(min_length=1)]]
     writable_roots: list[Annotated[str, Field(min_length=1)]]
     external_roots: list[Annotated[str, Field(min_length=1)]]

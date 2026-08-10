@@ -122,6 +122,13 @@ def test_relative_paths_are_independent_of_current_working_directory(
     assert reloaded.state_dir == expected_state
 
 
+def test_repository_default_branch_accepts_standard_git_ref_with_slashes(project: FixtureProject) -> None:
+    values = config_values(project)
+    values["repositories"]["fixture-repo"]["default_branch"] = "release/tier1"
+
+    _write_and_load(project, values)
+
+
 def test_profile_selection_must_exist_in_strict_profiles_document(project: FixtureProject) -> None:
     values = config_values(project)
     values["profile"]["profile_id"] = "missing"
