@@ -326,6 +326,55 @@ class StateStore:
                 )
         return sessions
 
+    def request_dispatch_cancellation(
+        self,
+        *,
+        run_id: str,
+        expected_generation: int,
+        dispatch_id: str,
+        actor_id: str,
+    ) -> tuple[RunRecord, int, int, str]:
+        """Record cancellation intent before a separate process may be signalled."""
+        record, generation = self.load_run(run_id)
+        if generation != expected_generation:
+            raise StateStoreConflictError("run changed before cancellation request")
+        dispatch = record.dispatches.get(dispatch_id)
+        if dispatch is None:
+            raise StateStoreError(f"dispatch not found: {dispatch_id}")
+        if dispatch.state is not DispatchStatus.RUNNING or dispatch.process_id is None:
+            raise StateStoreError("cancellation requires a running dispatch with a recorded process")
+        if dispatch.cancel_requested:
+            raise StateStoreError("dispatch cancellation was already requested")
+        if dispatch.process_host is None:
+            raise StateStoreCorruptionError("running dispatch has no recorded process host")
+        event = TransitionEvent(
+            event_id=f"event-{uuid.uuid4().hex}",
+            sequence=record.sequence + 1,
+            actor="operator",
+            reason="operator requested dispatch cancellation before signalling process",
+            correlation_id=dispatch_id,
+            occurred_at=datetime.now(UTC),
+        )
+        updated_dispatch = dispatch.model_copy(
+            update={"cancel_requested": True, "cancel_requested_at": event.occurred_at, "last_event": event}
+        )
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch_id] = updated_dispatch
+        updated = record.model_copy(
+            update={"dispatches": dispatches, "sequence": event.sequence, "updated_at": event.occurred_at}
+        )
+        next_generation = self.save_run(updated, expected_generation=generation)
+        self.append_audit_event(
+            run_id=run_id,
+            event_id=f"audit-{event.event_id}",
+            sequence=event.sequence,
+            kind="dispatch_cancellation_requested",
+            correlation_id=dispatch_id,
+            causation_id=None,
+            payload={"actor_id": actor_id, "process_host": dispatch.process_host},
+        )
+        return updated, next_generation, dispatch.process_id, dispatch.process_host
+
     def leases_for_run(self, run_id: str) -> tuple[Lease, ...]:
         """Return every durable lease currently associated with one run."""
         with self._connection_lock:
@@ -580,6 +629,10 @@ class StateStore:
         result: Mapping[str, Any] | None = None,
         forwarding_payload: str | None = None,
         process_id: int | None = None,
+        process_host: str | None = None,
+        process_started_at: datetime | None = None,
+        failure_category: str | None = None,
+        failure_detail: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         repository_after: Mapping[str, Any] | None = None,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
@@ -604,6 +657,11 @@ class StateStore:
             runtime_session_id=runtime_session_id,
             result_digest=result_digest,
             forwarding_digest=forwarding_digest,
+            process_host=process_host,
+            process_started_at=process_started_at,
+            process_id=process_id,
+            failure_category=failure_category,
+            failure_detail=failure_detail,
         )
         dispatches = dict(record.dispatches)
         dispatches[dispatch_id] = transitioned
@@ -910,6 +968,22 @@ class StateStore:
                 updated_record = record.model_copy(
                     update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
                 )
+                target = RunStatus.RUNNING
+            else:
+                target = RunStatus.HALTED
+        elif request.kind == "stall_recovery":
+            if request.step_id is None or request.step_id not in record.steps:
+                raise StateStoreCorruptionError("stall recovery request does not reference a known step")
+            if answer == "retry":
+                step = record.steps[request.step_id]
+                if step.state is StepStatus.BLOCKED:
+                    steps = dict(record.steps)
+                    steps[request.step_id] = transition_step(step, StepStatus.READY, event)
+                    updated_record = record.model_copy(
+                        update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                    )
+                elif step.state is not StepStatus.REVIEW_REQUIRED:
+                    raise StateStoreError("stall retry requires a blocked or review-required step")
                 target = RunStatus.RUNNING
             else:
                 target = RunStatus.HALTED

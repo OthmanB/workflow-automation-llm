@@ -65,6 +65,25 @@ contain unintegrated work. `CLEANUP_PENDING` means cleanup intent was persisted
 before a crash and can be resumed safely by the dispatcher-owned workspace
 manager. Do not remove Git worktrees or branches by hand.
 
+## Cancel And Stall Recovery
+
+```bash
+dispatcher cancel --config <project.yaml> --run-id <run-id> \
+  --dispatch-id <dispatch-id> --actor-id <operator-id>
+```
+
+`cancel` records the request before signalling the verified local process group.
+It checks the recorded host and process identity and never signals a process on
+another host. The managed process receives an interrupt first, followed by the
+configured termination sequence if it does not stop.
+
+Timeouts, interruptions, temporary connection failures, temporary rate limits,
+and context overflow may retry according to `execution.stall_policy`. Each retry
+creates a new dispatch and preserves the old attempt. Provider quota/billing,
+authentication/permission, and unknown failures stop for operator action.
+After the configured retry count, the run asks the operator or halts. The
+project cost/token budget remains a separate optional safety limit.
+
 ## Operator Answer
 
 ```bash
@@ -132,6 +151,6 @@ local input and is not a baseline decision.
 
 ## Unsupported Lifecycle Operations
 
-There is no `cancel` command and no authoritative-state `archive` command.
-Do not simulate either by deleting state files. Halt or recovery decisions must
-be recorded through the dispatcher-owned workflow and operator-gate paths.
+There is no authoritative-state `archive` command. Do not simulate archival by
+deleting state files. Halt, cancellation, and recovery decisions must be
+recorded through dispatcher-owned workflow and operator-gate paths.

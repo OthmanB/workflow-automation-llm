@@ -89,6 +89,31 @@ def test_repository_commit_followed_by_nonzero_exit_requires_reconciliation(
     fixture.coordinator.release_run()
 
 
+def test_timeout_uses_one_bounded_cooldown_retry_then_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _create_fault_fixture(
+        tmp_path,
+        monkeypatch,
+        timeout_seconds=1,
+        max_executor_attempts=2,
+        stall_retries=1,
+        cooldown_seconds=3,
+    )
+    prepared = _prepare_executor(fixture)
+    _inject_fault(fixture.fake_opencode, "timeout")
+    sleeps: list[int] = []
+    monkeypatch.setattr("dispatcher.execution.sleep", lambda seconds: sleeps.append(seconds))
+
+    outcome = fixture.coordinator.execute_worker(prepared)
+
+    assert outcome.record.steps["prepare-fixture"].state.value == "ACCEPTED"
+    assert outcome.record.steps["prepare-fixture"].stalls == 1
+    assert sleeps == [3]
+    fixture.coordinator.release_run()
+
+
 def test_report_failure_does_not_commit_success_or_terminal_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -122,16 +147,28 @@ def _create_fault_fixture(
     *,
     timeout_seconds: int = 5,
     review_required: bool = False,
+    max_executor_attempts: int | None = None,
+    stall_retries: int | None = None,
+    cooldown_seconds: int | None = None,
 ) -> FaultFixture:
     project = create_fixture_project(tmp_path)
     if timeout_seconds != project.config.execution.timeout_seconds:
         values = config_values(project)
         values["execution"]["timeout_seconds"] = timeout_seconds
         project = replace(project, config=write_config(project, values))
+    if max_executor_attempts is not None or stall_retries is not None or cooldown_seconds is not None:
+        values = config_values(project)
+        if stall_retries is not None:
+            values["execution"]["stall_policy"]["maximum_retries_per_step"] = stall_retries
+        if cooldown_seconds is not None:
+            values["execution"]["stall_policy"]["cooldown_seconds"] = cooldown_seconds
+        project = replace(project, config=write_config(project, values))
     _commit_initial_fixture(project.repository)
     plan_values = valid_plan_values(project)
     step = plan_values["steps"][0]
     step["authorization"]["authorized_actions"] = ["inspect", "modify", "verify"]
+    if max_executor_attempts is not None:
+        step["retry"]["max_executor_attempts"] = max_executor_attempts
     if review_required:
         step["review"] = {
             "required": True,

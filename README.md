@@ -51,6 +51,7 @@ dispatcher start --config <project.yaml> --run-record <run.json>
 dispatcher status --config <project.yaml> [--run-id <id>] [--format text|json]
 dispatcher resume --config <project.yaml> --run-id <id>
 dispatcher recover --config <project.yaml> --run-id <id>
+dispatcher cancel --config <project.yaml> --run-id <id> --dispatch-id <id> --actor-id <id>
 dispatcher answer --config <project.yaml> --run-id <id> --request-id <id> --answer <value> --actor-id <id>
 dispatcher support --config <project.yaml> --run-id <id>
 dispatcher prune --config <project.yaml> --apply
@@ -58,8 +59,8 @@ dispatcher baseline inspect|approve ...
 ```
 
 See [`docs/operations.md`](docs/operations.md) for required preconditions and
-durable state effects. `cancel` and authoritative-state `archive` are not
-implemented; never delete or edit `dispatcher.sqlite3` manually.
+durable state effects. Authoritative-state `archive` is not implemented; never
+delete or edit `dispatcher.sqlite3` manually.
 
 ## Development Verification
 

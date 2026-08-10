@@ -37,7 +37,7 @@ def test_operations_document_every_supported_cli_command_and_unsupported_lifecyc
         "dispatcher baseline",
     ):
         assert command in operations
-    assert "There is no `cancel` command" in operations
+    assert "`cancel` records the request before signalling" in operations
     assert "no authoritative-state `archive` command" in operations
     assert "Never edit or delete the database manually" in operations
 

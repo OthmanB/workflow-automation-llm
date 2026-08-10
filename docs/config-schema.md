@@ -50,6 +50,10 @@ execution:
   termination_grace_seconds: 15
   max_output_bytes: 1048576
   max_rounds_per_step: 4
+  stall_policy:
+    maximum_retries_per_step: 2
+    cooldown_seconds: 180
+    on_exhausted: ask
   halt_mode: ask_on_ambiguity
   underspec_mode: ask
   response_template: "[response_content_chat]"
@@ -125,6 +129,10 @@ preflight:
 - Enabled budgets require measured worker usage. Limits halt or create a durable
   operator decision according to `budget.on_limit`; missing required usage fails
   closed.
+- `execution.stall_policy` is separate from `budget`: it controls bounded retries
+  after timeouts, interruptions, temporary connection/rate-limit failures, or
+  incomplete provider output. Provider quota, billing, authentication, and
+  unknown errors do not retry automatically.
 - Permission layers compile in global, project, repository, role-class,
   concrete-role, then dispatch-authorization order. Undeclared actions deny.
   `ask` prevents `--auto`.

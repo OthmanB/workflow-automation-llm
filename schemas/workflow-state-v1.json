@@ -235,10 +235,53 @@
           "default": null,
           "title": "Batch Id"
         },
+        "cancel_requested": {
+          "default": false,
+          "title": "Cancel Requested",
+          "type": "boolean"
+        },
+        "cancel_requested_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cancel Requested At"
+        },
         "dispatch_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Dispatch Id",
           "type": "string"
+        },
+        "failure_category": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure Category"
+        },
+        "failure_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure Detail"
         },
         "forwarding_digest": {
           "anyOf": [
@@ -262,6 +305,45 @@
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Logical Session Key",
           "type": "string"
+        },
+        "process_host": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Host"
+        },
+        "process_id": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Id"
+        },
+        "process_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Started At"
         },
         "result_digest": {
           "anyOf": [
@@ -462,7 +544,8 @@
             "escalation",
             "review_waiver",
             "batch_reconciliation",
-            "workspace_reconciliation"
+            "workspace_reconciliation",
+            "stall_recovery"
           ],
           "title": "Kind",
           "type": "string"
@@ -1054,6 +1137,31 @@
         },
         "last_event": {
           "$ref": "#/$defs/TransitionEvent"
+        },
+        "last_stall_category": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Stall Category"
+        },
+        "last_stall_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Stall Reason"
         },
         "operator_gate_resolved": {
           "title": "Operator Gate Resolved",

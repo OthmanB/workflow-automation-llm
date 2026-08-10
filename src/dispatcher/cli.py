@@ -112,6 +112,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
+    cancel_parser = sub.add_parser("cancel", help="request and signal one active worker dispatch")
+    cancel_parser.add_argument("--config", required=True)
+    cancel_parser.add_argument("--run-id", required=True)
+    cancel_parser.add_argument("--dispatch-id", required=True)
+    cancel_parser.add_argument("--actor-id", required=True)
+    cancel_parser.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
     # --- answer ---
     answer_parser = sub.add_parser("answer", help="persist an answer for a waiting run")
     answer_parser.add_argument("--config", required=True)
@@ -421,6 +430,35 @@ def _cmd_answer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .sessions import OpenCodeAdapterError, cancel_process_group
+    from .state_store import StateStoreError
+
+    cfg = load_config(args.config)
+    _setup_logging(args.log_level or cfg.observability.log_level)
+    try:
+        store = state_mod.open_state_store(cfg)
+        record, generation = store.load_run(args.run_id)
+        _updated, _generation, process_id, process_host = store.request_dispatch_cancellation(
+            run_id=args.run_id,
+            expected_generation=generation,
+            dispatch_id=args.dispatch_id,
+            actor_id=args.actor_id,
+        )
+        stopped = cancel_process_group(
+            process_id,
+            process_host,
+            cfg.execution.termination_grace_seconds,
+        )
+    except (OpenCodeAdapterError, OSError, StateStoreError, ValueError) as exc:
+        print(f"cancel: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"cancel: recorded  run={record.run_id} dispatch={args.dispatch_id} process_stopped={stopped}")
+    return 0
+
+
 def _cmd_baseline(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .baseline import (
@@ -492,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_recover(args)
     elif args.command == "answer":
         return _cmd_answer(args)
+    elif args.command == "cancel":
+        return _cmd_cancel(args)
     elif args.command == "support":
         return _cmd_support(args)
     elif args.command == "prune":

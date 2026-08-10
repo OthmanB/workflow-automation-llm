@@ -13,6 +13,7 @@ from dispatcher.sessions import (
     OpenCodeProcessError,
     OpenCodeProtocolError,
     _parse_json_output,
+    classify_provider_failure,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -189,3 +190,18 @@ def test_decoder_rejects_error_and_malformed_fixture_events() -> None:
     malformed_line = (_fixture_dir() / "run-malformed.jsonl").read_text(encoding="utf-8").splitlines()[0]
     with pytest.raises(OpenCodeProtocolError, match="malformed"):
         malformed_decoder.consume_line(malformed_line, line_number=1)
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "expected"),
+    [
+        ("RateLimitError", "too many requests", "rate_limit"),
+        ("ContextOverflowError", "context overflow", "context_overflow"),
+        ("ProviderAuthError", "invalid api key", "authentication"),
+        ("QuotaExceededError", "quota exhausted", "quota"),
+        ("UnknownError", "connection reset", "connection"),
+        ("UnknownError", "unclassified failure", "unknown"),
+    ],
+)
+def test_provider_error_classification_is_explicit(name: str, message: str, expected: str) -> None:
+    assert classify_provider_failure(name, message) == expected

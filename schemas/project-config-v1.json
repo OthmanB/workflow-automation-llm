@@ -192,6 +192,9 @@
           "title": "Scheduling",
           "type": "string"
         },
+        "stall_policy": {
+          "$ref": "#/$defs/StallPolicyDefinition"
+        },
         "termination_grace_seconds": {
           "maximum": 3600,
           "minimum": 1,
@@ -223,6 +226,7 @@
         "termination_grace_seconds",
         "max_output_bytes",
         "max_rounds_per_step",
+        "stall_policy",
         "halt_mode",
         "underspec_mode",
         "response_template"
@@ -754,6 +758,39 @@
         "roles_files"
       ],
       "title": "SourcesDefinition",
+      "type": "object"
+    },
+    "StallPolicyDefinition": {
+      "additionalProperties": false,
+      "description": "Provider/process interruption retry policy, separate from project budgets.",
+      "properties": {
+        "cooldown_seconds": {
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Cooldown Seconds",
+          "type": "integer"
+        },
+        "maximum_retries_per_step": {
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Maximum Retries Per Step",
+          "type": "integer"
+        },
+        "on_exhausted": {
+          "enum": [
+            "ask",
+            "halt"
+          ],
+          "title": "On Exhausted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "maximum_retries_per_step",
+        "cooldown_seconds",
+        "on_exhausted"
+      ],
+      "title": "StallPolicyDefinition",
       "type": "object"
     },
     "StateDefinition": {

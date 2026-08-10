@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -23,6 +24,18 @@ logger = logging.getLogger(__name__)
 
 OPENCODE_BIN = "opencode"
 SUPPORTED_OPENCODE_VERSION = "1.18.11"
+FailureCategory = Literal[
+    "timeout",
+    "interrupted",
+    "connection",
+    "rate_limit",
+    "context_overflow",
+    "quota",
+    "authentication",
+    "permission",
+    "protocol",
+    "unknown",
+]
 _SUPPORTED_EVENT_TYPES = frozenset(
     {"error", "reasoning", "step_finish", "step_start", "text", "tool_use"}
 )
@@ -40,12 +53,14 @@ class OpenCodeAdapterError(RuntimeError):
         stderr: str = "",
         stdout_log_path: str = "",
         stderr_log_path: str = "",
+        category: FailureCategory = "unknown",
     ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
         self.stderr = stderr
         self.stdout_log_path = stdout_log_path
         self.stderr_log_path = stderr_log_path
+        self.category = category
 
 
 class OpenCodeVersionError(OpenCodeAdapterError):
@@ -55,6 +70,9 @@ class OpenCodeVersionError(OpenCodeAdapterError):
 class OpenCodeProtocolError(OpenCodeAdapterError):
     """The supported OpenCode JSONL contract was malformed or incomplete."""
 
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, category="protocol", **kwargs)
+
 
 class OpenCodeProcessError(OpenCodeAdapterError):
     """OpenCode returned a nonzero exit or a structured error event."""
@@ -62,6 +80,9 @@ class OpenCodeProcessError(OpenCodeAdapterError):
 
 class OpenCodeTimeoutError(OpenCodeAdapterError):
     """The OpenCode process group did not complete by its configured deadline."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, category="timeout", **kwargs)
 
 
 class OpenCodeSessionError(OpenCodeAdapterError):
@@ -122,6 +143,8 @@ class OpenCodeJsonlDecoder:
         self._cost: float | None = None
         self._session_id = ""
         self._structured_error = ""
+        self._structured_error_name = ""
+        self._structured_error_message = ""
         self._saw_step_finish = False
         self._on_session_identified = on_session_identified
 
@@ -170,7 +193,13 @@ class OpenCodeJsonlDecoder:
     def finish(self, *, require_response: bool) -> tuple[list[dict[str, Any]], str, dict[str, Any], str, float | None]:
         """Return the validated result or fail before the caller persists state."""
         if self._structured_error:
-            raise OpenCodeProcessError(f"OpenCode structured error: {self._structured_error}")
+            raise OpenCodeProcessError(
+                f"OpenCode structured error: {self._structured_error}",
+                category=classify_provider_failure(
+                    self._structured_error_name,
+                    self._structured_error_message,
+                ),
+            )
         if not self._session_id:
             raise OpenCodeProtocolError("OpenCode output did not include a sessionID")
         if require_response and not self._chat_parts:
@@ -230,6 +259,8 @@ class OpenCodeJsonlDecoder:
         if not isinstance(name, str) or not isinstance(message, str):
             raise OpenCodeProtocolError(f"OpenCode error event at line {line_number} is malformed")
         self._structured_error = f"{name}: {redact_text(message)}"
+        self._structured_error_name = name
+        self._structured_error_message = redact_text(message)
 
     def _append_metadata(self, event: dict[str, Any]) -> None:
         part = event.get("part")
@@ -357,6 +388,7 @@ def run_session(
                 f"OpenCode exited with status {exit_code}: {stderr or '[no stderr]'}",
                 exit_code=exit_code,
                 stderr=stderr,
+                category=classify_provider_failure("", stderr),
                 stdout_log_path=str(stdout_log),
                 stderr_log_path=str(stderr_log),
             )
@@ -390,6 +422,26 @@ def run_session(
         parent_session_id=session_id if mode == "fork" and session_id else "",
         opencode_version=SUPPORTED_OPENCODE_VERSION,
     )
+
+
+def classify_provider_failure(name: str, message: str) -> FailureCategory:
+    """Map known OpenCode/provider errors to safe retry categories."""
+    text = f"{name} {message}".lower()
+    if "contextoverflow" in text or "context overflow" in text or "outputlength" in text:
+        return "context_overflow"
+    if "ratelimit" in text or "rate limit" in text or "too many requests" in text:
+        return "rate_limit"
+    if "quota" in text or "billing" in text or "insufficient credit" in text:
+        return "quota"
+    if "auth" in text or "unauthorized" in text or "invalid api key" in text:
+        return "authentication"
+    if "permission" in text or "forbidden" in text or "access denied" in text:
+        return "permission"
+    if "connection" in text or "network" in text or "econn" in text or "timed out" in text:
+        return "connection"
+    if "abort" in text or "interrupt" in text or "cancel" in text:
+        return "interrupted"
+    return "unknown"
 
 
 def list_sessions(*, limit: int = 1000) -> list[SessionDescriptor]:
@@ -699,6 +751,43 @@ def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: in
             return
         process.kill()
     process.wait(timeout=grace_seconds)
+
+
+def cancel_process_group(process_id: int, expected_host: str, grace_seconds: int) -> bool:
+    """Interrupt one dispatcher-owned process group after host/identity checks."""
+    if expected_host != socket.gethostname():
+        raise OpenCodeProcessError("refusing cancellation for a process on another host")
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise OpenCodeProcessError("refusing cancellation without process ownership") from exc
+    try:
+        os.killpg(process_id, signal.SIGINT)
+    except ProcessLookupError:
+        return False
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    try:
+        os.killpg(process_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    time.sleep(min(0.1, max(0.01, grace_seconds / 10)))
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        os.killpg(process_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    return True
 
 
 def _split_complete_lines(buffer: bytes) -> tuple[bytes, list[bytes]]:

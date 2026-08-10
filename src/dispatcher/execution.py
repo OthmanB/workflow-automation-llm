@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from time import sleep
 from typing import Any
 
 from .config import Config
@@ -14,6 +15,7 @@ from .permissions import compile_effective_policy, generate_opencode_config, sho
 from .results import parse_executor_result, parse_reviewer_result
 from .sequential import CompletionDecision, PreparedBatch, PreparedDispatch, SequentialWorkflow
 from .sessions import (
+    OpenCodeAdapterError,
     SessionLifecycleCallbacks,
     SessionResult,
     run_session,
@@ -217,25 +219,37 @@ class SequentialExecutionCoordinator:
                     parse_reviewer_result(payload),
                     usage=usage,
                 )
+        except OpenCodeAdapterError as exc:
+            stored, stored_generation = self.store.load_run(current.run_id)
+            stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
+            if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
+                current = _refresh_prepared(current, stored, stored_generation)
+                if exc.category in {"timeout", "interrupted", "connection", "rate_limit", "context_overflow"}:
+                    record, generation, retry_allowed = self.workflow.handle_stall(
+                        current,
+                        category=exc.category,
+                        reason=str(exc),
+                    )
+                    if retry_allowed:
+                        sleep(self.config.execution.stall_policy.cooldown_seconds)
+                        retry = self.workflow.prepare_stall_retry(
+                            record,
+                            generation,
+                            current,
+                            category=exc.category,
+                        )
+                        return self.execute_worker(retry)
+                else:
+                    self.workflow.fail_dispatch(
+                        current,
+                        reason=f"worker execution failed: {type(exc).__name__}",
+                    )
+            raise
         except Exception as exc:
             stored, stored_generation = self.store.load_run(current.run_id)
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
-                current = PreparedDispatch(
-                    run_id=current.run_id,
-                    generation=stored_generation,
-                    dispatch=stored_dispatch,
-                    prompt=current.prompt,
-                    workdir=current.workdir,
-                    permission_config=current.permission_config,
-                    auto_approve=current.auto_approve,
-                    lease_keys=current.lease_keys,
-                    lease_owner_id=current.lease_owner_id,
-                    review_target=current.review_target,
-                    session_mode=current.session_mode,
-                    session_id=current.session_id,
-                    repository_before=current.repository_before,
-                )
+                current = _refresh_prepared(current, stored, stored_generation)
                 self.workflow.fail_dispatch(
                     current,
                     reason=f"worker execution failed: {type(exc).__name__}",
@@ -357,6 +371,30 @@ class SequentialExecutionCoordinator:
             raise ExecutionCoordinatorError(f"sequential run exceeded {max_turns} supervisor turns")
         finally:
             self.release_run()
+
+
+def _refresh_prepared(
+    current: PreparedDispatch,
+    stored: RunRecord,
+    generation: int,
+) -> PreparedDispatch:
+    """Refresh a prepared dispatch from the authoritative record after adapter failure."""
+    stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
+    return PreparedDispatch(
+        run_id=current.run_id,
+        generation=generation,
+        dispatch=stored_dispatch,
+        prompt=current.prompt,
+        workdir=current.workdir,
+        permission_config=current.permission_config,
+        auto_approve=current.auto_approve,
+        lease_keys=current.lease_keys,
+        lease_owner_id=current.lease_owner_id,
+        review_target=current.review_target,
+        session_mode=current.session_mode,
+        session_id=current.session_id,
+        repository_before=current.repository_before,
+    )
 
 
 def _strict_json_object(text: str) -> dict[str, Any]:

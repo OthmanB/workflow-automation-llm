@@ -19,6 +19,7 @@ from dispatcher.sessions import (
     OpenCodeVersionError,
     SessionLifecycleCallbacks,
     _session_exists,
+    cancel_process_group,
     list_sessions,
     run_session,
     validate_session_reference,
@@ -313,6 +314,35 @@ def test_decoder_rejects_malformed_and_missing_completion() -> None:
     )
     with pytest.raises(OpenCodeProtocolError, match="step_finish"):
         decoder.finish(require_response=True)
+
+
+def test_cancel_process_group_checks_host_before_signalling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sessions.socket, "gethostname", lambda: "dispatcher-host")
+
+    with pytest.raises(OpenCodeProcessError, match="another host"):
+        cancel_process_group(4242, "other-host", 1)
+
+
+def test_cancel_process_group_interrupts_and_escalates(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+    alive = {4242}
+    monkeypatch.setattr(sessions.socket, "gethostname", lambda: "dispatcher-host")
+
+    def fake_kill(pid: int, signal_number: int) -> None:
+        if signal_number == 0:
+            if pid not in alive:
+                raise ProcessLookupError
+            return
+        calls.append((pid, signal_number))
+        if signal_number == sessions.signal.SIGINT:
+            alive.clear()
+
+    monkeypatch.setattr(sessions.os, "kill", fake_kill)
+    monkeypatch.setattr(sessions.os, "killpg", fake_kill)
+    monkeypatch.setattr(sessions.time, "sleep", lambda _seconds: None)
+
+    assert cancel_process_group(4242, "dispatcher-host", 1) is True
+    assert calls == [(4242, sessions.signal.SIGINT)]
 
 
 def test_run_session_rejects_an_unsupported_binary_version(

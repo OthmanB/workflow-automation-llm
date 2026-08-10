@@ -153,6 +153,11 @@ def create_fixture_project(
             "termination_grace_seconds": 5,
             "max_output_bytes": 65536,
             "max_rounds_per_step": 4,
+            "stall_policy": {
+                "maximum_retries_per_step": 2,
+                "cooldown_seconds": 0,
+                "on_exhausted": "ask",
+            },
             "halt_mode": "ask_on_ambiguity",
             "underspec_mode": "ask",
             "response_template": "[response_content_chat]",

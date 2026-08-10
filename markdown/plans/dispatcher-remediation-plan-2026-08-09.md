@@ -736,18 +736,18 @@ step-level controls.
 
 **Actions:**
 
-- [ ] Track executor attempts, review attempts, rework rounds, and stalls per
+- [x] Track executor attempts, review attempts, rework rounds, and stalls per
   step.
 - [x] Read all limits from validated YAML or normalized plan policy.
 - [x] Define which failures are retryable, blocked, escalated, or terminal.
 - [x] Require operator approval before retrying uncertain external side effects.
 - [x] Remove implicit mode changes such as resume-to-new fallback.
-- [ ] Add boundary and exhaustion tests for every counter.
+- [x] Add boundary and exhaustion tests for every counter.
 
 **Acceptance criteria:**
 
 - [x] One stuck step cannot consume the allowance of unrelated steps.
-- [ ] Exceeded limits produce deterministic escalation or halt states.
+- [x] Exceeded limits produce deterministic escalation or halt states.
 
 ### DISP-405: Import the existing private-project baseline
 

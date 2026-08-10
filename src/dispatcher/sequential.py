@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import threading
 import uuid
 from dataclasses import dataclass, replace
@@ -740,6 +741,8 @@ class SequentialWorkflow:
             target=DispatchStatus.RUNNING,
             event=event,
             process_id=process_id,
+            process_host=socket.gethostname(),
+            process_started_at=event.occurred_at,
         )
         return PreparedDispatch(
             run_id=prepared.run_id,
@@ -1248,6 +1251,116 @@ class SequentialWorkflow:
             generation = self.store.save_run(record, expected_generation=generation)
         self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         return record, generation
+
+    @_serialized_transition
+    def handle_stall(
+        self,
+        prepared: PreparedDispatch,
+        *,
+        category: str,
+        reason: str,
+    ) -> tuple[RunRecord, int, bool]:
+        """Persist one interruption and decide whether a bounded retry is allowed."""
+        record, generation = self.store.load_run(prepared.run_id)
+        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        if dispatch.state not in {DispatchStatus.PREPARED, DispatchStatus.RUNNING}:
+            raise SequentialWorkflowError(f"cannot record stall from dispatch state {dispatch.state.value}")
+        event = self._event(record, "dispatcher", f"worker stall: {category}", dispatch.dispatch_id)
+        record, generation = self.store.commit_dispatch_transition(
+            record,
+            expected_generation=generation,
+            dispatch_id=dispatch.dispatch_id,
+            target=DispatchStatus.FAILED if dispatch.state is DispatchStatus.RUNNING else DispatchStatus.ABANDONED,
+            event=event,
+            failure_category=category,
+            failure_detail=reason,
+        )
+        step = record.steps[dispatch.step_id]
+        stall_count = step.stalls + 1
+        step_event = self._event(record, "dispatcher", "stall recorded", dispatch.dispatch_id)
+        if step.state is StepStatus.EXECUTING:
+            blocked = transition_step(step, StepStatus.BLOCKED, step_event)
+            retry_state = StepStatus.READY
+        elif step.state is StepStatus.REVIEWING:
+            blocked = transition_step(step, StepStatus.REVIEW_REQUIRED, step_event)
+            retry_state = StepStatus.REVIEW_REQUIRED
+        else:
+            raise SequentialWorkflowError(f"stalled dispatch has incompatible step state {step.state.value}")
+        updated_step = blocked.model_copy(
+            update={"stalls": stall_count, "last_stall_category": category, "last_stall_reason": reason[:5000]}
+        )
+        plan_step = next(item for item in record.plan.steps if item.step_id == dispatch.step_id)
+        attempt_limit_available = (
+            step.executor_attempts < plan_step.retry.max_executor_attempts
+            if dispatch.role_kind == "executor"
+            else step.reviewer_attempts < plan_step.retry.max_reviewer_attempts
+        )
+        retry_allowed = (
+            stall_count <= self.config.execution.stall_policy.maximum_retries_per_step
+            and attempt_limit_available
+        )
+        if retry_allowed:
+            ready_event = self._event(record, "dispatcher", "stall retry is ready", dispatch.dispatch_id)
+            if updated_step.state is not retry_state:
+                updated_step = transition_step(updated_step, retry_state, ready_event)
+            else:
+                updated_step = updated_step.model_copy(update={"last_event": ready_event})
+            updated_step = updated_step.model_copy(
+                update={"stalls": stall_count, "last_stall_category": category, "last_stall_reason": reason[:5000]}
+            )
+        record, generation = self._replace_step(record, generation, updated_step)
+        if not retry_allowed:
+            if self.config.execution.stall_policy.on_exhausted == "ask":
+                request_event = self._event(record, "dispatcher", "stall retry limit exhausted", dispatch.step_id)
+                request = OperatorRequest(
+                    request_id=f"request-{uuid.uuid4().hex}",
+                    question=(
+                        f"Step {dispatch.step_id} exhausted stall retries after {stall_count} interruptions. "
+                        "Retry once more or halt?"
+                    ),
+                    allowed_answers=["retry", "halt"],
+                    context_ref=dispatch.dispatch_id,
+                    resume_to=RunStatus.RUNNING,
+                    expires_at=None,
+                    required_role=None,
+                    kind="stall_recovery",
+                    step_id=dispatch.step_id,
+                )
+                record = transition_run(record, RunStatus.WAITING_OPERATOR, request_event, operator_request=request)
+                generation = self.store.save_run(record, expected_generation=generation)
+            else:
+                halt_event = self._event(record, "dispatcher", "stall retry limit exhausted; halted", dispatch.step_id)
+                record = transition_run(record, RunStatus.HALTED, halt_event)
+                generation = self.store.save_run(record, expected_generation=generation)
+        self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
+        return record, generation, retry_allowed
+
+    def prepare_stall_retry(
+        self,
+        record: RunRecord,
+        generation: int,
+        prepared: PreparedDispatch,
+        *,
+        category: str,
+    ) -> PreparedDispatch:
+        """Create a fresh dispatch with a bounded continuation instruction."""
+        command = DispatchCommand(
+            protocol_version=1,
+            action="dispatch",
+            step_id=prepared.dispatch.step_id,
+            target_role=prepared.dispatch.role_key,
+            session_mode="new",
+            prompt=(
+                "Continue the current approved step from its last durable result. "
+                "Do not repeat completed side effects. Return the required typed result only. "
+                f"The previous interruption category was {category}."
+            ),
+            rationale="dispatcher-owned bounded stall continuation",
+        )
+        retried = self.prepare_dispatch(record, generation, command)
+        if not isinstance(retried, PreparedDispatch):
+            raise SequentialWorkflowError("stall retry could not prepare a worker dispatch")
+        return retried
 
     @_serialized_transition
     def finalize_batch(

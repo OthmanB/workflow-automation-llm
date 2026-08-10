@@ -214,6 +214,7 @@ class ExecutionDefinition(ContractModel):
     termination_grace_seconds: Annotated[int, Field(ge=1, le=3_600)]
     max_output_bytes: Annotated[int, Field(ge=1_024, le=104_857_600)]
     max_rounds_per_step: Annotated[int, Field(ge=1, le=100)]
+    stall_policy: StallPolicyDefinition
     halt_mode: Literal["ask_on_ambiguity", "full_auto"]
     underspec_mode: Literal["ask", "auto"]
     response_template: Annotated[str, Field(min_length=1, max_length=20_000)]
@@ -242,6 +243,14 @@ class BudgetDefinition(ContractModel):
     max_step_cost_usd: Annotated[float, Field(ge=0)]
     max_context_tokens: Annotated[int, Field(ge=1)]
     on_limit: Literal["halt", "ask"]
+
+
+class StallPolicyDefinition(ContractModel):
+    """Provider/process interruption retry policy, separate from project budgets."""
+
+    maximum_retries_per_step: Annotated[int, Field(ge=0, le=20)]
+    cooldown_seconds: Annotated[int, Field(ge=0, le=86_400)]
+    on_exhausted: Literal["ask", "halt"]
 
 
 class RetentionDefinition(ContractModel):

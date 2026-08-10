@@ -203,6 +203,7 @@ class OperatorRequest(ContractModel):
         "review_waiver",
         "batch_reconciliation",
         "workspace_reconciliation",
+        "stall_recovery",
     ] = "underspecification"
     step_id: Identifier | None = None
     reassignment_role_key: Identifier | None = None
@@ -246,6 +247,13 @@ class DispatchRecord(ContractModel):
     dispatch_id: Identifier
     batch_id: Identifier | None = None
     workspace_group_id: Identifier | None = None
+    process_id: Annotated[int, Field(ge=1)] | None = None
+    process_host: Identifier | None = None
+    process_started_at: datetime | None = None
+    cancel_requested: bool = False
+    cancel_requested_at: datetime | None = None
+    failure_category: Identifier | None = None
+    failure_detail: str | None = None
     step_id: Identifier
     role_key: Identifier
     role_kind: Literal["executor", "reviewer"]
@@ -412,6 +420,8 @@ class StepRecord(ContractModel):
     reassignment_role_key: Identifier | None = None
     review_waiver_decision_ref: Identifier | None = None
     stalls: Annotated[int, Field(ge=0, le=100)] = 0
+    last_stall_category: Identifier | None = None
+    last_stall_reason: str | None = None
     operator_gate_resolved: bool
     waiver_decision_ref: Identifier | None
     result_digests: list[Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]]
@@ -635,6 +645,11 @@ def transition_dispatch(
     runtime_session_id: str | None = None,
     result_digest: str | None = None,
     forwarding_digest: str | None = None,
+    failure_category: str | None = None,
+    failure_detail: str | None = None,
+    process_host: str | None = None,
+    process_started_at: datetime | None = None,
+    process_id: int | None = None,
 ) -> DispatchRecord:
     """Apply a dispatch state transition with its required durable transition data."""
     _validate_transition("dispatch", record.state, target, DISPATCH_TRANSITIONS)
@@ -645,6 +660,16 @@ def transition_dispatch(
         updates["result_digest"] = result_digest
     if forwarding_digest is not None:
         updates["forwarding_digest"] = forwarding_digest
+    if failure_category is not None:
+        updates["failure_category"] = failure_category
+    if failure_detail is not None:
+        updates["failure_detail"] = failure_detail[:5000]
+    if process_host is not None:
+        updates["process_host"] = process_host
+    if process_started_at is not None:
+        updates["process_started_at"] = process_started_at
+    if process_id is not None:
+        updates["process_id"] = process_id
     try:
         values = record.model_dump()
         values.update(updates)

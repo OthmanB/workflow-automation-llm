@@ -64,6 +64,7 @@ def _record(
     *,
     review_required: bool = False,
     max_reviewer_attempts: int | None = None,
+    max_executor_attempts: int | None = None,
 ) -> RunRecord:
     values = valid_plan_values(project)
     if review_required:
@@ -77,6 +78,8 @@ def _record(
         values["steps"][0]["retry"]["on_changes_requested"] = "retry"
     if max_reviewer_attempts is not None:
         values["steps"][0]["retry"]["max_reviewer_attempts"] = max_reviewer_attempts
+    if max_executor_attempts is not None:
+        values["steps"][0]["retry"]["max_executor_attempts"] = max_executor_attempts
     plan = NormalizedPlan.model_validate(values)
     record = new_run_record(
         run_id="fixture-run",
@@ -183,12 +186,14 @@ def _activate_ready_run(
     *,
     review_required: bool = False,
     max_reviewer_attempts: int | None = None,
+    max_executor_attempts: int | None = None,
 ) -> tuple[StateStore, SequentialWorkflow, RunRecord, int]:
     store = _store(project)
     record = _record(
         project,
         review_required=review_required,
         max_reviewer_attempts=max_reviewer_attempts,
+        max_executor_attempts=max_executor_attempts,
     )
     generation = store.create_run(record)
     workflow = _workflow(project, store)
@@ -201,11 +206,13 @@ def _prepare_executor(
     *,
     review_required: bool = False,
     max_reviewer_attempts: int | None = None,
+    max_executor_attempts: int | None = None,
 ) -> tuple[StateStore, SequentialWorkflow, PreparedDispatch]:
     _store_value, workflow, record, generation = _activate_ready_run(
         project,
         review_required=review_required,
         max_reviewer_attempts=max_reviewer_attempts,
+        max_executor_attempts=max_executor_attempts,
     )
     prepared = workflow.prepare_from_supervisor(
         record.run_id,
@@ -260,6 +267,54 @@ def test_executor_dispatch_transitions_only_its_ready_step_and_completion_is_gua
     assert decision.accepted
     assert decision.report_path is not None
     assert store.load_run(record.run_id)[0].state.value == "SUCCEEDED"
+
+
+def test_stall_requeues_with_a_fresh_dispatch_and_preserves_the_stall_count(project: FixtureProject) -> None:
+    store, workflow, prepared = _prepare_executor(project, max_executor_attempts=2)
+
+    record, generation, retry_allowed = workflow.handle_stall(
+        prepared,
+        category="timeout",
+        reason="synthetic timeout",
+    )
+
+    assert retry_allowed is True
+    assert record.steps["prepare-fixture"].state is StepStatus.READY
+    assert record.steps["prepare-fixture"].stalls == 1
+    assert record.steps["prepare-fixture"].last_stall_category == "timeout"
+    assert record.dispatches[prepared.dispatch.dispatch_id].state.value == "FAILED"
+
+    retry = workflow.prepare_stall_retry(record, generation, prepared, category="timeout")
+
+    assert retry.dispatch.dispatch_id != prepared.dispatch.dispatch_id
+    assert retry.dispatch.attempt == 2
+    assert json.loads(retry.prompt)["task"].startswith("Continue the current approved step")
+
+
+def test_stall_retry_exhaustion_enters_operator_wait(project: FixtureProject) -> None:
+    store, workflow, prepared = _prepare_executor(project, max_executor_attempts=4)
+    current = prepared
+    record = None
+    generation = prepared.generation
+    for attempt in range(3):
+        record, generation, retry_allowed = workflow.handle_stall(
+            current,
+            category="connection",
+            reason=f"synthetic connection interruption {attempt + 1}",
+        )
+        if retry_allowed:
+            current = workflow.prepare_stall_retry(record, generation, current, category="connection")
+            current = workflow.record_session_id(
+                workflow.mark_running(current, process_id=5000 + attempt),
+                runtime_session_id=f"session-stall-{attempt}",
+            )
+
+    assert record is not None
+    assert record.state.value == "WAITING_OPERATOR"
+    assert record.operator_request is not None
+    assert record.operator_request.kind == "stall_recovery"
+    assert record.steps["prepare-fixture"].stalls == 3
+    assert record.steps["prepare-fixture"].state is StepStatus.BLOCKED
 
 
 def test_process_and_session_identity_are_separate_atomic_generations(

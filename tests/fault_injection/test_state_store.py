@@ -143,6 +143,51 @@ def test_snapshot_commits_every_generation_atomically(project: FixtureProject) -
     assert {run_generation, plan_generation, *step_generations, *session_generations} == {2}
 
 
+def test_cancellation_intent_is_persisted_before_process_signal(project: FixtureProject) -> None:
+    store = _store(project)
+    record = _record(project)
+    dispatch = _dispatch("perform fixture task", {"permission": {"*": "deny"}})
+    prepared_record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store.create_run(prepared_record)
+    generation = store.prepare_dispatch(
+        prepared_record,
+        expected_generation=1,
+        dispatch=dispatch,
+        prompt="perform fixture task",
+        policy={"permission": {"*": "deny"}},
+        repository_before={"repo_id": "fixture-repo"},
+    )
+    running = transition_dispatch(
+        dispatch,
+        DispatchStatus.RUNNING,
+        _event(2),
+        runtime_session_id="session-one",
+        process_id=4242,
+        process_host="fixture-host",
+        process_started_at=datetime.now(UTC),
+    )
+    running_record = prepared_record.model_copy(update={"dispatches": {dispatch.dispatch_id: running}})
+    generation = store.save_run(running_record, expected_generation=generation)
+
+    cancelled, next_generation, process_id, process_host = store.request_dispatch_cancellation(
+        run_id=record.run_id,
+        expected_generation=generation,
+        dispatch_id=dispatch.dispatch_id,
+        actor_id="operator",
+    )
+
+    assert next_generation == generation + 1
+    assert process_id == 4242
+    assert process_host == "fixture-host"
+    assert cancelled.dispatches[dispatch.dispatch_id].cancel_requested is True
+    with sqlite3.connect(store.database_path) as connection:
+        kind = connection.execute(
+            "SELECT kind FROM audit_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+            (record.run_id,),
+        ).fetchone()[0]
+    assert kind == "dispatch_cancellation_requested"
+
+
 def test_faulted_snapshot_rolls_back_all_tables(project: FixtureProject) -> None:
     store = _store(project)
     record = _record(project)
