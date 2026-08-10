@@ -113,6 +113,10 @@ preflight:
   `bounded_parallel` is explicit and only permits independent,
   resource-unconflicted cross-repository children. Same-repository work remains
   serialized.
+- `same_repository_mode: worktree_barrier` declares the owner-only root and
+  branch prefix used for temporary same-repository worktrees. This manager
+  currently supports only `commit_policy: required`; it does not yet admit
+  same-repository batch dispatches until review and merge promotion are wired.
 - Review profiles declare `review_schedule`, `multi_review`, reviewer role
   keys, and required acceptance count. Mandatory plan or project review cannot
   be weakened by profile choice or an operator waiver.

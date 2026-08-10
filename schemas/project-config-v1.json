@@ -73,13 +73,34 @@
           },
           "title": "Role Capacities",
           "type": "object"
+        },
+        "same_repository_mode": {
+          "enum": [
+            "serialized",
+            "worktree_barrier"
+          ],
+          "title": "Same Repository Mode",
+          "type": "string"
+        },
+        "worktree_branch_prefix": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,80}$",
+          "title": "Worktree Branch Prefix",
+          "type": "string"
+        },
+        "worktree_root": {
+          "minLength": 1,
+          "title": "Worktree Root",
+          "type": "string"
         }
       },
       "required": [
         "max_active_dispatches",
         "max_batch_size",
         "role_capacities",
-        "failure_mode"
+        "failure_mode",
+        "same_repository_mode",
+        "worktree_root",
+        "worktree_branch_prefix"
       ],
       "title": "ConcurrencyDefinition",
       "type": "object"

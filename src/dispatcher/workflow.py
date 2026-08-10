@@ -58,6 +58,13 @@ class BatchStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class WorkspaceGroupStatus(str, Enum):
+    PREPARED = "PREPARED"
+    ACTIVE = "ACTIVE"
+    CLEANUP_PENDING = "CLEANUP_PENDING"
+    CLEANED = "CLEANED"
+    FAILED = "FAILED"
+
 RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.NEW: frozenset(
         {RunStatus.READY, RunStatus.WAITING_OPERATOR, RunStatus.FAILED, RunStatus.CANCELLED}
@@ -142,6 +149,14 @@ BATCH_TRANSITIONS: dict[BatchStatus, frozenset[BatchStatus]] = {
     BatchStatus.RUNNING: frozenset({BatchStatus.JOINED, BatchStatus.FAILED}),
     BatchStatus.JOINED: frozenset(),
     BatchStatus.FAILED: frozenset(),
+}
+
+WORKSPACE_GROUP_TRANSITIONS: dict[WorkspaceGroupStatus, frozenset[WorkspaceGroupStatus]] = {
+    WorkspaceGroupStatus.PREPARED: frozenset({WorkspaceGroupStatus.ACTIVE, WorkspaceGroupStatus.FAILED}),
+    WorkspaceGroupStatus.ACTIVE: frozenset({WorkspaceGroupStatus.CLEANUP_PENDING, WorkspaceGroupStatus.FAILED}),
+    WorkspaceGroupStatus.CLEANUP_PENDING: frozenset({WorkspaceGroupStatus.CLEANED, WorkspaceGroupStatus.FAILED}),
+    WorkspaceGroupStatus.CLEANED: frozenset(),
+    WorkspaceGroupStatus.FAILED: frozenset({WorkspaceGroupStatus.CLEANUP_PENDING}),
 }
 
 ACTIVE_DISPATCH_STATES = frozenset(
@@ -281,6 +296,46 @@ class BatchRecord(ContractModel):
         return self
 
 
+class WorkspaceChild(ContractModel):
+    """One temporary branch and linked worktree owned by a workspace group."""
+
+    step_id: Identifier
+    branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")]
+    worktree_path: Annotated[str, Field(min_length=1)]
+    base_revision: Annotated[str, Field(min_length=1, max_length=200)]
+    head_revision: Annotated[str, Field(min_length=1, max_length=200)] | None = None
+
+
+class WorkspaceGroup(ContractModel):
+    """Durable ownership record for temporary same-repository worktrees."""
+
+    workspace_group_id: Identifier
+    repo_id: Identifier
+    base_revision: Annotated[str, Field(min_length=1, max_length=200)]
+    base_branch: Identifier
+    integration_branch: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$")]
+    worktree_root: Annotated[str, Field(min_length=1)]
+    lease_owner_id: Identifier
+    children: tuple[WorkspaceChild, ...]
+    state: WorkspaceGroupStatus
+    last_event: TransitionEvent
+
+    @model_validator(mode="after")
+    def validate_children(self) -> "WorkspaceGroup":
+        if not self.children:
+            raise ValueError("workspace group requires at least one child")
+        step_ids = [child.step_id for child in self.children]
+        branches = [child.branch for child in self.children]
+        paths = [child.worktree_path for child in self.children]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError("workspace group children must have unique step IDs")
+        if len(branches) != len(set(branches)):
+            raise ValueError("workspace group children must have unique branches")
+        if len(paths) != len(set(paths)):
+            raise ValueError("workspace group children must have unique paths")
+        return self
+
+
 class CompiledReviewObligation(ContractModel):
     """Concrete pre-dispatch review policy for one normalized plan step."""
 
@@ -386,6 +441,7 @@ class RunRecord(ContractModel):
     steps: dict[Identifier, StepRecord]
     dispatches: dict[Identifier, DispatchRecord]
     batches: dict[Identifier, BatchRecord] = Field(default_factory=dict)
+    workspace_groups: dict[Identifier, WorkspaceGroup] = Field(default_factory=dict)
     operator_request: OperatorRequest | None
     policy: RunPolicy | None = None
     usage: UsageLedger = Field(default_factory=UsageLedger)
@@ -413,6 +469,11 @@ class RunRecord(ContractModel):
                 raise ValueError("batch ID must match its mapping key")
             if not set(batch.dispatch_ids).issubset(self.dispatches):
                 raise ValueError("batch dispatch_ids must reference run dispatches")
+        for group_id, group in self.workspace_groups.items():
+            if group.workspace_group_id != group_id:
+                raise ValueError("workspace group ID must match its mapping key")
+            if not set(child.step_id for child in group.children).issubset(self.steps):
+                raise ValueError("workspace group children must reference run steps")
         if self.state is RunStatus.WAITING_OPERATOR and self.operator_request is None:
             raise ValueError("waiting operator run requires operator_request")
         if self.state is not RunStatus.WAITING_OPERATOR and self.operator_request is not None:
@@ -481,6 +542,7 @@ def new_run_record(
         steps=steps,
         dispatches={},
         batches={},
+        workspace_groups={},
         operator_request=None,
         created_at=now,
         updated_at=now,
@@ -587,6 +649,16 @@ def transition_batch(record: BatchRecord, target: BatchStatus, event: Transition
     return record.model_copy(update={"state": target, "last_event": event})
 
 
+def transition_workspace_group(
+    record: WorkspaceGroup,
+    target: WorkspaceGroupStatus,
+    event: TransitionEvent,
+) -> WorkspaceGroup:
+    """Apply one durable temporary-worktree lifecycle transition."""
+    _validate_transition("workspace group", record.state, target, WORKSPACE_GROUP_TRANSITIONS)
+    return record.model_copy(update={"state": target, "last_event": event})
+
+
 def completion_obligations(record: RunRecord) -> list[CompletionObligation]:
     """Return every outstanding condition that prevents successful completion."""
     obligations: list[CompletionObligation] = []
@@ -684,7 +756,7 @@ def terminal_exit_code(status: RunStatus) -> int:
         raise TransitionError(f"run state {status.value} is not terminal") from exc
 
 
-State = TypeVar("State", RunStatus, StepStatus, DispatchStatus, BatchStatus)
+State = TypeVar("State", RunStatus, StepStatus, DispatchStatus, BatchStatus, WorkspaceGroupStatus)
 
 
 def _validate_transition(

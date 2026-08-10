@@ -76,6 +76,9 @@ execution:
       reviewer: 1
       reviewer-two: 1
     failure_mode: wait_for_started
+    same_repository_mode: serialized
+    worktree_root: ../../state/workflow-automation-example/worktrees
+    worktree_branch_prefix: dispatcher/workspace
   default_repo_id: dispatcher-framework
   timeout_seconds: 300
   termination_grace_seconds: 10

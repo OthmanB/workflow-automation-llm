@@ -94,6 +94,23 @@ def status_snapshot(config: Config, store: StateStore, run_id: str | None = None
             }
             for batch in record.batches.values()
         ],
+        "workspace_groups": [
+            {
+                "workspace_group_id": group.workspace_group_id,
+                "repo_id": group.repo_id,
+                "state": group.state.value,
+                "base_revision": group.base_revision,
+                "children": [
+                    {
+                        "step_id": child.step_id,
+                        "branch": child.branch,
+                        "head_revision": child.head_revision,
+                    }
+                    for child in group.children
+                ],
+            }
+            for group in record.workspace_groups.values()
+        ],
         "waiting_operator": (
             {
                 "request_id": request.request_id,

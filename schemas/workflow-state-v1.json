@@ -1287,6 +1287,135 @@
       },
       "title": "UsageLedger",
       "type": "object"
+    },
+    "WorkspaceChild": {
+      "additionalProperties": false,
+      "description": "One temporary branch and linked worktree owned by a workspace group.",
+      "properties": {
+        "base_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Base Revision",
+          "type": "string"
+        },
+        "branch": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$",
+          "title": "Branch",
+          "type": "string"
+        },
+        "head_revision": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Head Revision"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "worktree_path": {
+          "minLength": 1,
+          "title": "Worktree Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "branch",
+        "worktree_path",
+        "base_revision"
+      ],
+      "title": "WorkspaceChild",
+      "type": "object"
+    },
+    "WorkspaceGroup": {
+      "additionalProperties": false,
+      "description": "Durable ownership record for temporary same-repository worktrees.",
+      "properties": {
+        "base_branch": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Base Branch",
+          "type": "string"
+        },
+        "base_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Base Revision",
+          "type": "string"
+        },
+        "children": {
+          "items": {
+            "$ref": "#/$defs/WorkspaceChild"
+          },
+          "title": "Children",
+          "type": "array"
+        },
+        "integration_branch": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,300}$",
+          "title": "Integration Branch",
+          "type": "string"
+        },
+        "last_event": {
+          "$ref": "#/$defs/TransitionEvent"
+        },
+        "lease_owner_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Lease Owner Id",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkspaceGroupStatus"
+        },
+        "workspace_group_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Workspace Group Id",
+          "type": "string"
+        },
+        "worktree_root": {
+          "minLength": 1,
+          "title": "Worktree Root",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_group_id",
+        "repo_id",
+        "base_revision",
+        "base_branch",
+        "integration_branch",
+        "worktree_root",
+        "lease_owner_id",
+        "children",
+        "state",
+        "last_event"
+      ],
+      "title": "WorkspaceGroup",
+      "type": "object"
+    },
+    "WorkspaceGroupStatus": {
+      "enum": [
+        "PREPARED",
+        "ACTIVE",
+        "CLEANUP_PENDING",
+        "CLEANED",
+        "FAILED"
+      ],
+      "title": "WorkspaceGroupStatus",
+      "type": "string"
     }
   },
   "additionalProperties": false,
@@ -1391,6 +1520,15 @@
     },
     "usage": {
       "$ref": "#/$defs/UsageLedger"
+    },
+    "workspace_groups": {
+      "patternProperties": {
+        "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+          "$ref": "#/$defs/WorkspaceGroup"
+        }
+      },
+      "title": "Workspace Groups",
+      "type": "object"
     }
   },
   "required": [

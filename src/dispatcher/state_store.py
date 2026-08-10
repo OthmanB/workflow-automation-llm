@@ -32,6 +32,7 @@ from .workflow import (
     RunStatus,
     StepStatus,
     TransitionEvent,
+    WorkspaceGroup,
     transition_run,
     transition_step,
 )
@@ -495,6 +496,26 @@ class StateStore:
             expected_generation=expected_generation,
             dispatch_payloads=dispatch_payloads,
         )
+
+    def save_workspace_group(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        group: WorkspaceGroup,
+    ) -> tuple[RunRecord, int]:
+        """Persist one temporary-worktree lifecycle update with the run snapshot."""
+        groups = dict(record.workspace_groups)
+        groups[group.workspace_group_id] = group
+        updated = record.model_copy(
+            update={
+                "workspace_groups": groups,
+                "sequence": group.last_event.sequence,
+                "updated_at": group.last_event.occurred_at,
+            }
+        )
+        generation = self.save_run(updated, expected_generation=expected_generation)
+        return updated, generation
 
     def update_dispatch_payload(
         self,
@@ -1201,6 +1222,20 @@ class StateStore:
             lines.append(
                 f"| `{batch.batch_id}` | `{batch.state.value}` | "
                 f"`{', '.join(batch.dispatch_ids)}` | `{', '.join(batch.failed_dispatch_ids)}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Workspace Groups",
+                "",
+                "| Group | Repository | State | Base revision | Children |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for group in sorted(record.workspace_groups.values(), key=lambda value: value.workspace_group_id):
+            lines.append(
+                f"| `{group.workspace_group_id}` | `{group.repo_id}` | `{group.state.value}` | "
+                f"`{group.base_revision}` | `{', '.join(child.step_id for child in group.children)}` |"
             )
         lines.extend(
             [

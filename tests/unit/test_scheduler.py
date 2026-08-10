@@ -35,6 +35,9 @@ def _parallel_config(project_path: Path):
                 "max_batch_size": 2,
                 "role_capacities": {"terra": 2, "reviewer": 1, "reviewer-two": 1},
                 "failure_mode": "wait_for_started",
+                "same_repository_mode": "serialized",
+                "worktree_root": str(project.root / "worktrees"),
+                "worktree_branch_prefix": "dispatcher/workspace",
             },
         }
     )

@@ -186,6 +186,12 @@ class ConcurrencyDefinition(ContractModel):
     max_batch_size: Annotated[int, Field(ge=1, le=100)]
     role_capacities: dict[Identifier, Annotated[int, Field(ge=1, le=100)]]
     failure_mode: Literal["wait_for_started"]
+    same_repository_mode: Literal["serialized", "worktree_barrier"]
+    worktree_root: Annotated[str, Field(min_length=1)]
+    worktree_branch_prefix: Annotated[
+        str,
+        Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,80}$"),
+    ]
 
     @model_validator(mode="after")
     def validate_bounds(self) -> Self:
@@ -560,6 +566,10 @@ class Config:
             Path(self.model.observability.retention.archive_directory),
             "observability.retention.archive_directory",
         )
+        _require_writable_parent(
+            Path(self.model.execution.concurrency.worktree_root),
+            "execution.concurrency.worktree_root",
+        )
 
         resolved_roots: dict[str, Path] = {}
         writable_roots: list[tuple[str, Path, bool]] = []
@@ -632,6 +642,10 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
         retention = resolved["observability"].get("retention")
         if isinstance(retention, dict):
             resolve_at(retention, "archive_directory")
+    if isinstance(resolved.get("execution"), dict):
+        concurrency = resolved["execution"].get("concurrency")
+        if isinstance(concurrency, dict):
+            resolve_at(concurrency, "worktree_root")
     if isinstance(resolved.get("profile"), dict):
         resolve_at(resolved["profile"], "profiles_file")
     if isinstance(resolved.get("repositories"), dict):

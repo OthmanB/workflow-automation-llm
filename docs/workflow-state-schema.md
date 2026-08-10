@@ -65,6 +65,21 @@ prepared all-or-none and retain their normal dispatch lifecycle. A failed child
 is named in the batch result and creates one durable reconciliation request only
 after every started child reaches a durable outcome.
 
+## Workspace group states
+
+| State | Meaning |
+|---|---|
+| `PREPARED` | Temporary worktree intent is durable; Git side effects have not started. |
+| `ACTIVE` | Child branches/worktrees exist under a repository lease. |
+| `CLEANUP_PENDING` | Cleanup intent is durable before worktrees or branches are removed. |
+| `CLEANED` | Every owned worktree and branch was removed. |
+| `FAILED` | Provisioning or cleanup needs explicit recovery. |
+
+Workspace groups are not yet scheduler-admitted dispatch batches. They are the
+durable ownership layer for a future same-repository barrier: temporary child
+branches start from one base revision, remain available through review/rework,
+and are removed only after a later integration decision.
+
 ## Run Policy and Usage
 
 Activation persists an immutable `RunPolicy` with compiled review obligations,
