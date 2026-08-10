@@ -143,6 +143,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     baseline_inspect = baseline_sub.add_parser("inspect", help="produce read-only historical observations")
     baseline_inspect.add_argument("--config", required=True)
     baseline_inspect.add_argument("--plan", required=True)
+    baseline_inspect.add_argument("--source-markdown")
+    baseline_inspect.add_argument("--ownership-map")
     baseline_inspect.add_argument("--output")
     baseline_inspect.add_argument(
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -150,6 +152,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     baseline_approve = baseline_sub.add_parser("approve", help="persist explicit approved baseline decisions")
     baseline_approve.add_argument("--config", required=True)
     baseline_approve.add_argument("--plan", required=True)
+    baseline_approve.add_argument("--source-markdown")
+    baseline_approve.add_argument("--ownership-map")
     baseline_approve.add_argument("--observation", required=True)
     baseline_approve.add_argument("--decisions", required=True)
     baseline_approve.add_argument("--approval-decision-ref", required=True)
@@ -427,6 +431,7 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
         inspect_baseline,
     )
     from .config import load_config
+    from .importers import import_tier2_markdown, load_ownership_map
     from .plan import load_normalized_plan
     from .security import atomic_write_private_text
     from .state_store import StateStoreError
@@ -434,7 +439,13 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     _setup_logging(args.log_level or cfg.observability.log_level)
     try:
-        plan = load_normalized_plan(args.plan, cfg)
+        if bool(args.source_markdown) != bool(args.ownership_map):
+            raise BaselineError("--source-markdown and --ownership-map must be supplied together")
+        if args.source_markdown:
+            ownership = load_ownership_map(args.ownership_map, cfg)
+            plan = import_tier2_markdown(args.source_markdown, args.plan, cfg, ownership)
+        else:
+            plan = load_normalized_plan(args.plan, cfg)
         if args.baseline_command == "inspect":
             observation = inspect_baseline(plan, cfg)
             payload = observation.model_dump_json(indent=2) + "\n"

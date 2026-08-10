@@ -117,6 +117,19 @@ whether those hashes constitute sufficient review proof.
 Private reference migration remains separately authorized work and is not
 performed by the public example.
 
+When the source document has a table of steps, pass the source table and an
+explicit ownership map:
+
+```bash
+dispatcher baseline inspect --config <project.yaml> --plan <sidecar.yaml> \
+  --source-markdown <roles-table.md> --ownership-map <ownership-map.yaml>
+```
+
+The importer requires one registered repository per step. Explicit repository
+names in the source must agree with the sidecar and map; rows without a
+repository fail unless the ownership map supplies one. The map is a project
+local input and is not a baseline decision.
+
 ## Unsupported Lifecycle Operations
 
 There is no `cancel` command and no authoritative-state `archive` command.
