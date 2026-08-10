@@ -23,6 +23,18 @@ No T2 repository or production project was used.
 - Worker prompts now include configured evidence roots, reducing ambiguity about
   where required evidence files must be written.
 
+## Important Result
+
+The real model did perform the disposable file edits and Git commits. In some
+runs its final chat response was a short natural-language success response
+rather than the required schema-v1 result object. The disposable harness then
+validated the actual files, evidence, and commit and shaped a typed result for
+the workflow test. This proves real repository mutation and integration, but it
+does **not** close the strict model-response gate for T2. Production real
+operation must reject such a response, so the next readiness action is to make
+the real model reliably return the strict typed result directly (or add a
+provider-supported structured-output mechanism) before T2 execution.
+
 ## Safety
 
 - The disposable suite is gated by `DISPATCHER_REAL_DISPOSABLE=1` and is skipped
