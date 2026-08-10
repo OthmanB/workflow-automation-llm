@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -322,6 +323,7 @@ def run_session(
     termination_grace_seconds: int,
     max_output_bytes: int,
     state_dir: str | Path,
+    credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None = None,
     require_response: bool = True,
     snapshot_dirs: list[str] | None = None,
@@ -354,6 +356,7 @@ def run_session(
     child_env = build_child_environment(
         os.environ,
         state_dir=state_dir,
+        credential_state_dir=credential_state_dir,
         permission_config=permission_config,
     )
 
@@ -520,6 +523,7 @@ def build_child_environment(
     parent_environment: Mapping[str, str],
     *,
     state_dir: str | Path,
+    credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None,
 ) -> dict[str, str]:
     """Build an isolated environment without inherited credentials or OpenCode state."""
@@ -528,6 +532,22 @@ def build_child_environment(
     config_home = ensure_private_directory(home / ".config")
     cache_home = ensure_private_directory(home / ".cache")
     data_home = ensure_private_directory(home / ".local" / "share")
+    if credential_state_dir is not None:
+        credential_auth = (
+            Path(credential_state_dir)
+            / "opencode-child"
+            / "home"
+            / ".local"
+            / "share"
+            / "opencode"
+            / "auth.json"
+        )
+        if credential_auth.is_file():
+            target_auth_dir = ensure_private_directory(data_home / "opencode")
+            target_auth = target_auth_dir / "auth.json"
+            if credential_auth.resolve() != target_auth.resolve():
+                shutil.copy2(credential_auth, target_auth)
+            target_auth.chmod(0o600)
     state_home = ensure_private_directory(home / ".local" / "state")
 
     environment = {

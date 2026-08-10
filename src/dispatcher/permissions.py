@@ -22,7 +22,15 @@ _ACTION_RULES: dict[str, dict[str, PermissionDecision | dict[str, PermissionDeci
             "mypy *": "allow",
         }
     },
-    "commit": {"bash": {"git commit *": "allow"}},
+    "commit": {
+        "bash": {
+            "git add *": "allow",
+            "git status *": "allow",
+            "git diff *": "allow",
+            "git rev-parse *": "allow",
+            "git commit *": "allow",
+        }
+    },
     "push": {"bash": {"git push *": "allow"}},
     "force_push": {"bash": {"git push --force *": "allow"}},
     "create_branch": {"bash": {"git branch *": "allow"}},

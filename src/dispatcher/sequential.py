@@ -365,6 +365,7 @@ class SequentialWorkflow:
             repository=repository_before.dispatch_coordinate(
                 base_branch=workspace_group.base_branch if workspace_group is not None else None
             ),
+            evidence_roots=self.config.repository(step.repo_id).evidence_roots,
             review_target=review_target,
         )
         dispatch = DispatchRecord(
@@ -570,6 +571,7 @@ class SequentialWorkflow:
                 repository=repository_before.dispatch_coordinate(
                     base_branch=workspace_group.base_branch if workspace_group is not None else None
                 ),
+                evidence_roots=self.config.repository(step.repo_id).evidence_roots,
                 review_target=review_target,
             )
             dispatch = DispatchRecord(
@@ -2053,6 +2055,7 @@ def _worker_prompt(
     step: PlanStep,
     task: str,
     repository: DispatchRepositoryCoordinate,
+    evidence_roots: list[str],
     review_target: ReviewTarget | None,
 ) -> str:
     """Render the exact machine context a worker needs to return a typed result."""
@@ -2071,6 +2074,7 @@ def _worker_prompt(
             "remote_name": repository.remote_name,
             "remote_url": repository.remote_url,
             "task": task,
+            "evidence_roots": evidence_roots,
             "authorized_actions": list(step.authorization.authorized_actions),
             "acceptance_criteria": [
                 criterion.model_dump(mode="json") for criterion in step.acceptance_criteria

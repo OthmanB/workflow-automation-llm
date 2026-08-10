@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 from typing import Any
 
@@ -180,6 +181,7 @@ class SequentialExecutionCoordinator:
             str(prepared.workdir / evidence_root)
             for evidence_root in repository.evidence_roots
         ]
+        worker_state_dir = Path(self.config.state_dir) / "opencode-dispatches" / prepared.dispatch.dispatch_id
         try:
             result = self._session_runner(
                 prompt=prepared.prompt,
@@ -196,7 +198,8 @@ class SequentialExecutionCoordinator:
                 timeout_seconds=self.config.execution.timeout_seconds,
                 termination_grace_seconds=self.config.execution.termination_grace_seconds,
                 max_output_bytes=self.config.execution.max_output_bytes,
-                state_dir=self.config.state_dir,
+                state_dir=worker_state_dir,
+                credential_state_dir=self.config.state_dir,
                 permission_config=prepared.permission_config,
                 snapshot_dirs=snapshot_dirs,
                 lifecycle=SessionLifecycleCallbacks(process_started, session_identified),
