@@ -12,10 +12,10 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from .config import Config, ContractModel, Identifier
-from .plan import NormalizedPlan, Sha256, verify_plan_sources
+from .plan import NormalizedPlan, PlanApproval, Sha256, verify_plan_sources
 from .policy import compile_run_policy
 from .state_store import StateStore
-from .workflow import RunRecord, StepStatus, TransitionEvent, transition_step
+from .workflow import RunRecord, StepStatus, TransitionEvent, new_run_record, transition_step
 
 BASELINE_IMPORTER_VERSION: Literal["baseline-v2"] = "baseline-v2"
 
@@ -273,6 +273,27 @@ def hydrate_run_from_baseline(record: RunRecord, approval: BaselineApproval) -> 
             )
         updated_at = event.occurred_at
     return record.model_copy(update={"steps": steps, "sequence": sequence, "updated_at": updated_at})
+
+
+def create_run_from_baseline(
+    *,
+    run_id: str,
+    plan: NormalizedPlan,
+    config: Config,
+    plan_approval: PlanApproval,
+    baseline_approval: BaselineApproval,
+    event: TransitionEvent,
+) -> RunRecord:
+    """Create a NEW run whose first activation begins at baseline Pending work only."""
+    record = new_run_record(
+        run_id=run_id,
+        project_id=config.project_id,
+        config_digest=config.config_digest,
+        plan=plan,
+        plan_approval=plan_approval,
+        event=event,
+    )
+    return hydrate_run_from_baseline(record, baseline_approval)
 
 
 def _validate_observation(observation: BaselineObservation, plan: NormalizedPlan, config: Config) -> None:
