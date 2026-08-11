@@ -20,6 +20,7 @@ _PATCH = "b" * 64
 def _executor_result(outcome: str = "completed") -> dict[str, Any]:
     result: dict[str, Any] = {
         "result_version": 1,
+        "response_contract": "dispatcher.executor_result.v1",
         "dispatch_id": "dispatch-one",
         "attempt": 1,
         "step_id": "prepare-fixture",
@@ -65,6 +66,7 @@ def _review_target() -> dict[str, Any]:
 def _review_result(verdict: str = "accepted") -> dict[str, Any]:
     result: dict[str, Any] = {
         "result_version": 1,
+        "response_contract": "dispatcher.reviewer_result.v1",
         "dispatch_id": "review-dispatch",
         "attempt": 1,
         "step_id": "prepare-fixture",
@@ -166,3 +168,40 @@ def test_reviewer_result_rejects_wrong_immutable_target() -> None:
 
     with pytest.raises(ResultError, match="target does not match"):
         validate_reviewer_result_context(result, expectation)
+
+
+def test_executor_requires_exact_response_contract_and_nonblank_summary() -> None:
+    missing = _executor_result()
+    missing.pop("response_contract")
+    with pytest.raises(ResultError, match="response_contract"):
+        parse_executor_result(missing)
+
+    wrong = _executor_result()
+    wrong["response_contract"] = "executor-result-v1"
+    with pytest.raises(ResultError, match="response_contract"):
+        parse_executor_result(wrong)
+
+    blank = _executor_result()
+    blank["summary"] = ""
+    with pytest.raises(ResultError, match="summary"):
+        parse_executor_result(blank)
+
+
+def test_reviewer_requires_exact_response_contract_and_nonblank_summary() -> None:
+    missing = _review_result()
+    missing.pop("response_contract")
+    with pytest.raises(ResultError, match="response_contract"):
+        parse_reviewer_result(missing)
+
+    blank = _review_result()
+    blank["summary"] = ""
+    with pytest.raises(ResultError, match="summary"):
+        parse_reviewer_result(blank)
+
+
+def test_executor_rejects_valid_json_that_omits_attempt() -> None:
+    values = _executor_result()
+    values.pop("attempt")
+
+    with pytest.raises(ResultError, match="attempt"):
+        parse_executor_result(values)

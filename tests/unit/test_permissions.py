@@ -32,7 +32,16 @@ def test_dispatch_authorization_tightens_the_effective_executor_policy(tmp_path:
         "grep": "allow",
         "edit": "deny",
         "write": "deny",
-        "bash": {"pytest *": "deny", "ruff *": "deny", "mypy *": "deny"},
+        "bash": {
+            "pytest *": "deny",
+            "ruff *": "deny",
+            "mypy *": "deny",
+            "shasum *": "deny",
+            "sha256sum *": "deny",
+            "ls *": "deny",
+            "wc *": "deny",
+            "stat *": "deny",
+        },
     }
     assert should_auto_approve(rules)
     assert generate_opencode_config(rules)["permission"]["*"] == "deny"

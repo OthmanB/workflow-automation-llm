@@ -282,6 +282,7 @@ def _workspace_executor_runner(**kwargs: Any) -> SessionResult:
         chat_response=json.dumps(
             {
                 "result_version": 1,
+                "response_contract": "dispatcher.executor_result.v1",
                 "dispatch_id": prompt["dispatch_id"],
                 "attempt": prompt["attempt"],
                 "step_id": step_id,

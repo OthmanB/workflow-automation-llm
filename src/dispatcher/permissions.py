@@ -20,6 +20,11 @@ _ACTION_RULES: dict[str, dict[str, PermissionDecision | dict[str, PermissionDeci
             "pytest *": "allow",
             "ruff *": "allow",
             "mypy *": "allow",
+            "shasum *": "allow",
+            "sha256sum *": "allow",
+            "ls *": "allow",
+            "wc *": "allow",
+            "stat *": "allow",
         }
     },
     "commit": {

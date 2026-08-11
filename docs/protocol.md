@@ -131,12 +131,17 @@ one validated decision transactionally.
 Executor results are typed JSON objects discriminated by `outcome`:
 `completed`, `blocked`, or `failed`. Every result includes:
 
+- `response_contract: "dispatcher.executor_result.v1"` exactly;
 - `result_version`, `dispatch_id`, `attempt`, and `step_id`;
 - repository ID, base revision, and result revision or patch hash;
 - evidence artifacts with content hashes;
 - verification results;
 - a concise summary; and
 - an optional transcript reference.
+
+The response must be one JSON object, with no prose or Markdown fences. Required
+strings cannot be empty. The dispatcher first parses JSON and then validates the
+full schema; valid JSON with missing or incorrect fields is rejected.
 
 `blocked` results require nonempty `blockers`. `failed` results require a stable
 `failure_code`. The dispatcher rejects a result whose dispatch ID, attempt, step
@@ -155,6 +160,9 @@ bound to an immutable review target containing the executor dispatch ID, attempt
 result revision or patch hash, and reviewed evidence hashes.
 
 `accepted` cannot contain a blocking finding or required remediation.
+Every reviewer result must contain the exact
+`response_contract: "dispatcher.reviewer_result.v1"` field. It must be one JSON
+object with no prose or Markdown fences; required strings cannot be empty.
 `changes_requested` requires remediation. `blocked` requires blockers.
 `inconclusive` requires a reason. A review result for any other immutable target
 is retained only as supplemental evidence and cannot change step state.

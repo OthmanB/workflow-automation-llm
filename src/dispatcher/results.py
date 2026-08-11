@@ -14,6 +14,10 @@ class ResultError(ValueError):
     """A worker result is malformed or does not match its active dispatch."""
 
 
+EXECUTOR_RESPONSE_CONTRACT = "dispatcher.executor_result.v1"
+REVIEWER_RESPONSE_CONTRACT = "dispatcher.reviewer_result.v1"
+
+
 class ArtifactRecord(ContractModel):
     """Immutable evidence artifact returned by an executor or reviewer."""
 
@@ -51,6 +55,7 @@ class ExecutorResultBase(ContractModel):
     """Common fields for every executor result outcome."""
 
     result_version: Literal[1]
+    response_contract: Literal["dispatcher.executor_result.v1"]
     dispatch_id: Identifier
     attempt: Annotated[int, Field(ge=1, le=100)]
     step_id: Identifier
@@ -124,6 +129,7 @@ class ReviewerResultBase(ContractModel):
     """Common reviewer result fields, all bound to one immutable review target."""
 
     result_version: Literal[1]
+    response_contract: Literal["dispatcher.reviewer_result.v1"]
     dispatch_id: Identifier
     attempt: Annotated[int, Field(ge=1, le=100)]
     step_id: Identifier

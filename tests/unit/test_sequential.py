@@ -152,6 +152,7 @@ def _dispatch_command(role: str = "terra", mode: str = "new") -> str:
 def _executor_result(prepared: PreparedDispatch, outcome: str = "completed") -> dict[str, Any]:
     result: dict[str, Any] = {
         "result_version": 1,
+        "response_contract": "dispatcher.executor_result.v1",
         "dispatch_id": prepared.dispatch.dispatch_id,
         "attempt": prepared.dispatch.attempt,
         "step_id": "prepare-fixture",
@@ -614,6 +615,7 @@ def test_thorough_profile_requires_two_distinct_fresh_reviewer_acceptances(proje
     first_result = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": first.dispatch.dispatch_id,
             "attempt": first.dispatch.attempt,
             "step_id": "prepare-fixture",
@@ -698,6 +700,7 @@ def test_conflicting_reviews_require_a_fresh_tie_break_on_the_same_artifact(proj
     accepted = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": first.dispatch.dispatch_id,
             "attempt": first.dispatch.attempt,
             "step_id": "prepare-fixture",
@@ -730,6 +733,7 @@ def test_conflicting_reviews_require_a_fresh_tie_break_on_the_same_artifact(proj
     changes_requested = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": second.dispatch.dispatch_id,
             "attempt": second.dispatch.attempt,
             "step_id": "prepare-fixture",
@@ -820,6 +824,7 @@ def test_review_escalation_waits_for_reassignment_without_resetting_attempts(pro
     changes = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": reviewer.dispatch.dispatch_id,
             "attempt": reviewer.dispatch.attempt,
             "step_id": "prepare-fixture",
@@ -984,6 +989,7 @@ def test_reviewer_acceptance_is_fresh_policy_bound_and_revision_bound(project: F
     review_result = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": reviewer.dispatch.dispatch_id,
             "attempt": reviewer.dispatch.attempt,
             "step_id": "prepare-fixture",
@@ -1025,6 +1031,7 @@ def test_reviewer_changes_requested_returns_a_deterministic_rework_state(project
     review_result = parse_reviewer_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.reviewer_result.v1",
             "dispatch_id": reviewer.dispatch.dispatch_id,
             "attempt": reviewer.dispatch.attempt,
             "step_id": "prepare-fixture",

@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
@@ -36,6 +37,8 @@ from .repository import (
     validate_review_snapshot,
 )
 from .results import (
+    EXECUTOR_RESPONSE_CONTRACT,
+    REVIEWER_RESPONSE_CONTRACT,
     ExecutorCompletedResult,
     ExecutorResult,
     ResultError,
@@ -2075,7 +2078,56 @@ def _worker_prompt(
             "remote_url": repository.remote_url,
             "task": task,
             "evidence_roots": evidence_roots,
+            "evidence_path_rule": (
+                "Each evidence relative_path is relative to one listed evidence_root; "
+                "do not include the evidence_root directory name in relative_path."
+            ),
             "authorized_actions": list(step.authorization.authorized_actions),
+            "response_contract": (
+                EXECUTOR_RESPONSE_CONTRACT
+                if role_kind == "executor"
+                else REVIEWER_RESPONSE_CONTRACT
+            ),
+            "response_contract_rule": (
+                "MUST return exactly one JSON object with a required response_contract field equal to "
+                f"{EXECUTOR_RESPONSE_CONTRACT}; MUST NOT return prose, Markdown, or code fences."
+                if role_kind == "executor"
+                else "MUST return exactly one JSON object with a required response_contract field equal to "
+                f"{REVIEWER_RESPONSE_CONTRACT}; MUST NOT return prose, Markdown, or code fences."
+            ),
+            "required_response_fields": (
+                [
+                    "response_contract",
+                    "result_version",
+                    "dispatch_id",
+                    "attempt",
+                    "step_id",
+                    "repository",
+                    "evidence",
+                    "verification",
+                    "summary",
+                    "outcome",
+                ]
+                if role_kind == "executor"
+                else [
+                    "response_contract",
+                    "result_version",
+                    "dispatch_id",
+                    "attempt",
+                    "step_id",
+                    "repo_id",
+                    "review_target",
+                    "findings",
+                    "verification",
+                    "required_remediation",
+                    "summary",
+                    "verdict",
+                ]
+            ),
+            "final_response_check": (
+                "Before sending, verify the JSON object contains every item in required_response_fields, "
+                "especially response_contract and attempt. Missing, null, empty, or renamed fields are invalid."
+            ),
             "acceptance_criteria": [
                 criterion.model_dump(mode="json") for criterion in step.acceptance_criteria
             ],
@@ -2085,16 +2137,86 @@ def _worker_prompt(
             "review_target": (
                 review_target.model_dump(mode="json") if review_target is not None else None
             ),
-            "response_contract": (
-                "Return exactly one schema-v1 executor result JSON object."
-                if role_kind == "executor"
-                else "Return exactly one schema-v1 reviewer result JSON object."
+            "response_template": _worker_response_template(
+                role_kind=role_kind,
+                contract=(
+                    EXECUTOR_RESPONSE_CONTRACT
+                    if role_kind == "executor"
+                    else REVIEWER_RESPONSE_CONTRACT
+                ),
+                dispatch_id=dispatch_id,
+                attempt=attempt,
+                step_id=step.step_id,
+                repo_id=step.repo_id,
+                base_revision=repository.base_revision,
+                evidence_requirements=step.evidence_requirements,
+                review_target=review_target,
             ),
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _worker_response_template(
+    *,
+    role_kind: Literal["executor", "reviewer"],
+    contract: str,
+    dispatch_id: str,
+    attempt: int,
+    step_id: str,
+    repo_id: str,
+    base_revision: str,
+    evidence_requirements: Iterable[Any],
+    review_target: ReviewTarget | None,
+) -> dict[str, Any]:
+    """Give workers a concrete response shape instead of an undocumented schema name."""
+    if role_kind == "executor":
+        return {
+            "response_contract": contract,
+            "result_version": 1,
+            "dispatch_id": dispatch_id,
+            "attempt": attempt,
+            "step_id": step_id,
+            "repository": {
+                "repo_id": repo_id,
+                "base_revision": base_revision,
+                "result_revision": "<non-empty Git revision>",
+                "patch_sha256": None,
+            },
+            "evidence": [
+                {
+                    "artifact_id": requirement.artifact_id,
+                    "relative_path": requirement.relative_path,
+                    "sha256": "<64 lowercase hexadecimal characters>",
+                    "media_type": requirement.media_type,
+                    "size_bytes": 0,
+                }
+                for requirement in evidence_requirements
+            ],
+            "verification": [
+                {"check_id": "<non-empty check ID>", "status": "passed", "summary": "<non-empty summary>"}
+            ],
+            "summary": "<non-empty summary>",
+            "outcome": "completed",
+        }
+    return {
+        "response_contract": contract,
+        "result_version": 1,
+        "dispatch_id": dispatch_id,
+        "attempt": attempt,
+        "step_id": step_id,
+        "repo_id": repo_id,
+        "review_target": review_target.model_dump(mode="json") if review_target is not None else {},
+        "findings": [],
+        "verification": [
+            {"check_id": "<non-empty check ID>", "status": "passed", "summary": "<non-empty summary>"}
+        ],
+        "required_remediation": [],
+        "summary": "<non-empty summary>",
+        "verdict": "accepted",
+    }
 
 
 def _validate_executor_result(result: ExecutorResult, dispatch: DispatchRecord) -> None:

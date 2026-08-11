@@ -186,6 +186,7 @@ def _executor_result(
     return parse_executor_result(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.executor_result.v1",
             "dispatch_id": "dispatch-one",
             "attempt": 1,
             "step_id": "prepare-fixture",

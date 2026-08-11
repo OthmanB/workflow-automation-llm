@@ -85,6 +85,11 @@
         "repository": {
           "$ref": "#/$defs/RepositoryCoordinate"
         },
+        "response_contract": {
+          "const": "dispatcher.executor_result.v1",
+          "title": "Response Contract",
+          "type": "string"
+        },
         "result_version": {
           "const": 1,
           "title": "Result Version",
@@ -124,6 +129,7 @@
       },
       "required": [
         "result_version",
+        "response_contract",
         "dispatch_id",
         "attempt",
         "step_id",
@@ -167,6 +173,11 @@
         "repository": {
           "$ref": "#/$defs/RepositoryCoordinate"
         },
+        "response_contract": {
+          "const": "dispatcher.executor_result.v1",
+          "title": "Response Contract",
+          "type": "string"
+        },
         "result_version": {
           "const": 1,
           "title": "Result Version",
@@ -206,6 +217,7 @@
       },
       "required": [
         "result_version",
+        "response_contract",
         "dispatch_id",
         "attempt",
         "step_id",
@@ -253,6 +265,11 @@
         "repository": {
           "$ref": "#/$defs/RepositoryCoordinate"
         },
+        "response_contract": {
+          "const": "dispatcher.executor_result.v1",
+          "title": "Response Contract",
+          "type": "string"
+        },
         "result_version": {
           "const": 1,
           "title": "Result Version",
@@ -292,6 +309,7 @@
       },
       "required": [
         "result_version",
+        "response_contract",
         "dispatch_id",
         "attempt",
         "step_id",

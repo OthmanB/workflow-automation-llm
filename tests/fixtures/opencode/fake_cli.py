@@ -171,6 +171,7 @@ def _executor_response(
     revision = _git_head(workdir)
     return {
         "result_version": 1,
+        "response_contract": "dispatcher.executor_result.v1",
         "dispatch_id": payload["dispatch_id"],
         "attempt": attempt,
         "step_id": payload["step_id"],
@@ -214,6 +215,7 @@ def _reviewer_response(
     remediation = ["set the fixture to its second value"] if attempt == 1 else []
     return {
         "result_version": 1,
+        "response_contract": "dispatcher.reviewer_result.v1",
         "dispatch_id": payload["dispatch_id"],
         "attempt": attempt,
         "step_id": payload["step_id"],

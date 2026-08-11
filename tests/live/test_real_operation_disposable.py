@@ -11,7 +11,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MethodType
-from typing import Any
 
 import pytest
 from helpers import config_values, create_fixture_project, valid_plan_values, write_config
@@ -20,9 +19,7 @@ from dispatcher.execution import SequentialExecutionCoordinator, SupervisorOutco
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.sequential import PreparedDispatch, SequentialWorkflow
 from dispatcher.sessions import (
-    SessionResult,
     cancel_process_group,
-    run_session,
 )
 from dispatcher.state import open_state_store
 from dispatcher.workflow import TransitionEvent, new_run_record
@@ -38,7 +35,7 @@ def test_real_sequential_disposable_repository_operation(tmp_path: Path) -> None
 
     assert outcome.accepted is True
     _assert_clean_repository(project.repository)
-    assert (project.repository / "result.txt").read_text(encoding="utf-8") == "REAL_DISPOSABLE_OK\n"
+    assert (project.repository / "result.txt").read_text(encoding="utf-8").strip() == "REAL_DISPOSABLE_OK"
     assert (project.repository / "evidence" / "real-evidence.md").is_file()
 
 
@@ -186,7 +183,6 @@ def _run_real_scenario(project, plan: NormalizedPlan, commands: list[str]):
         store,
         workflow,
         owner_id=f"real-disposable-{project.root.name}",
-        session_runner=_live_worker_session_runner,
     )
     responses = iter(commands)
 
@@ -286,69 +282,6 @@ def _batch_commands(first: str, second: str) -> list[str]:
 
 def _dispatch(step_id: str, role: str, prompt: str) -> str:
     return json.dumps({"protocol_version": 1, "action": "dispatch", "step_id": step_id, "target_role": role, "session_mode": "new", "prompt": prompt})
-
-
-def _live_worker_session_runner(**kwargs: Any) -> SessionResult:
-    """Use a real model session, then validate and shape the disposable fixture result."""
-    result = run_session(**kwargs)
-    try:
-        payload = json.loads(result.chat_response)
-    except json.JSONDecodeError:
-        payload = {}
-    if payload.get("outcome") in {"completed", "accepted"}:
-        return result
-    prompt = json.loads(kwargs["prompt"])
-    workdir = Path(kwargs["workdir"])
-    if prompt["result_kind"] == "executor":
-        evidence_path = (
-            workdir
-            / prompt["evidence_roots"][0]
-            / prompt["evidence_requirements"][0]["relative_path"]
-        )
-        result_path = workdir / ("result-second.txt" if prompt["step_id"] == "prepare-second" else "result.txt")
-        assert result_path.read_text(encoding="utf-8").strip() == "REAL_DISPOSABLE_OK"
-        assert evidence_path.is_file()
-        revision = _git(workdir, "rev-parse", "HEAD")
-        payload = {
-            "result_version": 1,
-            "dispatch_id": prompt["dispatch_id"],
-            "attempt": prompt["attempt"],
-            "step_id": prompt["step_id"],
-            "repository": {
-                "repo_id": prompt["repo_id"],
-                "base_revision": prompt["base_revision"],
-                "result_revision": revision,
-                "patch_sha256": None,
-            },
-            "evidence": [
-                {
-                    "artifact_id": item["artifact_id"],
-                    "relative_path": item["relative_path"],
-                    "sha256": __import__("hashlib").sha256(evidence_path.read_bytes()).hexdigest(),
-                    "media_type": item["media_type"],
-                    "size_bytes": evidence_path.stat().st_size,
-                }
-                for item in prompt["evidence_requirements"]
-            ],
-            "verification": [{"check_id": "real-disposable", "status": "passed", "summary": "verified by harness"}],
-            "summary": "real disposable executor result validated by harness",
-            "outcome": "completed",
-        }
-    else:
-        payload = {
-            "result_version": 1,
-            "dispatch_id": prompt["dispatch_id"],
-            "attempt": prompt["attempt"],
-            "step_id": prompt["step_id"],
-            "repo_id": prompt["repo_id"],
-            "review_target": prompt["review_target"],
-            "findings": [],
-            "verification": [{"check_id": "real-disposable-review", "status": "passed", "summary": "reviewed by harness"}],
-            "required_remediation": [],
-            "summary": "real disposable reviewer result validated by harness",
-            "verdict": "accepted",
-        }
-    return replace(result, chat_response=json.dumps(payload))
 
 
 def _install_auth(state_dir: Path) -> None:

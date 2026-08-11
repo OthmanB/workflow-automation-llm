@@ -86,6 +86,7 @@ def test_baseline_backed_run_dispatches_only_the_first_dependency_ready_pending_
     completed = ExecutorCompletedResult.model_validate(
         {
             "result_version": 1,
+            "response_contract": "dispatcher.executor_result.v1",
             "dispatch_id": running.dispatch.dispatch_id,
             "attempt": running.dispatch.attempt,
             "step_id": "pending-final",
