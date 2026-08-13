@@ -96,33 +96,15 @@ Extend the current strict project configuration model in place while retaining:
 schema_version: 2
 ```
 
-Add one required top-level `mcp` section and one required `mcp_tools` list to
-each role. Existing project configs and test fixtures are updated directly; no
-runtime compatibility inference is needed.
+The top-level `mcp` section and role `mcp_tools` lists are optional. Omission
+inherits the operator's normal OpenCode MCP definitions and the default research
+catalog. Explicit project MCP configuration takes precedence; an empty registry
+disables MCP.
 
 Conceptual shape:
 
 ```yaml
 schema_version: 2
-
-mcp:
-  environment_passthrough: []
-  servers:
-    context7:
-      type: remote
-      url: https://mcp.context7.com/mcp
-      enabled: true
-      headers: {}
-    repomix:
-      type: local
-      command: [<configured-repomix-command>]
-      enabled: true
-      environment: {}
-    semble:
-      type: local
-      command: [<configured-semble-command>]
-      enabled: true
-      environment: {}
 
 roles:
   supervisor:
@@ -131,22 +113,11 @@ roles:
       variant: standard
       display: Supervisor
       permission_policy: supervisor
-      mcp_tools:
-        - context7_resolve-library-id
-        - context7_query-docs
-        - repomix_pack_codebase
-        - repomix_pack_remote_repository
-        - repomix_attach_packed_output
-        - repomix_read_repomix_output
-        - repomix_grep_repomix_output
-        - repomix_file_system_read_directory
-        - repomix_file_system_read_file
-        - semble_search
-        - semble_find_related
 ```
 
-Use the actual working local commands in the operator's project YAML. Test
-fixtures use a deterministic fixture MCP server and never contact live services.
+The minimal inherited form above uses the operator's existing OpenCode server
+commands. Explicit project registries remain supported for overrides and
+deterministic tests.
 
 ### Minimal Validation
 

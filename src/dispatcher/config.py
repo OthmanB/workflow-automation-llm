@@ -152,6 +152,7 @@ MCP_TOOL_CATALOG: dict[str, str] = {
     "semble_search": "semble",
     "semble_find_related": "semble",
 }
+DEFAULT_INHERITED_MCP_TOOLS = tuple(MCP_TOOL_CATALOG)
 
 
 def _validate_mcp_environment_names(values: tuple[str, ...], location: str) -> None:
@@ -224,7 +225,7 @@ class RoleDefinition(ContractModel):
     variant: Annotated[str, Field(min_length=1, max_length=100)]
     display: Annotated[str, Field(min_length=1, max_length=200)]
     permission_policy: Identifier
-    mcp_tools: tuple[MCPToolName, ...]
+    mcp_tools: tuple[MCPToolName, ...] = ()
 
     @field_validator("mcp_tools", mode="before")
     @classmethod
@@ -487,7 +488,7 @@ class ProjectConfigModel(ContractModel):
     permission_policies: PermissionPoliciesDefinition
     evidence: EvidencePolicy
     preflight: PreflightDefinition | None = None
-    mcp: MCPRegistry
+    mcp: MCPRegistry | None = None
 
     @model_validator(mode="after")
     def validate_references(self) -> Self:
@@ -549,6 +550,8 @@ class ProjectConfigModel(ContractModel):
                     raise ValueError(
                         f"roles.{role_key}.mcp_tools tool {tool!r} is not in the configured MCP tool catalog"
                     )
+                if self.mcp is None:
+                    continue
                 server = self.mcp.servers.get(server_key)
                 if server is None:
                     raise ValueError(

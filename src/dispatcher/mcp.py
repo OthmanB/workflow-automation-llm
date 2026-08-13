@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .config import MCP_TOOL_CATALOG, Config, MCPServerDefinition
+from .config import DEFAULT_INHERITED_MCP_TOOLS, MCP_TOOL_CATALOG, Config, MCPServerDefinition
 
 __all__ = [
     "MCPCompileError",
     "collect_role_mcp_environment",
     "compile_mcp_permissions",
     "compile_role_mcp_servers",
+    "inherits_global_mcp_config",
     "resolve_role_mcp_tools",
 ]
 
@@ -21,7 +22,15 @@ class MCPCompileError(ValueError):
 
 def resolve_role_mcp_tools(config: Config, role_key: str) -> tuple[str, ...]:
     """Return the exact ordered MCP tool list configured for one role."""
-    return config.role(role_key).mcp_tools
+    tools = config.role(role_key).mcp_tools
+    if config.model.mcp is None and not tools:
+        return DEFAULT_INHERITED_MCP_TOOLS
+    return tools
+
+
+def inherits_global_mcp_config(config: Config) -> bool:
+    """Return whether workers should load the operator's OpenCode configuration."""
+    return config.model.mcp is None
 
 
 def _selected_servers(
@@ -30,6 +39,8 @@ def _selected_servers(
     *,
     role_key: str,
 ) -> dict[str, MCPServerDefinition]:
+    if config.model.mcp is None:
+        return {}
     servers: dict[str, MCPServerDefinition] = {}
     for tool in tools:
         server_key = MCP_TOOL_CATALOG.get(tool)
@@ -48,6 +59,8 @@ def _selected_servers(
 
 def compile_role_mcp_servers(config: Config, role_key: str) -> dict[str, Any]:
     """Compile the OpenCode ``mcp`` object containing only servers the role uses."""
+    if inherits_global_mcp_config(config):
+        return {}
     tools = resolve_role_mcp_tools(config, role_key)
     servers = _selected_servers(config, tools, role_key=role_key)
     compiled: dict[str, Any] = {}
@@ -79,5 +92,7 @@ def compile_mcp_permissions(config: Config, role_key: str) -> dict[str, str]:
 
 def collect_role_mcp_environment(config: Config, role_key: str) -> tuple[str, ...]:
     """Return the configured passthrough environment variable names."""
+    del role_key
+    if config.model.mcp is None:
+        return ()
     return config.model.mcp.environment_passthrough
-

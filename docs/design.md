@@ -145,10 +145,10 @@ Roles from the sanitized reference workflow:
 
 ### 3.1 Research MCP tools
 
-Step 21-lite introduces a small managed MCP catalog because isolated worker
-HOME/XDG directories do not reliably inherit the operator's normal OpenCode
-configuration. Its schema-v2 project configuration defines local or remote
-servers, and each role lists the exact research methods it receives.
+Step 21-lite uses the operator's working OpenCode MCP configuration by default
+while keeping dispatcher session/data directories isolated. Projects that need
+different servers may provide an explicit schema-v2 registry, which takes
+precedence. Each role may narrow the default research method list.
 
 The planned initial catalog provides Context7 for current library documentation,
 selected Repomix read/pack/query methods for repository context, and Semble for

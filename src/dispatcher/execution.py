@@ -13,7 +13,11 @@ from time import sleep
 from typing import Any
 
 from .config import Config
-from .mcp import collect_role_mcp_environment, compile_role_mcp_servers
+from .mcp import (
+    collect_role_mcp_environment,
+    compile_role_mcp_servers,
+    inherits_global_mcp_config,
+)
 from .permissions import (
     compile_effective_policy,
     generate_opencode_config,
@@ -168,6 +172,7 @@ class SequentialExecutionCoordinator:
             state_dir=self.config.state_dir,
             permission_config=permission,
             environment_passthrough=collect_role_mcp_environment(self.config, role_key),
+            inherit_opencode_config=inherits_global_mcp_config(self.config),
             snapshot_dirs=[],
         )
         record, generation = self.store.load_run(run_id)
@@ -247,6 +252,7 @@ class SequentialExecutionCoordinator:
                 environment_passthrough=collect_role_mcp_environment(
                     self.config, prepared.dispatch.role_key
                 ),
+                inherit_opencode_config=inherits_global_mcp_config(self.config),
                 snapshot_dirs=snapshot_dirs,
                 lifecycle=SessionLifecycleCallbacks(process_started, session_identified),
             )

@@ -5,19 +5,22 @@
 
 ## Status
 
-Implementation code-complete on schema-v2 project configuration; the three
-manual real-tool smoke calls remain pending (see Manual Smoke below).
+Implementation code-complete on schema-v2 project configuration. The operator's
+installed Context7, Repomix, and Semble servers are inherited by default; three
+manual model-tool smoke calls remain pending.
 
 ## Configuration
 
-- Required top-level `mcp` section: `environment_passthrough` (environment
-  variable names copied into the isolated child environment; a missing name
-  fails before OpenCode launch) and a `servers` registry.
+- Omitted `mcp` inherits the operator's OpenCode configuration directory and
+  process environment while retaining dispatcher-owned session/data paths.
+- An explicit `mcp` section takes precedence and provides
+  `environment_passthrough` plus a server registry; an empty registry disables
+  MCP.
 - Local servers: `type: local`, non-empty argv `command` (no shell strings),
   optional `environment`, `enabled`. Remote servers: `type: remote`,
   http/https `url`, optional `headers`, `enabled`.
-- Required `mcp_tools` list on every role; every tool must be in the explicit
-  dispatcher catalog:
+- Empty or omitted role `mcp_tools` receives the default catalog; a nonempty
+  list narrows it. Every tool must be in the explicit dispatcher catalog:
 
   - Context7: `context7_resolve-library-id`, `context7_query-docs`
   - Repomix: pack codebase/remote, attach/read/grep packed output, file-system
@@ -58,22 +61,28 @@ naming convention. The reviewer independently confirmed that pinned OpenCode
 model-driven invocation capture (calling `fixture_echo` while `fixture_probe`
 is denied) remains gated behind the existing live environment gates.
 
+Pinned OpenCode 1.18.11 was also launched with dispatcher-style isolated
+HOME/XDG paths plus inherited `OPENCODE_CONFIG_DIR`. `opencode mcp list`
+connected the operator's Context7, Repomix, Semble, GitHub, and Playwright
+servers. The dispatcher inline permission map contained only the default
+Context7, Repomix, and Semble method catalog.
+
 ## Manual Smoke — pending
 
-Three real calls remain to be recorded by the operator:
+Three model-driven calls remain to be recorded through a dispatcher workflow:
 
 1. Context7 resolves and queries one library.
 2. Repomix packs or searches this repository.
 3. Semble searches this repository.
 
-The public example enables Context7 (public URL); Repomix and Semble are
-disabled placeholders pending the operator's installed commands in the real
-project YAML. No credentials or server locations are embedded in the
-repository.
+The public example inherits the operator's existing OpenCode servers. On the
+verified operator machine, OpenCode reports Context7, Repomix, Semble, GitHub,
+and Playwright connected; dispatcher permissions expose only the default
+Context7, Repomix, and Semble catalog.
 
 ## Verification
 
-- Full non-live suite: `529 passed, 10 deselected`.
+- Full non-live suite: `533 passed, 10 deselected`.
 - Ruff passed. MyPy passed for 34 source files.
 - `pip check`, strict `pip-audit`, `git diff --check`, wheel/sdist build, and
   strict Twine checks passed.

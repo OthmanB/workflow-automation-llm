@@ -115,6 +115,8 @@ def _check_mcp(config: Config) -> str:
     import json as _json
 
     problems: list[str] = []
+    if config.model.mcp is None:
+        return "inheriting operator OpenCode MCP configuration"
     for name in config.model.mcp.environment_passthrough:
         if name not in os.environ:
             problems.append(f"mcp passthrough environment variable {name!r} is not present")

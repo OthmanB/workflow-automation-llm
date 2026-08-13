@@ -799,6 +799,7 @@
           "type": "string"
         },
         "mcp_tools": {
+          "default": [],
           "items": {
             "pattern": "^[a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9_-]*$",
             "type": "string"
@@ -827,8 +828,7 @@
         "model",
         "variant",
         "display",
-        "permission_policy",
-        "mcp_tools"
+        "permission_policy"
       ],
       "title": "RoleDefinition",
       "type": "object"
@@ -1046,7 +1046,15 @@
       "$ref": "#/$defs/ExecutionDefinition"
     },
     "mcp": {
-      "$ref": "#/$defs/MCPRegistry"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MCPRegistry"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "observability": {
       "$ref": "#/$defs/ObservabilityDefinition"
@@ -1111,8 +1119,7 @@
     "budget",
     "observability",
     "permission_policies",
-    "evidence",
-    "mcp"
+    "evidence"
   ],
   "title": "ProjectConfigModel",
   "type": "object"

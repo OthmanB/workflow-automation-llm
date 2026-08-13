@@ -26,10 +26,11 @@ Replace ad-hoc paths and implicit defaults with a schema-v2 project YAML:
 Validate the result against `schemas/project-config-v1.json` and the public
 example before starting a run.
 
-The current executable schema does not yet accept MCP fields. Step 21-lite will
-extend schema version 2 in place with Context7, selected Repomix methods, Semble,
-and per-role lists; existing project files will then be updated directly without
-a new schema version or migration subsystem.
+Schema version 2 supports MCP without requiring project duplication. Omit `mcp`
+to inherit the operator's normal OpenCode Context7, Repomix, and Semble setup;
+add per-role lists only to narrow the default catalog. Add an explicit `mcp`
+registry only when the project needs to replace the global server definitions or
+disable MCP with an empty registry.
 
 ## Plans and Baselines
 

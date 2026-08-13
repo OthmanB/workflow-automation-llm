@@ -23,6 +23,7 @@ from dispatcher.sessions import (
     OpenCodeVersionError,
     SessionLifecycleCallbacks,
     _session_exists,
+    build_child_environment,
     cancel_process_group,
     list_sessions,
     run_session,
@@ -627,3 +628,41 @@ def test_run_session_rejects_a_missing_required_mcp_variable_before_launch(
 
     with pytest.raises(OpenCodeSessionError, match="required MCP environment variable missing"):
         run_session(**kwargs)
+
+
+def test_child_environment_inherits_operator_opencode_config_directory(
+    tmp_path: Path,
+) -> None:
+    operator_home = tmp_path / "operator"
+    config_dir = operator_home / ".config" / "opencode"
+    config_dir.mkdir(parents=True)
+
+    environment = build_child_environment(
+        {
+            "HOME": str(operator_home),
+            "PATH": "/usr/bin",
+            "MCP_API_KEY": "operator-secret",
+            "OPENCODE_CONFIG_CONTENT": "parent-inline-config",
+        },
+        state_dir=tmp_path / "state",
+        permission_config={"permission": {"*": "deny"}},
+        inherit_opencode_config=True,
+    )
+
+    assert environment["OPENCODE_CONFIG_DIR"] == str(config_dir)
+    assert environment["HOME"] != str(operator_home)
+    assert environment["MCP_API_KEY"] == "operator-secret"
+    assert environment["OPENCODE_CONFIG_CONTENT"] != "parent-inline-config"
+
+
+def test_explicit_mcp_mode_does_not_inherit_operator_config_directory(tmp_path: Path) -> None:
+    operator_home = tmp_path / "operator"
+    (operator_home / ".config" / "opencode").mkdir(parents=True)
+
+    environment = build_child_environment(
+        {"HOME": str(operator_home), "PATH": "/usr/bin"},
+        state_dir=tmp_path / "state",
+        permission_config={"permission": {"*": "deny"}, "mcp": {}},
+    )
+
+    assert "OPENCODE_CONFIG_DIR" not in environment

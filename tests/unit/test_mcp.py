@@ -9,11 +9,12 @@ from typing import Any
 import pytest
 from helpers import config_values, create_fixture_project, write_config
 
-from dispatcher.config import ConfigError, load_config
+from dispatcher.config import DEFAULT_INHERITED_MCP_TOOLS, ConfigError, load_config
 from dispatcher.mcp import (
     collect_role_mcp_environment,
     compile_mcp_permissions,
     compile_role_mcp_servers,
+    inherits_global_mcp_config,
     resolve_role_mcp_tools,
 )
 
@@ -210,3 +211,29 @@ def test_passthrough_names_are_collected_for_every_role(tmp_path: Path) -> None:
     project, config = _mcp_project(tmp_path)
     assert collect_role_mcp_environment(config, "terra") == ("FIXTURE_MCP_TOKEN",)
     assert collect_role_mcp_environment(config, "reviewer-two") == ("FIXTURE_MCP_TOKEN",)
+
+
+def test_omitted_mcp_inherits_global_servers_and_default_research_tools(tmp_path: Path) -> None:
+    project = create_fixture_project(tmp_path)
+    values = config_values(project)
+    values.pop("mcp")
+    for entries in values["roles"].values():
+        for role in entries.values():
+            role.pop("mcp_tools")
+    config = write_config(project, values)
+
+    assert inherits_global_mcp_config(config) is True
+    assert compile_role_mcp_servers(config, "terra") == {}
+    assert resolve_role_mcp_tools(config, "terra") == DEFAULT_INHERITED_MCP_TOOLS
+    assert set(compile_mcp_permissions(config, "terra")) == set(
+        resolve_role_mcp_tools(config, "terra")
+    )
+
+
+def test_explicit_mcp_registry_takes_precedence_over_global_config(tmp_path: Path) -> None:
+    project = create_fixture_project(tmp_path)
+    config = write_config(project, config_values(project))
+
+    assert inherits_global_mcp_config(config) is False
+    assert resolve_role_mcp_tools(config, "terra") == ()
+    assert compile_role_mcp_servers(config, "terra") == {}

@@ -339,15 +339,17 @@ rather than reviewer-run tests. The supervisor Markdown bootstrap advertises
 the same native inspection and exact diagnostic lists without changing its
 schema-v1 JSON response contract. Supervisors must not write target repositories.
 
-Dispatcher workers receive managed MCP definitions from schema-v2 project
-configuration: a project `mcp` section (`environment_passthrough` plus a
-`servers` registry) and an exact ordered `mcp_tools` list on every role. The
-generated child OpenCode configuration contains the selected servers and exact
-per-tool allow entries; prompts publish the same list. Isolated worker
-HOME/XDG directories remain in use, with only `environment_passthrough`
-variables passed from the parent (a missing name fails before process
-creation). Unlisted MCP methods stay denied; roles with MCP tools require a
-deny-default compiled permission policy.
+When schema-v2 project configuration omits `mcp`, dispatcher workers inherit
+the operator's normal OpenCode server configuration and process environment.
+Empty or omitted role lists resolve to the default Context7, Repomix, and Semble
+catalog; nonempty lists narrow that catalog. OpenCode data/session directories
+remain dispatcher-owned and isolated.
+
+An explicit project `mcp` section takes precedence over inherited server
+definitions. Its registry and environment passthrough are authoritative, and an
+explicit empty registry disables MCP. In both modes the generated child config
+contains exact per-tool allow entries, prompts publish the same list, unlisted
+methods stay denied, and roles with MCP tools require a deny-default policy.
 
 MCP output is non-authoritative research context. It cannot expand executor
 `writable_paths`, satisfy dispatcher acceptance checks, create evidence records,

@@ -30,11 +30,11 @@ repositories:
     allow_shared_writable_roots: false
 roles:
   supervisor:
-    supervisor-role: {model: provider/supervisor, variant: standard, display: Supervisor, permission_policy: supervisor, mcp_tools: [context7_resolve-library-id, context7_query-docs]}
+    supervisor-role: {model: provider/supervisor, variant: standard, display: Supervisor, permission_policy: supervisor}
   executors:
-    executor-role: {model: provider/executor, variant: standard, display: Executor, permission_policy: executor, mcp_tools: [context7_query-docs]}
+    executor-role: {model: provider/executor, variant: standard, display: Executor, permission_policy: executor}
   reviewers:
-    reviewer-role: {model: provider/reviewer, variant: standard, display: Reviewer, permission_policy: reviewer, mcp_tools: [context7_query-docs]}
+    reviewer-role: {model: provider/reviewer, variant: standard, display: Reviewer, permission_policy: reviewer}
 profile: {profiles_file: ./profiles.yaml, profile_id: balanced}
 execution:
   mode: mock_workflow_test
@@ -114,20 +114,12 @@ preflight:
   credentials: []
   require_git_remote: true
   disk_space_min_mb: 500
-mcp:
-  environment_passthrough: []
-  servers:
-    context7:
-      type: remote
-      enabled: true
-      url: https://mcp.context7.com/mcp
-      headers: {}
 ```
 
-The schema-version-2 contract requires a top-level `mcp` section
-(`environment_passthrough` plus a `servers` registry) and an `mcp_tools` list
-on every role definition; both are included in the examples above and in the
-public example project. See the MCP Servers and Role Tools section below.
+The schema-version-2 contract accepts optional `mcp` and per-role `mcp_tools`
+fields. Their absence selects inherited OpenCode MCP configuration and the
+default research catalog. See the MCP Servers and Role Tools section below for
+explicit override and disable forms.
 
 When `models_smoke_test` is enabled, the configured prompt must cause every
 tested model to return the exact marker `OK` after surrounding whitespace is
@@ -242,12 +234,18 @@ require at least two and cannot name duplicate reviewer roles.
 
 ## MCP Servers and Role Tools
 
-The schema-v2 project configuration carries a required top-level `mcp` section
-(an `environment_passthrough` list of environment variable names plus a
-`servers` registry) and a required `mcp_tools` list on every role. Each server
-is a strict discriminated union: `type: local` requires a non-empty argv
-`command` (never a shell string) plus optional `environment`; `type: remote`
-requires an http/https `url` plus optional `headers`. Both carry `enabled`.
+MCP has two schema-v2 modes. When the top-level `mcp` section is omitted,
+dispatcher workers load the operator's normal OpenCode configuration directory.
+An omitted or empty role `mcp_tools` list then receives the default Context7,
+Repomix, and Semble research catalog. A nonempty role list narrows the inherited
+catalog.
+
+When a top-level `mcp` section is present, it takes precedence over the global
+OpenCode MCP definitions. `environment_passthrough` names the parent variables
+copied into the minimal child environment and `servers` defines the only managed
+servers available to roles. An explicit empty registry disables MCP. Local
+servers require a nonempty argv `command`; remote servers require an HTTP(S)
+`url`. Both carry `enabled`.
 
 ```yaml
 mcp:
@@ -282,3 +280,9 @@ commands, invalid remote URLs, and duplicate passthrough names. A role's
 only the role's selected server definitions are emitted; unlisted methods keep
 the global deny (roles with MCP tools require a deny-default permission
 policy).
+
+In inherited mode, worker OpenCode data/session directories remain isolated,
+but `OPENCODE_CONFIG_DIR` points at the operator's global OpenCode configuration
+and the parent process environment is inherited so existing MCP commands and
+credential references work. The dispatcher inline permission map is merged last
+and still denies unlisted methods.

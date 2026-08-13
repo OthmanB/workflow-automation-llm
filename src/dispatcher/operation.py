@@ -13,7 +13,7 @@ from pydantic import Field
 
 from .baseline import BaselineError, validate_approved_baseline
 from .config import Config, ContractModel, Identifier, MCPToolName
-from .mcp import compile_role_mcp_servers
+from .mcp import compile_role_mcp_servers, resolve_role_mcp_tools
 from .permissions import (
     PermissionError,
     compile_effective_policy,
@@ -188,7 +188,7 @@ def compile_role_permission_manifest(
         entries[role_key] = RolePermissionEntry(
             role_kind=role_kind,
             authorized_actions=authorized_actions,
-            mcp_tools=config.role(role_key).mcp_tools,
+            mcp_tools=resolve_role_mcp_tools(config, role_key),
             digest=digest_json(permission),
         )
     repository = config.repository(repo_id)

@@ -193,16 +193,17 @@ durable state and target repository through those capabilities but may not write
 target repositories. Reviewer results, reviews, transcripts, and reports are
 stored by the dispatcher outside the immutable repository.
 
-Dispatcher workers receive managed MCP servers from schema-v2 project
-configuration: a project-level `mcp` section (`environment_passthrough` plus a
-`servers` registry) and an exact ordered `mcp_tools` list on every role. The
-initial public example enables Context7 with placeholders for Repomix and
-Semble local servers. Worker HOME/XDG directories remain isolated; the
-generated inline OpenCode config carries the selected MCP definitions, and
-only `environment_passthrough` variables are passed through (a missing name
-fails before process launch). Roles with MCP tools require a deny-default
-permission policy so unlisted methods stay denied. GitHub, Playwright, and
-`repomix_generate_skill` remain outside scope.
+If schema-v2 project configuration omits `mcp`, workers inherit the operator's
+normal OpenCode configuration and environment while keeping dispatcher-owned
+OpenCode data/session directories. Empty or omitted role `mcp_tools` receive the
+default Context7, Repomix, and Semble catalog; nonempty lists narrow it. The
+dispatcher permission map still denies unlisted methods, so inherited GitHub,
+Playwright, and `repomix_generate_skill` tools are not exposed.
+
+An explicit project `mcp` section takes precedence: only its server registry is
+emitted, only `environment_passthrough` variables are copied, and role lists are
+authoritative. An explicit empty server registry disables MCP. Roles with MCP
+tools require a deny-default permission policy so unlisted methods stay denied.
 
 This project operates as a trusted personal research tool. OpenCode permissions
 describe and constrain the intended role tool surface but are not presented as

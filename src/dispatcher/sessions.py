@@ -332,6 +332,7 @@ def run_session(
     credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None = None,
     environment_passthrough: Iterable[str] = (),
+    inherit_opencode_config: bool = False,
     require_response: bool = True,
     snapshot_dirs: list[str] | None = None,
     lifecycle: SessionLifecycleCallbacks | None = None,
@@ -366,6 +367,7 @@ def run_session(
         credential_state_dir=credential_state_dir,
         permission_config=permission_config,
         environment_passthrough=environment_passthrough,
+        inherit_opencode_config=inherit_opencode_config,
     )
 
     logger.info("opencode run model=%s variant=%s session_mode=%s", model, variant, mode)
@@ -544,6 +546,7 @@ def build_child_environment(
     credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None,
     environment_passthrough: Iterable[str] = (),
+    inherit_opencode_config: bool = False,
 ) -> dict[str, str]:
     """Build an isolated environment without inherited credentials or OpenCode state."""
     missing_required = [name for name in environment_passthrough if name not in parent_environment]
@@ -574,11 +577,17 @@ def build_child_environment(
             target_auth.chmod(0o600)
     state_home = ensure_private_directory(home / ".local" / "state")
 
-    environment = {
-        key: parent_environment[key]
-        for key in ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TERM", "TMPDIR")
-        if key in parent_environment
-    }
+    environment = (
+        dict(parent_environment)
+        if inherit_opencode_config
+        else {
+            key: parent_environment[key]
+            for key in ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TERM", "TMPDIR")
+            if key in parent_environment
+        }
+    )
+    for key in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR"):
+        environment.pop(key, None)
     environment.update(
         {
             name: parent_environment[name]
@@ -595,6 +604,20 @@ def build_child_environment(
             "XDG_STATE_HOME": str(state_home),
         }
     )
+    if inherit_opencode_config:
+        configured_dir = parent_environment.get("OPENCODE_CONFIG_DIR")
+        if configured_dir:
+            opencode_config_dir = Path(configured_dir)
+        else:
+            config_home = Path(
+                parent_environment.get(
+                    "XDG_CONFIG_HOME",
+                    str(Path(parent_environment.get("HOME", str(Path.home()))) / ".config"),
+                )
+            )
+            opencode_config_dir = config_home / "opencode"
+        if opencode_config_dir.is_dir():
+            environment["OPENCODE_CONFIG_DIR"] = str(opencode_config_dir)
     if permission_config is not None:
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
             dict(permission_config),

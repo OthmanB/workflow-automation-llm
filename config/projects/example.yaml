@@ -42,35 +42,23 @@ roles:
       variant: standard
       display: Example Supervisor
       permission_policy: supervisor
-      mcp_tools:
-        - context7_resolve-library-id
-        - context7_query-docs
   executors:
     executor:
       model: example/executor-model
       variant: standard
       display: Example Executor
       permission_policy: executor
-      mcp_tools:
-        - context7_resolve-library-id
-        - context7_query-docs
   reviewers:
     reviewer:
       model: example/reviewer-model
       variant: standard
       display: Example Reviewer
       permission_policy: reviewer
-      mcp_tools:
-        - context7_resolve-library-id
-        - context7_query-docs
     reviewer-two:
       model: example/reviewer-model
       variant: standard
       display: Example Second Reviewer
       permission_policy: reviewer
-      mcp_tools:
-        - context7_resolve-library-id
-        - context7_query-docs
 
 profile:
   profiles_file: ../profiles.yaml
@@ -215,26 +203,7 @@ preflight:
   require_git_remote: true
   disk_space_min_mb: 500
 
-mcp:
-  environment_passthrough: []
-  servers:
-    context7:
-      type: remote
-      enabled: true
-      url: https://mcp.context7.com/mcp
-      headers: {}
-    # Replace the placeholder commands below with the executables from your
-    # installed Repomix and Semble MCP servers, then set enabled to true and
-    # add their exact tools to each role's mcp_tools list.
-    repomix:
-      type: local
-      enabled: false
-      command:
-        - /usr/local/bin/repomix-mcp
-      environment: {}
-    semble:
-      type: local
-      enabled: false
-      command:
-        - /usr/local/bin/semble-mcp
-      environment: {}
+# MCP is omitted, so dispatcher workers inherit the operator's OpenCode MCP
+# server configuration and receive the default Context7, Repomix, and Semble
+# research tool catalog. Add an explicit mcp section and per-role mcp_tools to
+# replace the inherited server configuration for this project.
