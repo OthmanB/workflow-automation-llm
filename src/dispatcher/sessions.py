@@ -11,6 +11,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -94,6 +95,42 @@ class OpenCodeTimeoutError(OpenCodeAdapterError):
 
 class OpenCodeSessionError(OpenCodeAdapterError):
     """A requested persisted OpenCode session was missing, foreign, or stale."""
+
+
+def refresh_opencode_credentials(
+    state_dir: str | Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Atomically snapshot the operator's active OpenCode credentials for one project."""
+    parent = os.environ if environment is None else environment
+    data_home = Path(
+        parent.get(
+            "XDG_DATA_HOME",
+            str(Path(parent.get("HOME", str(Path.home()))) / ".local" / "share"),
+        )
+    )
+    source = data_home / "opencode" / "auth.json"
+    if not source.is_file():
+        raise OpenCodeSessionError(f"active OpenCode credential store is unavailable: {source}")
+    target_dir = ensure_private_directory(
+        Path(state_dir) / "opencode-child" / "home" / ".local" / "share" / "opencode"
+    )
+    target = target_dir / "auth.json"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".auth.", suffix=".tmp", dir=target_dir)
+    temporary = Path(temporary_name)
+    try:
+        with source.open("rb") as source_file, os.fdopen(descriptor, "wb") as target_file:
+            shutil.copyfileobj(source_file, target_file)
+            target_file.flush()
+            os.fsync(target_file.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, target)
+        target.chmod(0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
 
 
 @dataclass(frozen=True)

@@ -94,6 +94,15 @@ first pending step, and complete role permission manifest before launching a pro
 immediately before launch and records the validated approval record in the
 audit log.
 
+Immediately before `smoke-proof` and `execute`, the dispatcher atomically copies
+the active operator OpenCode credential store from
+`$XDG_DATA_HOME/opencode/auth.json` (or
+`$HOME/.local/share/opencode/auth.json`) into the configured private dispatcher
+state with mode `0600`. Switch the desired OpenCode account before invoking
+either command. The selected credentials are snapshotted at command start and
+remain stable for that invocation; their contents are never parsed or logged by
+the dispatcher.
+
 Real execution requires an available verification isolation backend.
 `darwin_seatbelt_v1` is the supported local macOS backend for dispatcher-owned
 checks; it denies check-process network access and writes outside the disposable

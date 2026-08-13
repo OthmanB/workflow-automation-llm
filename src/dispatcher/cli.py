@@ -35,7 +35,7 @@ from .observability import (
 )
 from .operation import LiveSmokeProof
 from .security import atomic_write_private_text
-from .sessions import SUPPORTED_OPENCODE_VERSION, SessionResult
+from .sessions import SUPPORTED_OPENCODE_VERSION, SessionResult, refresh_opencode_credentials
 from .sessions import run_session as real_run_session
 
 logger = logging.getLogger("dispatcher.cli")
@@ -292,12 +292,13 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     )
     from .preflight import PreflightError, run_preflight
     from .sequential import SequentialWorkflow
-    from .sessions import run_session
+    from .sessions import OpenCodeAdapterError, run_session
     from .state_store import StateStoreError
 
     try:
         cfg = load_config(args.config)
         _setup_logging(args.log_level or cfg.observability.log_level)
+        refresh_opencode_credentials(cfg.state_dir)
         store = state_mod.open_state_store(cfg)
         record, generation = store.load_run(args.run_id)
         details = validate_real_operation_prerequisites(
@@ -340,7 +341,14 @@ def _cmd_execute(args: argparse.Namespace) -> int:
             expected_generation=generation,
             max_turns=args.max_turns,
         )
-    except (RealOperationError, PreflightError, StateStoreError, OSError, ValueError) as exc:
+    except (
+        OpenCodeAdapterError,
+        RealOperationError,
+        PreflightError,
+        StateStoreError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"execute: FAILED - {exc}", file=sys.stderr)
         return 2
     print(f"execute: completed accepted={outcome.accepted} report={outcome.report_path}")
@@ -459,6 +467,7 @@ def produce_live_smoke_proof(
                 termination_grace_seconds=5,
                 max_output_bytes=65_536,
                 state_dir=Path(state_dir_name),
+                credential_state_dir=config.state_dir,
                 permission_config=_LIVE_SMOKE_PERMISSION_CONFIG,
                 snapshot_dirs=[str(workdir)],
             )
@@ -509,6 +518,7 @@ def _cmd_smoke_proof(
     try:
         config = load_config(args.config)
         _setup_logging(config.observability.log_level)
+        refresh_opencode_credentials(config.state_dir)
         proof = produce_live_smoke_proof(
             config,
             model=args.model,

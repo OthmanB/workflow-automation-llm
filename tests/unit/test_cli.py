@@ -76,6 +76,7 @@ def test_smoke_proof_command_writes_successful_proof(
         assert list(workdir.iterdir()) == []
         assert Path(kwargs["snapshot_dirs"][0]) == workdir
         assert Path(kwargs["state_dir"]) != workdir
+        assert Path(kwargs["credential_state_dir"]) == Path(project.config.state_dir)
         assert kwargs["prompt"] == "Reply with exactly LIVE_SMOKE_OK. Do not use tools or inspect files."
         assert kwargs["permission_config"] == {
             "permission": {"*": "deny", "read": "allow", "glob": "allow", "grep": "allow"}
@@ -88,6 +89,7 @@ def test_smoke_proof_command_writes_successful_proof(
             opencode_version="1.18.11",
         )
 
+    monkeypatch.setattr(cli, "refresh_opencode_credentials", lambda state_dir: None)
     result = cli._cmd_smoke_proof(
         Namespace(config=str(project.config_path), model="fixture/model", output=str(output)),
         run_session=runner,
@@ -115,6 +117,7 @@ def test_smoke_proof_command_rejects_nonmatching_result(
     project = create_fixture_project(tmp_path)
     output = tmp_path / "smoke.json"
     monkeypatch.setenv("DISPATCHER_LIVE_OPENCODE", "1")
+    monkeypatch.setattr(cli, "refresh_opencode_credentials", lambda state_dir: None)
 
     def runner(**_kwargs) -> SessionResult:
         return SessionResult(
@@ -144,6 +147,7 @@ def test_smoke_proof_command_reports_runner_failure_without_proof(
     project = create_fixture_project(tmp_path)
     output = tmp_path / "smoke.json"
     monkeypatch.setenv("DISPATCHER_LIVE_OPENCODE", "1")
+    monkeypatch.setattr(cli, "refresh_opencode_credentials", lambda state_dir: None)
 
     def runner(**_kwargs) -> SessionResult:
         raise RuntimeError("fake OpenCode failure")

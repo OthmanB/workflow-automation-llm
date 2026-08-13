@@ -64,6 +64,7 @@ def test_execute_command_completes_disposable_fake_opencode_run(
     fixture = _prepare_execute_fixture(tmp_path)
     fake_opencode = _install_fake_opencode(tmp_path)
     monkeypatch.setattr(sessions, "OPENCODE_BIN", str(fake_opencode))
+    monkeypatch.setattr("dispatcher.cli.refresh_opencode_credentials", lambda _state_dir: None)
     backend = DirectProductionTestBackend()
     monkeypatch.setattr("dispatcher.operation.verification_backend", lambda _config: backend)
     monkeypatch.setattr("dispatcher.verification.verification_backend", lambda _config: backend)
@@ -153,6 +154,7 @@ def test_execute_command_rejects_wrong_revision_without_launching_fake_opencode(
     fixture = _prepare_execute_fixture(tmp_path)
     fake_opencode = _install_fake_opencode(tmp_path)
     monkeypatch.setattr(sessions, "OPENCODE_BIN", str(fake_opencode))
+    monkeypatch.setattr("dispatcher.cli.refresh_opencode_credentials", lambda _state_dir: None)
     before_revision = _git(fixture.project.repository, "rev-parse", "HEAD")
     before_status = _git(fixture.project.repository, "status", "--porcelain")
 

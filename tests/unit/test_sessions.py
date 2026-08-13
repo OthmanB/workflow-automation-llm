@@ -26,6 +26,7 @@ from dispatcher.sessions import (
     build_child_environment,
     cancel_process_group,
     list_sessions,
+    refresh_opencode_credentials,
     run_session,
     validate_session_reference,
 )
@@ -666,3 +667,41 @@ def test_explicit_mcp_mode_does_not_inherit_operator_config_directory(tmp_path: 
     )
 
     assert "OPENCODE_CONFIG_DIR" not in environment
+
+
+def test_refresh_opencode_credentials_snapshots_active_operator_store(tmp_path: Path) -> None:
+    operator_home = tmp_path / "operator"
+    source = operator_home / ".local" / "share" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"openai":{"type":"oauth","refresh":"current-account"}}', encoding="utf-8")
+
+    target = refresh_opencode_credentials(
+        tmp_path / "state",
+        environment={"HOME": str(operator_home)},
+    )
+
+    assert target.read_bytes() == source.read_bytes()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_refresh_opencode_credentials_replaces_stale_snapshot(tmp_path: Path) -> None:
+    operator_home = tmp_path / "operator"
+    source = operator_home / ".local" / "share" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text("new-account", encoding="utf-8")
+    target = (
+        tmp_path
+        / "state"
+        / "opencode-child"
+        / "home"
+        / ".local"
+        / "share"
+        / "opencode"
+        / "auth.json"
+    )
+    target.parent.mkdir(parents=True)
+    target.write_text("stale-account", encoding="utf-8")
+
+    refresh_opencode_credentials(tmp_path / "state", environment={"HOME": str(operator_home)})
+
+    assert target.read_text(encoding="utf-8") == "new-account"
