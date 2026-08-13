@@ -38,7 +38,7 @@ from dispatcher.sequential import (
     SequentialWorkflowError,
     WorkerResultValidationError,
 )
-from dispatcher.state_store import StateStore
+from dispatcher.state_store import DispatchPayload, StateStore
 from dispatcher.verification import AuthoritativeVerification
 from dispatcher.workflow import (
     DispatchStatus,
@@ -362,6 +362,125 @@ def test_recover_completed_reviewer_dispatch_persists_review_and_acceptance_once
 
     with pytest.raises(SequentialWorkflowError, match="requires a COMPLETED dispatch"):
         workflow.recover_completed_dispatch("completed-recovery-run", reviewer.dispatch.dispatch_id)
+
+
+def test_recovery_rejects_success_without_authoritative_verification(tmp_path: Path) -> None:
+    store, workflow, _record, _generation, executor = _activate_and_prepare(
+        tmp_path,
+        review_required=True,
+    )
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+    reviewer = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(reviewer, PreparedDispatch)
+    reviewer = workflow.mark_running(reviewer, process_id=999_999_998, process_create_time=1.0)
+    reviewer = workflow.record_session_id(reviewer, runtime_session_id="session-review-recovery")
+    record, generation = store.load_run("completed-recovery-run")
+    _legacy_complete(
+        store,
+        record,
+        generation,
+        reviewer,
+        _reviewer_result(reviewer),
+        authoritative_verification=[],
+    )
+
+    with pytest.raises(WorkerResultValidationError, match="authoritative verification IDs"):
+        workflow.recover_completed_dispatch("completed-recovery-run", reviewer.dispatch.dispatch_id)
+
+
+def test_restore_forwarded_verification_repairs_only_missing_authority(tmp_path: Path) -> None:
+    store, workflow, _record, _generation, executor = _activate_and_prepare(
+        tmp_path,
+        review_required=True,
+    )
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+    reviewer = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(reviewer, PreparedDispatch)
+    reviewer = workflow.mark_running(reviewer, process_id=999_999_998, process_create_time=1.0)
+    reviewer = workflow.record_session_id(reviewer, runtime_session_id="session-review-recovery")
+    record, generation = store.load_run("completed-recovery-run")
+    _legacy_complete(store, record, generation, reviewer, _reviewer_result(reviewer))
+    recovered, _generation, _forwarding = workflow.recover_completed_dispatch(
+        "completed-recovery-run", reviewer.dispatch.dispatch_id
+    )
+    payload = store.load_dispatch_payload(recovered.run_id, reviewer.dispatch.dispatch_id)
+    assert payload.authoritative_verification is not None
+    missing_authority = DispatchPayload(
+        prompt=payload.prompt,
+        policy=payload.policy,
+        result=payload.result,
+        authoritative_verification=(),
+        forwarding_payload=payload.forwarding_payload,
+        process_id=payload.process_id,
+        session_metadata=payload.session_metadata,
+        repository_before=payload.repository_before,
+        repository_after=payload.repository_after,
+    )
+    generation = store.save_run(
+        recovered,
+        expected_generation=_generation,
+        dispatch_payloads={reviewer.dispatch.dispatch_id: missing_authority},
+    )
+    restored_verification = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="passed",
+            argv=("python", "-c", "print('restored fixture check')"),
+            exit_code=0,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="d" * 64,
+            stderr_sha256="e" * 64,
+            transcript_sha256="f" * 64,
+            duration_ms=2,
+            backend="fixture-restored-recovery",
+            summary="restored fixture authoritative check passed",
+        ),
+    )
+
+    restored, generation, forwarding = workflow.restore_forwarded_verification(
+        recovered.run_id,
+        reviewer.dispatch.dispatch_id,
+        authoritative_verification=restored_verification,
+    )
+
+    payload = store.load_dispatch_payload(restored.run_id, reviewer.dispatch.dispatch_id)
+    assert payload.authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in restored_verification
+    )
+    assert json.loads(forwarding)["authoritative_verification"] == [
+        item.model_dump(mode="json") for item in restored_verification
+    ]
+    acknowledged, generation = workflow.acknowledge_forwarding(
+        restored.run_id,
+        expected_generation=generation,
+        dispatch_id=reviewer.dispatch.dispatch_id,
+    )
+    assert workflow.evaluate_completion(acknowledged, generation).accepted
 
 
 def test_adopt_failed_reviewer_result_retains_attempt_and_completes_step(

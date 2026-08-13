@@ -1539,6 +1539,7 @@ class SequentialWorkflow:
                 AuthoritativeVerification.model_validate_json(json.dumps(item))
                 for item in payload.authoritative_verification or ()
             )
+            _validate_result_verification(step, result, verification)
             if not applied:
                 if step_record.state is not StepStatus.EXECUTING:
                     raise SequentialWorkflowError(
@@ -1579,6 +1580,7 @@ class SequentialWorkflow:
                 AuthoritativeVerification.model_validate_json(json.dumps(item))
                 for item in payload.authoritative_verification or ()
             )
+            _validate_result_verification(step, reviewer_result, verification)
             if (
                 isinstance(reviewer_result, ReviewerAcceptedResult)
                 and dispatch.role_key in step_record.accepted_reviewer_role_keys
@@ -1636,6 +1638,134 @@ class SequentialWorkflow:
             review=review if review_id is not None else None,
         )
         return record, generation, forwarding
+
+    @_serialized_transition
+    def restore_forwarded_verification(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        *,
+        authoritative_verification: tuple[AuthoritativeVerification, ...],
+    ) -> tuple[RunRecord, int, str]:
+        """Repair only missing authority on a recovered, unacknowledged forwarding."""
+        record, generation = self.store.load_run(run_id)
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown recovery dispatch: {dispatch_id}") from exc
+        if dispatch.state is not DispatchStatus.FORWARDED:
+            raise SequentialWorkflowError(
+                "verification restoration requires a FORWARDED dispatch"
+            )
+        payload = self.store.load_dispatch_payload(run_id, dispatch_id)
+        if payload.result is None or payload.forwarding_payload is None:
+            raise SequentialWorkflowError(
+                "forwarded dispatch is missing its durable result or forwarding payload"
+            )
+        if _sha256_text(payload.forwarding_payload) != dispatch.forwarding_digest:
+            raise SequentialWorkflowError(
+                "forwarded dispatch payload does not match its durable forwarding digest"
+            )
+        if payload.authoritative_verification:
+            raise SequentialWorkflowError(
+                "verification restoration requires a forwarding with no durable authority"
+            )
+        step = _plan_step(record, dispatch.step_id)
+        if dispatch.role_kind == "executor":
+            executor_result = parse_executor_result(payload.result)
+            expectation = ResultExpectation(
+                dispatch_id=dispatch.dispatch_id,
+                attempt=dispatch.attempt,
+                step_id=dispatch.step_id,
+                repo_id=dispatch.intent.repository.repo_id,
+                expected_review_target=None,
+            )
+            try:
+                validate_executor_result_context(executor_result, expectation)
+            except ResultError as exc:
+                raise SequentialWorkflowError(
+                    f"forwarded executor dispatch has an invalid durable result: {exc}"
+                ) from exc
+            if not isinstance(executor_result, ExecutorCompletedResult):
+                raise SequentialWorkflowError(
+                    "verification restoration requires a completed executor result"
+                )
+            _validate_result_verification(step, executor_result, authoritative_verification)
+            forwarding = _executor_forwarding(
+                executor_result,
+                record.usage.by_session.get(
+                    dispatch.runtime_session_id or dispatch.logical_session_key,
+                    UsageAmount(),
+                ),
+                authoritative_verification,
+            )
+        else:
+            reviewer_result = parse_reviewer_result(payload.result)
+            expectation = ResultExpectation(
+                dispatch_id=dispatch.dispatch_id,
+                attempt=dispatch.attempt,
+                step_id=dispatch.step_id,
+                repo_id=dispatch.intent.repository.repo_id,
+                expected_review_target=self._review_target(record, step),
+            )
+            try:
+                validate_reviewer_result_context(reviewer_result, expectation)
+            except ResultError as exc:
+                raise SequentialWorkflowError(
+                    f"forwarded reviewer dispatch has an invalid durable result: {exc}"
+                ) from exc
+            if not isinstance(reviewer_result, ReviewerAcceptedResult):
+                raise SequentialWorkflowError(
+                    "verification restoration requires an accepted reviewer result"
+                )
+            _validate_result_verification(step, reviewer_result, authoritative_verification)
+            forwarding = _reviewer_forwarding(
+                reviewer_result,
+                record.usage.by_session.get(
+                    dispatch.runtime_session_id or dispatch.logical_session_key,
+                    UsageAmount(),
+                ),
+                authoritative_verification,
+            )
+        event = self._event(
+            record,
+            "dispatcher",
+            "authoritative verification restored for recovered forwarding",
+            dispatch_id,
+        )
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch_id] = dispatch.model_copy(
+            update={
+                "forwarding_digest": _sha256_text(forwarding),
+                "last_event": event,
+            }
+        )
+        updated = record.model_copy(
+            update={
+                "dispatches": dispatches,
+                "sequence": event.sequence,
+                "updated_at": event.occurred_at,
+            }
+        )
+        replacement = DispatchPayload(
+            prompt=payload.prompt,
+            policy=payload.policy,
+            result=payload.result,
+            authoritative_verification=tuple(
+                item.model_dump(mode="json") for item in authoritative_verification
+            ),
+            forwarding_payload=forwarding,
+            process_id=payload.process_id,
+            session_metadata=payload.session_metadata,
+            repository_before=payload.repository_before,
+            repository_after=payload.repository_after,
+        )
+        generation = self.store.save_run(
+            updated,
+            expected_generation=generation,
+            dispatch_payloads={dispatch_id: replacement},
+        )
+        return updated, generation, forwarding
 
     @_serialized_transition
     def adopt_failed_reviewer_result(
