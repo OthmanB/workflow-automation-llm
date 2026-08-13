@@ -8,7 +8,7 @@ import pytest
 import yaml
 from helpers import FixtureProject, config_values, create_fixture_project
 
-from dispatcher.config import ConfigError, load_config
+from dispatcher.config import PERMISSION_ACTIONS, ConfigError, load_config
 
 
 @pytest.fixture
@@ -85,6 +85,7 @@ def test_invalid_schema_values_fail_with_exact_field_paths(
         ("state", "lease_heartbeat_seconds"),
         ("profile", "profiles_file"),
         ("execution", "timeout_seconds"),
+        ("execution", "structured_git"),
         ("execution", "concurrency"),
         ("repositories", "fixture-repo", "commit_policy"),
         ("repositories", "fixture-repo", "external_roots"),
@@ -127,6 +128,69 @@ def test_repository_default_branch_accepts_standard_git_ref_with_slashes(project
     values["repositories"]["fixture-repo"]["default_branch"] = "release/tier1"
 
     _write_and_load(project, values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("author_name", " Dispatcher", "leading or trailing whitespace"),
+        ("committer_name", "Dispatcher\nCommitter", "control characters"),
+        ("author_email", "not-an-email", "one non-edge '@'"),
+    ],
+)
+def test_structured_git_identity_is_explicit_and_strict(
+    project: FixtureProject,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    values = config_values(project)
+    values["execution"]["structured_git"][field] = value
+
+    with pytest.raises(ConfigError, match=message):
+        _write_and_load(project, values)
+
+
+def test_duplicate_yaml_keys_fail_before_config_validation(project: FixtureProject) -> None:
+    project.config_path.write_text(
+        project.config_path.read_text(encoding="utf-8") + "\nschema_version: 2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="duplicate YAML key: schema_version"):
+        load_config(project.config_path)
+
+
+@pytest.mark.parametrize("role_kind", ["supervisor", "executor", "reviewer"])
+def test_role_class_permission_policy_requires_every_canonical_action(
+    project: FixtureProject,
+    role_kind: str,
+) -> None:
+    values = config_values(project)
+    policy_id = values["permission_policies"]["role_class_policies"][role_kind]
+    del values["permission_policies"]["policies"][policy_id]["actions"]["commit"]
+
+    with pytest.raises(ConfigError, match=rf"{role_kind}.*missing: commit"):
+        _write_and_load(project, values)
+
+
+def test_permission_actions_use_one_complete_canonical_vocabulary(project: FixtureProject) -> None:
+    values = config_values(project)
+
+    for policy_id in values["permission_policies"]["role_class_policies"].values():
+        assert tuple(values["permission_policies"]["policies"][policy_id]["actions"]) == (
+            PERMISSION_ACTIONS
+        )
+
+
+def test_unknown_permission_action_is_rejected_during_config_loading(project: FixtureProject) -> None:
+    values = config_values(project)
+    values["permission_policies"]["policies"]["project"]["actions"]["unknown_action"] = (
+        "allow"
+    )
+
+    with pytest.raises(ConfigError, match="permission_policies.policies.project.actions"):
+        _write_and_load(project, values)
 
 
 def test_profile_selection_must_exist_in_strict_profiles_document(project: FixtureProject) -> None:

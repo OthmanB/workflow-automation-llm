@@ -6,7 +6,10 @@ import copy
 import hashlib
 import json
 import os
+import re
 import subprocess
+import unicodedata
+import urllib.parse
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
@@ -19,6 +22,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from .yaml_io import DuplicateYamlKeyError, load_unique_yaml
 
 
 class ConfigError(ValueError):
@@ -34,6 +39,24 @@ class ContractModel(BaseModel):
 Identifier = Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")]
 ModelName = Annotated[str, Field(pattern=r"^[^/\s]+/[^/\s]+$")]
 PermissionDecision = Literal["allow", "ask", "deny"]
+PermissionAction = Literal[
+    "inspect",
+    "modify",
+    "verify",
+    "commit",
+    "push",
+    "force_push",
+    "create_branch",
+]
+PERMISSION_ACTIONS: tuple[PermissionAction, ...] = (
+    "inspect",
+    "modify",
+    "verify",
+    "commit",
+    "push",
+    "force_push",
+    "create_branch",
+)
 
 
 class ProjectDefinition(ContractModel):
@@ -108,6 +131,92 @@ class RepositoryDefinition(ContractModel):
         return values
 
 
+MCPToolName = Annotated[
+    str,
+    Field(pattern=r"^[a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9_-]*$"),
+]
+_MCP_ENV_NAME = r"^[A-Za-z_][A-Za-z0-9_]*$"
+
+# The explicit Step 21-lite tool catalog. Every role tool must be listed here;
+# each entry maps a sanitized OpenCode tool name to its configured server key.
+MCP_TOOL_CATALOG: dict[str, str] = {
+    "context7_resolve-library-id": "context7",
+    "context7_query-docs": "context7",
+    "repomix_pack_codebase": "repomix",
+    "repomix_pack_remote_repository": "repomix",
+    "repomix_attach_packed_output": "repomix",
+    "repomix_read_repomix_output": "repomix",
+    "repomix_grep_repomix_output": "repomix",
+    "repomix_file_system_read_directory": "repomix",
+    "repomix_file_system_read_file": "repomix",
+    "semble_search": "semble",
+    "semble_find_related": "semble",
+}
+
+
+def _validate_mcp_environment_names(values: tuple[str, ...], location: str) -> None:
+    for name in values:
+        if not re.match(_MCP_ENV_NAME, name):
+            raise ValueError(f"{location} names must be valid environment variable names")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{location} names must be unique")
+
+
+class MCPRemoteServer(ContractModel):
+    """One remote HTTP MCP server definition."""
+
+    type: Literal["remote"]
+    enabled: bool
+    url: Annotated[str, Field(min_length=1, max_length=2000)]
+    headers: dict[str, str] = {}
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("remote MCP server url must be an http or https URL")
+        return value
+
+
+class MCPLocalServer(ContractModel):
+    """One local stdio MCP server definition with an exact argv list."""
+
+    type: Literal["local"]
+    enabled: bool
+    command: tuple[Annotated[str, Field(min_length=1)], ...] = Field(min_length=1)
+    environment: dict[str, str] = {}
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def freeze_command(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+
+MCPServerDefinition = Annotated[
+    MCPLocalServer | MCPRemoteServer,
+    Field(discriminator="type"),
+]
+
+
+class MCPRegistry(ContractModel):
+    """Explicit project MCP server registry and passthrough environment names."""
+
+    environment_passthrough: tuple[str, ...] = ()
+    servers: dict[Identifier, MCPServerDefinition]
+
+    @field_validator("environment_passthrough", mode="before")
+    @classmethod
+    def freeze_passthrough(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("environment_passthrough")
+    @classmethod
+    def validate_passthrough(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        _validate_mcp_environment_names(values, "mcp.environment_passthrough")
+        return values
+
+
 class RoleDefinition(ContractModel):
     """Configured model role and its named permission policy."""
 
@@ -115,6 +224,12 @@ class RoleDefinition(ContractModel):
     variant: Annotated[str, Field(min_length=1, max_length=100)]
     display: Annotated[str, Field(min_length=1, max_length=200)]
     permission_policy: Identifier
+    mcp_tools: tuple[MCPToolName, ...]
+
+    @field_validator("mcp_tools", mode="before")
+    @classmethod
+    def freeze_tool_list(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
 
 
 class RolesDefinition(ContractModel):
@@ -202,11 +317,42 @@ class ConcurrencyDefinition(ContractModel):
         return self
 
 
+class StructuredGitDefinition(ContractModel):
+    """Explicit dispatcher-owned Git commit identity and process bounds."""
+
+    capability_version: Literal[1]
+    author_name: Annotated[str, Field(min_length=1, max_length=200)]
+    author_email: Annotated[str, Field(min_length=3, max_length=320)]
+    committer_name: Annotated[str, Field(min_length=1, max_length=200)]
+    committer_email: Annotated[str, Field(min_length=3, max_length=320)]
+    timeout_seconds: Annotated[int, Field(ge=1, le=300)]
+    max_output_bytes: Annotated[int, Field(ge=1024, le=10_000_000)]
+
+    @field_validator("author_name", "author_email", "committer_name", "committer_email")
+    @classmethod
+    def safe_identity_value(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("Git identity values must not have leading or trailing whitespace")
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("Git identity values must not contain control characters")
+        return value
+
+    @field_validator("author_email", "committer_email")
+    @classmethod
+    def valid_email_shape(cls, value: str) -> str:
+        local, separator, domain = value.partition("@")
+        if not separator or not local or not domain or "@" in domain:
+            raise ValueError("Git identity email must contain one non-edge '@'")
+        return value
+
+
 class ExecutionDefinition(ContractModel):
     """All active execution controls for the mock-only Phase 7 runtime."""
 
     mode: Literal["mock_workflow_test", "real_operation"]
     protocol_version: Literal[1]
+    verification_backend: Literal["darwin_seatbelt_v1", "linux_bwrap_v1"]
+    structured_git: StructuredGitDefinition
     scheduling: Literal["sequential", "bounded_parallel"]
     concurrency: ConcurrencyDefinition
     default_repo_id: Identifier
@@ -250,7 +396,7 @@ class StallPolicyDefinition(ContractModel):
 
     maximum_retries_per_step: Annotated[int, Field(ge=0, le=20)]
     cooldown_seconds: Annotated[int, Field(ge=0, le=86_400)]
-    on_exhausted: Literal["ask", "halt"]
+    on_exhausted: Literal["ask", "halt", "fail"]
 
 
 class RetentionDefinition(ContractModel):
@@ -277,7 +423,7 @@ class PermissionPolicy(ContractModel):
     """Named semantic permission rules compiled to exact OpenCode patterns."""
 
     default: PermissionDecision
-    actions: dict[Identifier, PermissionDecision]
+    actions: dict[PermissionAction, PermissionDecision]
 
     @field_validator("actions")
     @classmethod
@@ -341,6 +487,7 @@ class ProjectConfigModel(ContractModel):
     permission_policies: PermissionPoliciesDefinition
     evidence: EvidencePolicy
     preflight: PreflightDefinition | None = None
+    mcp: MCPRegistry
 
     @model_validator(mode="after")
     def validate_references(self) -> Self:
@@ -377,7 +524,40 @@ class ProjectConfigModel(ContractModel):
                 raise ValueError(
                     f"permission_policies.{layer_name} must reference permission_policies.policies"
                 )
+        required_actions = set(PERMISSION_ACTIONS)
+        for role_kind, policy_id in self.permission_policies.role_class_policies.model_dump().items():
+            actions = set(self.permission_policies.policies[policy_id].actions)
+            if actions != required_actions:
+                missing = ", ".join(sorted(required_actions - actions)) or "none"
+                extra = ", ".join(sorted(actions - required_actions)) or "none"
+                raise ValueError(
+                    "permission_policies.role_class_policies."
+                    f"{role_kind} policy {policy_id!r} must define every permission action "
+                    f"exactly once; missing: {missing}; extra: {extra}"
+                )
+        self._validate_mcp_registry()
         return self
+
+    def _validate_mcp_registry(self) -> None:
+        """Reject MCP assignments that cannot compile to exact OpenCode rules."""
+        for role_key, role in self.all_roles().items():
+            if len(role.mcp_tools) != len(set(role.mcp_tools)):
+                raise ValueError(f"roles.{role_key}.mcp_tools must not contain duplicate tools")
+            for tool in role.mcp_tools:
+                server_key = MCP_TOOL_CATALOG.get(tool)
+                if server_key is None:
+                    raise ValueError(
+                        f"roles.{role_key}.mcp_tools tool {tool!r} is not in the configured MCP tool catalog"
+                    )
+                server = self.mcp.servers.get(server_key)
+                if server is None:
+                    raise ValueError(
+                        f"roles.{role_key}.mcp_tools tool {tool!r} does not reference a configured MCP server"
+                    )
+                if not server.enabled:
+                    raise ValueError(
+                        f"roles.{role_key}.mcp_tools tool {tool!r} references disabled MCP server {server_key!r}"
+                    )
 
     def all_roles(self) -> dict[str, RoleDefinition]:
         """Return all role definitions keyed by their globally unique role key."""
@@ -623,8 +803,8 @@ def _load_yaml_mapping(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigError(f"{label} file not found: {path}")
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        data = load_unique_yaml(path)
+    except (DuplicateYamlKeyError, yaml.YAMLError) as exc:
         raise ConfigError(f"invalid {label} YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{label} must be a YAML mapping")

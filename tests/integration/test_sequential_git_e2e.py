@@ -5,12 +5,15 @@ import json
 import shutil
 import sqlite3
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml
 from helpers import create_fixture_project, valid_plan_values
 
 from dispatcher import sessions
+from dispatcher.config import load_config
 from dispatcher.execution import SequentialExecutionCoordinator
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.sequential import SequentialWorkflow
@@ -18,7 +21,7 @@ from dispatcher.state import open_state_store
 from dispatcher.workflow import RunStatus, TransitionEvent, new_run_record
 
 
-def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
+def test_fake_opencode_executes_narrated_rework_review_and_completion_in_disposable_git(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -26,7 +29,11 @@ def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
     _commit_initial_fixture(project.repository)
     plan_values = valid_plan_values(project)
     step = plan_values["steps"][0]
-    step["authorization"]["authorized_actions"] = ["inspect", "modify", "verify"]
+    step["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "verify", "commit"],
+        "writable_paths": ["evidence/", "src/value.txt"],
+        "requires_operator_approval": False,
+    }
     step["review"] = {
         "required": True,
         "reviewer_role_keys": ["reviewer"],
@@ -40,6 +47,11 @@ def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
         "on_changes_requested": "retry",
         "escalation_role_key": None,
     }
+    config_values = yaml.safe_load(project.config_path.read_text(encoding="utf-8"))
+    config_values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    config_values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
+    project.config_path.write_text(yaml.safe_dump(config_values, sort_keys=False), encoding="utf-8")
+    project = replace(project, config=load_config(project.config_path))
     plan = NormalizedPlan.model_validate(plan_values)
     event = TransitionEvent(
         event_id="event-integration-start",
@@ -107,6 +119,26 @@ def test_fake_opencode_executes_rework_review_and_completion_in_disposable_git(
     assert len(calls) == 9
     assert executor_calls[0]["requested_session"] is None
     assert executor_calls[1]["requested_session"] == executor_calls[0]["session_id"]
+    assert executor_calls[0]["child_environment"] == executor_calls[1]["child_environment"]
+    assert executor_calls[0]["child_environment"] != reviewer_calls[0]["child_environment"]
+    assert executor_calls[0]["child_environment"]["HOME"] == str(
+        Path(project.config.state_dir)
+        / "opencode-dispatches"
+        / record.run_id
+        / "executors"
+        / "terra"
+        / "opencode-child"
+        / "home"
+    )
+    assert reviewer_calls[0]["child_environment"]["HOME"] == str(
+        Path(project.config.state_dir)
+        / "opencode-dispatches"
+        / record.run_id
+        / "reviewers"
+        / "reviewer"
+        / "opencode-child"
+        / "home"
+    )
     assert all(call["policy"]["permission"]["edit"] == "allow" for call in executor_calls)
     assert all(call["policy"]["permission"]["write"] == "deny" for call in reviewer_calls)
     assert all(call["head_before"] == call["head_after"] for call in reviewer_calls)

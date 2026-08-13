@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -12,19 +13,46 @@ from time import sleep
 from typing import Any
 
 from .config import Config
-from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
-from .results import parse_executor_result, parse_reviewer_result
-from .sequential import CompletionDecision, PreparedBatch, PreparedDispatch, SequentialWorkflow
+from .mcp import collect_role_mcp_environment, compile_role_mcp_servers
+from .permissions import (
+    compile_effective_policy,
+    generate_opencode_config,
+    role_scoped_authorized_actions,
+    should_auto_approve,
+)
+from .repository import RepositoryValidationError
+from .results import ResultError, parse_executor_proposal, parse_reviewer_result
+from .security import redact_text
+from .sequential import (
+    CompletionDecision,
+    PreparedBatch,
+    PreparedDispatch,
+    SequentialWorkflow,
+    SequentialWorkflowError,
+    WorkerResultValidationError,
+    session_registry_identity,
+)
 from .sessions import (
     OpenCodeAdapterError,
     SessionLifecycleCallbacks,
     SessionResult,
     run_session,
 )
-from .state_store import StateStore
-from .workflow import RunRecord, RunStatus
+from .state_store import StateStore, StateStoreError
+from .verification import AuthoritativeVerification, VerificationRunner
+from .workflow import (
+    DispatchRecord,
+    DispatchStatus,
+    RunRecord,
+    RunStatus,
+    StepStatus,
+    TransitionError,
+)
+
+logger = logging.getLogger(__name__)
 
 SessionRunner = Callable[..., SessionResult]
+VerificationRunnerFn = Callable[[Any, Path], tuple[AuthoritativeVerification, ...]]
 
 
 class ExecutionCoordinatorError(RuntimeError):
@@ -72,12 +100,16 @@ class SequentialExecutionCoordinator:
         *,
         owner_id: str,
         session_runner: SessionRunner = run_session,
+        verification_runner: VerificationRunnerFn | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.workflow = workflow
         self.owner_id = owner_id
         self._session_runner = session_runner
+        self._verification_runner = (
+            verification_runner or VerificationRunner.from_config(config).run
+        )
         self._run_lease_key = f"run:{config.project_id}"
         self._heartbeat_lock = threading.Lock()
 
@@ -111,13 +143,15 @@ class SequentialExecutionCoordinator:
         role_key = next(iter(self.config.model.roles.supervisor))
         role = self.config.role(role_key)
         repo_id = self.config.default_repository_id
+        authorized_actions = role_scoped_authorized_actions(("inspect",), "supervisor")
         permission = generate_opencode_config(
             compile_effective_policy(
                 self.config,
                 repo_id=repo_id,
                 role_key=role_key,
-                dispatch_authorized_actions=["inspect"],
-            )
+                dispatch_authorized_actions=authorized_actions,
+            ),
+            mcp_servers=compile_role_mcp_servers(self.config, role_key),
         )
         result = self._session_runner(
             prompt=prompt,
@@ -133,6 +167,7 @@ class SequentialExecutionCoordinator:
             max_output_bytes=self.config.execution.max_output_bytes,
             state_dir=self.config.state_dir,
             permission_config=permission,
+            environment_passthrough=collect_role_mcp_environment(self.config, role_key),
             snapshot_dirs=[],
         )
         record, generation = self.store.load_run(run_id)
@@ -163,10 +198,14 @@ class SequentialExecutionCoordinator:
         """Execute one prepared worker with synchronous lifecycle transactions."""
         current = prepared
 
-        def process_started(process_id: int) -> None:
+        def process_started(process_id: int, process_create_time: float) -> None:
             nonlocal current
             self.heartbeat()
-            current = self.workflow.mark_running(current, process_id=process_id)
+            current = self.workflow.mark_running(
+                current,
+                process_id=process_id,
+                process_create_time=process_create_time,
+            )
 
         def session_identified(runtime_session_id: str) -> None:
             nonlocal current
@@ -181,7 +220,11 @@ class SequentialExecutionCoordinator:
             str(prepared.workdir / evidence_root)
             for evidence_root in repository.evidence_roots
         ]
-        worker_state_dir = Path(self.config.state_dir) / "opencode-dispatches" / prepared.dispatch.dispatch_id
+        worker_state_dir = worker_opencode_state_dir(
+            self.config.state_dir,
+            run_id=prepared.run_id,
+            dispatch=prepared.dispatch,
+        )
         try:
             result = self._session_runner(
                 prompt=prepared.prompt,
@@ -201,6 +244,9 @@ class SequentialExecutionCoordinator:
                 state_dir=worker_state_dir,
                 credential_state_dir=self.config.state_dir,
                 permission_config=prepared.permission_config,
+                environment_passthrough=collect_role_mcp_environment(
+                    self.config, prepared.dispatch.role_key
+                ),
                 snapshot_dirs=snapshot_dirs,
                 lifecycle=SessionLifecycleCallbacks(process_started, session_identified),
             )
@@ -211,18 +257,31 @@ class SequentialExecutionCoordinator:
             payload = _strict_json_object(result.chat_response)
             usage = _session_usage(result)
             if current.dispatch.role_kind == "executor":
-                record, generation, forwarding = self.workflow.apply_executor_result(
+                proposal = parse_executor_proposal(payload)
+                proposal_snapshot = self.workflow.record_executor_proposal(current, proposal)
+                authoritative_verification: tuple[AuthoritativeVerification, ...] = ()
+                if proposal.outcome == "completed":
+                    authoritative_verification = self._run_authoritative_verification(current)
+                record, generation, forwarding = self.workflow.materialize_executor_proposal(
                     current,
-                    parse_executor_result(payload),
+                    proposal,
+                    authoritative_verification=authoritative_verification,
                     usage=usage,
+                    verified_snapshot=proposal_snapshot,
                 )
             else:
+                parsed_review = parse_reviewer_result(payload)
+                authoritative_verification = ()
+                if parsed_review.verdict == "accepted":
+                    authoritative_verification = self._run_authoritative_verification(current)
                 record, generation, forwarding = self.workflow.apply_reviewer_result(
                     current,
-                    parse_reviewer_result(payload),
+                    parsed_review,
+                    authoritative_verification=authoritative_verification,
                     usage=usage,
                 )
         except OpenCodeAdapterError as exc:
+            failure_category, failure_detail = _worker_failure(exc)
             stored, stored_generation = self.store.load_run(current.run_id)
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
@@ -231,7 +290,7 @@ class SequentialExecutionCoordinator:
                     record, generation, retry_allowed = self.workflow.handle_stall(
                         current,
                         category=exc.category,
-                        reason=str(exc),
+                        reason=failure_detail,
                     )
                     if retry_allowed:
                         sleep(self.config.execution.stall_policy.cooldown_seconds)
@@ -245,21 +304,48 @@ class SequentialExecutionCoordinator:
                 else:
                     self.workflow.fail_dispatch(
                         current,
-                        reason=f"worker execution failed: {type(exc).__name__}",
+                        reason=_failure_event_reason(failure_category, failure_detail),
+                        failure_category=failure_category,
+                        failure_detail=failure_detail,
                     )
             raise
         except Exception as exc:
+            failure_category, failure_detail = _worker_failure(exc)
             stored, stored_generation = self.store.load_run(current.run_id)
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
                 current = _refresh_prepared(current, stored, stored_generation)
                 self.workflow.fail_dispatch(
                     current,
-                    reason=f"worker execution failed: {type(exc).__name__}",
+                    reason=_failure_event_reason(failure_category, failure_detail),
+                    failure_category=failure_category,
+                    failure_detail=failure_detail,
                 )
             raise
         self.heartbeat()
         return WorkerOutcome(record, generation, current.dispatch.dispatch_id, forwarding)
+
+    def _run_authoritative_verification(
+        self,
+        prepared: PreparedDispatch,
+    ) -> tuple[AuthoritativeVerification, ...]:
+        record, _generation = self.store.load_run(prepared.run_id)
+        step = next(step for step in record.plan.steps if step.step_id == prepared.dispatch.step_id)
+        self.heartbeat()
+        results = self._verification_runner(step, Path(prepared.workdir))
+        self.heartbeat()
+        failed = [result.check_id for result in results if result.status != "passed"]
+        if failed:
+            raise WorkerResultValidationError(
+                "dispatcher-owned verification failed: "
+                + ", ".join(
+                    f"{result.check_id}(exit={result.exit_code}, timeout={result.timed_out}, "
+                    f"truncated={result.output_truncated}, summary={result.summary})"
+                    for result in results
+                    if result.status != "passed"
+                )
+            )
+        return results
 
     def execute_batch(self, prepared: PreparedBatch) -> BatchOutcome:
         """Run all atomically prepared children within the configured global bound."""
@@ -271,12 +357,30 @@ class SequentialExecutionCoordinator:
             ),
             thread_name_prefix="dispatcher-worker",
         ) as executor:
-            futures = [executor.submit(self.execute_worker, child) for child in prepared.dispatches]
-            for future in futures:
+            futures = [
+                (child, executor.submit(self.execute_worker, child))
+                for child in prepared.dispatches
+            ]
+            for child, future in futures:
                 try:
                     outcomes.append(future.result())
-                except Exception:
+                except Exception as exc:
                     # The worker boundary persisted its own failed dispatch state before raising.
+                    category, detail = _worker_failure(exc)
+                    logger.warning(
+                        "batch child dispatch %s failed [%s]: %s",
+                        child.dispatch.dispatch_id,
+                        category,
+                        detail,
+                        extra={
+                            "dispatcher_context": {
+                                "project_id": self.config.project_id,
+                                "run_id": child.run_id,
+                                "dispatch_id": child.dispatch.dispatch_id,
+                                "step_id": child.dispatch.step_id,
+                            }
+                        },
+                    )
                     continue
         _record, current_generation = self.store.load_run(prepared.run_id)
         record, generation, forwarding = self.workflow.finalize_batch(
@@ -290,6 +394,71 @@ class SequentialExecutionCoordinator:
             batch_id=prepared.batch_id,
             forwarding=forwarding,
             forwarded_dispatch_ids=tuple(outcome.dispatch_id for outcome in outcomes),
+        )
+
+    def _continuation_prompt(
+        self,
+        bootstrap: str,
+        record: RunRecord,
+    ) -> tuple[str, list[str]]:
+        """Build a deterministic replay envelope from durable pending forwardings."""
+        pending = sorted(
+            (
+                dispatch
+                for dispatch in record.dispatches.values()
+                if dispatch.state is DispatchStatus.FORWARDED
+            ),
+            key=lambda dispatch: (dispatch.last_event.sequence, dispatch.dispatch_id),
+        )
+        if not pending:
+            return bootstrap, []
+        pending_ids = [dispatch.dispatch_id for dispatch in pending]
+        if len(pending_ids) != len(set(pending_ids)):
+            raise ExecutionCoordinatorError("durable pending forwardings contain duplicate dispatch IDs")
+
+        forwardings: list[dict[str, object]] = []
+        for dispatch in pending:
+            try:
+                stored = self.store.load_dispatch_payload(record.run_id, dispatch.dispatch_id)
+            except StateStoreError as exc:
+                raise ExecutionCoordinatorError(
+                    f"cannot load durable forwarding payload for dispatch {dispatch.dispatch_id}"
+                ) from exc
+            raw = stored.forwarding_payload
+            if raw is None:
+                raise ExecutionCoordinatorError(
+                    f"durable forwarding payload is missing for dispatch {dispatch.dispatch_id}"
+                )
+            if not raw.strip():
+                raise ExecutionCoordinatorError(
+                    f"durable forwarding payload is empty for dispatch {dispatch.dispatch_id}"
+                )
+            payload = _strict_json_object(
+                raw,
+                description=f"durable forwarding payload for dispatch {dispatch.dispatch_id}",
+            )
+            if payload.get("dispatch_id") != dispatch.dispatch_id:
+                raise ExecutionCoordinatorError(
+                    f"durable forwarding payload identity does not match dispatch {dispatch.dispatch_id}"
+                )
+            expected_kind = f"{dispatch.role_kind}_result"
+            if payload.get("kind") != expected_kind:
+                raise ExecutionCoordinatorError(
+                    f"durable forwarding payload kind does not match {dispatch.role_kind} "
+                    f"dispatch {dispatch.dispatch_id}"
+                )
+            forwardings.append({"dispatch_id": dispatch.dispatch_id, "payload": payload})
+
+        return (
+            json.dumps(
+                {
+                    "kind": "orchestration_resume",
+                    "bootstrap": bootstrap,
+                    "pending_forwardings": forwardings,
+                },
+                sort_keys=True,
+            ),
+            pending_ids,
         )
 
     def run_to_completion(
@@ -307,9 +476,22 @@ class SequentialExecutionCoordinator:
                 run_id,
                 expected_generation=expected_generation,
             )
+            for dispatch_id in sorted(
+                (
+                    dispatch.dispatch_id
+                    for dispatch in record.dispatches.values()
+                    if dispatch.state is DispatchStatus.COMPLETED
+                )
+            ):
+                record, generation, _forwarding = self.workflow.recover_completed_dispatch(
+                    run_id,
+                    dispatch_id,
+                )
             supervisor_session_id: str | None = None
-            supervisor_prompt = bootstrap
-            pending_acknowledgements: list[str] = []
+            supervisor_prompt, pending_acknowledgements = self._continuation_prompt(
+                bootstrap,
+                record,
+            )
             for _turn in range(max_turns):
                 supervisor = self.run_supervisor_turn(
                     run_id,
@@ -359,6 +541,12 @@ class SequentialExecutionCoordinator:
                     continue
                 if isinstance(action, CompletionDecision):
                     if not action.accepted:
+                        record, generation = self.store.load_run(run_id)
+                        if any(
+                            step.state is StepStatus.FAILED
+                            for step in record.steps.values()
+                        ):
+                            return action
                         supervisor_prompt = json.dumps(
                             {
                                 "kind": "completion_denied",
@@ -400,14 +588,35 @@ def _refresh_prepared(
     )
 
 
-def _strict_json_object(text: str) -> dict[str, Any]:
+def worker_opencode_state_dir(
+    state_dir: str | Path,
+    *,
+    run_id: str,
+    dispatch: DispatchRecord,
+) -> Path:
+    """Return the private OpenCode state root owned by one durable session identity."""
+    pool, session_registry_key = session_registry_identity(dispatch)
+    return Path(state_dir) / "opencode-dispatches" / run_id / pool / session_registry_key
+
+
+def _strict_json_object(
+    text: str,
+    *,
+    description: str = "worker response",
+) -> dict[str, Any]:
     stripped = text.strip()
     try:
-        value = json.loads(stripped, object_pairs_hook=_reject_duplicate_keys)
+        value = json.loads(
+            stripped,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite_constant,
+        )
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ExecutionCoordinatorError(f"worker response is not one strict JSON object: {exc}") from exc
+        raise ExecutionCoordinatorError(
+            f"{description} is not one strict JSON object: {exc}"
+        ) from exc
     if not isinstance(value, dict):
-        raise ExecutionCoordinatorError("worker response must be a JSON object")
+        raise ExecutionCoordinatorError(f"{description} must be a JSON object")
     return value
 
 
@@ -418,6 +627,10 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_non_finite_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
 
 
 def _session_usage(result: SessionResult) -> dict[str, object] | None:
@@ -431,3 +644,42 @@ def _session_usage(result: SessionResult) -> dict[str, object] | None:
         "tokens_output": tokens.get("output"),
         "tokens_reasoning": tokens.get("reasoning"),
     }
+
+
+def _worker_failure(exc: BaseException) -> tuple[str, str]:
+    """Return one stable category and bounded redacted worker-boundary detail."""
+    chain = _exception_chain(exc)
+    category: str
+    if isinstance(exc, OpenCodeAdapterError):
+        category = exc.category
+    elif any(isinstance(item, (ExecutionCoordinatorError, ResultError, WorkerResultValidationError)) for item in chain):
+        category = "result_validation"
+    elif any(isinstance(item, RepositoryValidationError) for item in chain):
+        category = "repository_validation"
+    elif any(
+        isinstance(item, (SequentialWorkflowError, StateStoreError, TransitionError))
+        for item in chain
+    ):
+        category = "workflow_validation"
+    else:
+        category = "internal"
+    detail = redact_text(str(exc))[:5000]
+    if not detail:
+        detail = type(exc).__name__
+    return category, detail
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _failure_event_reason(category: str, detail: str) -> str:
+    prefix = f"worker execution failed [{category}]: "
+    return (prefix + detail)[:5000]

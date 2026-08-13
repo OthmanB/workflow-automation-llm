@@ -3,6 +3,7 @@
 Usage:
     dispatcher run --config config/projects/<name>.yaml  [--resume]  [--mock]  [--skip-smoke]
     dispatcher preflight --config config/projects/<name>.yaml  [--skip-smoke]
+    dispatcher smoke-proof --config <project.yaml> --model <model-id> --output <path>
     dispatcher status --config config/projects/<name>.yaml
     dispatcher start --config config/projects/<name>.yaml --run-record <record.json>
     dispatcher resume --config config/projects/<name>.yaml --run-id <run-id>
@@ -15,9 +16,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import tempfile
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from .baseline import BaselineError
+from .config import Config
 from .observability import (
     configure_logging,
     export_support_bundle,
@@ -25,8 +33,18 @@ from .observability import (
     prune_derived_artifacts,
     status_snapshot,
 )
+from .operation import LiveSmokeProof
+from .security import atomic_write_private_text
+from .sessions import SUPPORTED_OPENCODE_VERSION, SessionResult
+from .sessions import run_session as real_run_session
 
 logger = logging.getLogger("dispatcher.cli")
+
+_LIVE_SMOKE_PROMPT = "Reply with exactly LIVE_SMOKE_OK. Do not use tools or inspect files."
+_LIVE_SMOKE_PERMISSION_CONFIG = {
+    "permission": {"*": "deny", "read": "allow", "glob": "allow", "grep": "allow"}
+}
+_LIVE_SMOKE_ENV_MESSAGE = "set DISPATCHER_LIVE_OPENCODE=1 to run the live OpenCode smoke suite"
 
 
 def _setup_logging(level: str) -> None:
@@ -69,6 +87,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
+    approval_parser = sub.add_parser(
+        "approve-real-operation", help="write an approval record for one exact real-operation step"
+    )
+    approval_parser.add_argument("--config", required=True)
+    approval_parser.add_argument("--run-id", required=True)
+    approval_parser.add_argument("--plan", required=True)
+    approval_parser.add_argument("--repo-id", required=True)
+    approval_parser.add_argument("--approval-ref", required=True)
+    approval_parser.add_argument(
+        "--permission-digest",
+        action="append",
+        required=True,
+        metavar="ROLE=SHA256",
+    )
+    approval_parser.add_argument("--output", required=True)
+
+    manifest_parser = sub.add_parser(
+        "permission-manifest", help="write the exact role permission manifest for one step"
+    )
+    manifest_parser.add_argument("--config", required=True)
+    manifest_parser.add_argument("--run-id", required=True)
+    manifest_parser.add_argument("--plan", required=True)
+    manifest_parser.add_argument("--repo-id", required=True)
+    manifest_parser.add_argument("--output", required=True)
+
     execute_parser = sub.add_parser("execute", help="run one explicitly approved real-operation run")
     execute_parser.add_argument("--config", required=True)
     execute_parser.add_argument("--run-id", required=True)
@@ -76,9 +119,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     execute_parser.add_argument("--repo-id", required=True)
     execute_parser.add_argument("--smoke-proof", required=True)
     execute_parser.add_argument("--smoke-model", required=True)
-    execute_parser.add_argument("--permission-digest", required=True)
+    execute_parser.add_argument(
+        "--permission-digest",
+        action="append",
+        required=True,
+        metavar="ROLE=SHA256",
+    )
     execute_parser.add_argument("--stall-policy-digest", required=True)
-    execute_parser.add_argument("--approval-ref", required=True)
+    execute_parser.add_argument("--expected-revision", required=True)
+    execute_parser.add_argument("--approval-record", required=True)
     execute_parser.add_argument("--confirm-real-operation", action="store_true")
     execute_parser.add_argument("--max-turns", type=int, default=20)
     execute_parser.add_argument(
@@ -93,6 +142,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-level", default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+
+    smoke_parser = sub.add_parser(
+        "smoke-proof", help="run the live read-only OpenCode smoke test and write its proof"
+    )
+    smoke_parser.add_argument("--config", required=True)
+    smoke_parser.add_argument("--model", required=True)
+    smoke_parser.add_argument("--output", required=True)
 
     # --- status ---
     st_parser = sub.add_parser("status", help="show current run status")
@@ -121,7 +177,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # --- recover ---
-    recover_parser = sub.add_parser("recover", help="inspect unresolved durable dispatches")
+    recover_parser = sub.add_parser(
+        "recover", help="adopt exact interrupted commits and inspect unresolved durable dispatches"
+    )
     recover_parser.add_argument("--config", required=True)
     recover_parser.add_argument("--run-id", required=True)
     recover_parser.add_argument(
@@ -227,7 +285,11 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
     from .execution import SequentialExecutionCoordinator
-    from .operation import RealOperationError, validate_real_operation_prerequisites
+    from .operation import (
+        RealOperationError,
+        parse_permission_digest_args,
+        validate_real_operation_prerequisites,
+    )
     from .preflight import PreflightError, run_preflight
     from .sequential import SequentialWorkflow
     from .sessions import run_session
@@ -246,22 +308,25 @@ def _cmd_execute(args: argparse.Namespace) -> int:
             repo_id=args.repo_id,
             smoke_proof_path=args.smoke_proof,
             smoke_model=args.smoke_model,
-            permission_digest=args.permission_digest,
+            permission_digests=parse_permission_digest_args(args.permission_digest),
             stall_policy_digest=args.stall_policy_digest,
-            approval_ref=args.approval_ref,
+            expected_revision=args.expected_revision,
+            approval_record_path=args.approval_record,
             confirm=args.confirm_real_operation,
         )
         if cfg.preflight is None or not cfg.preflight.enabled:
             raise RealOperationError("real operation requires enabled preflight configuration")
         run_preflight(cfg, cfg.state_dir, run_session=run_session, skip_smoke=False)
+        approval = details["approval"]
+        assert isinstance(approval, dict)
         store.append_audit_event(
             run_id=args.run_id,
-            event_id=f"audit-real-operation-{args.approval_ref}",
+            event_id=f"audit-real-operation-{approval['approval_ref']}",
             sequence=record.sequence + 1,
             kind="real_operation_approved",
             correlation_id=args.run_id,
             causation_id=None,
-            payload={"approval_ref": args.approval_ref, **details},
+            payload=details,
         )
         workflow = SequentialWorkflow(cfg, store, owner_id=f"real-operation-{os.getpid()}")
         coordinator = SequentialExecutionCoordinator(
@@ -280,6 +345,69 @@ def _cmd_execute(args: argparse.Namespace) -> int:
         return 2
     print(f"execute: completed accepted={outcome.accepted} report={outcome.report_path}")
     return 0 if outcome.accepted else 1
+
+
+def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .operation import RealOperationError, approve_real_operation, parse_permission_digest_args
+    from .plan import load_normalized_plan
+    from .state_store import StateStoreError
+
+    try:
+        config = load_config(args.config)
+        _setup_logging(config.observability.log_level)
+        store = state_mod.open_state_store(config)
+        record, _generation = store.load_run(args.run_id)
+        plan = load_normalized_plan(args.plan, config)
+        approval = approve_real_operation(
+            config=config,
+            record=record,
+            plan=plan,
+            repo_id=args.repo_id,
+            approval_ref=args.approval_ref,
+            permission_digests=parse_permission_digest_args(args.permission_digest),
+        )
+        atomic_write_private_text(args.output, approval.model_dump_json(indent=2) + "\n")
+    except (RealOperationError, StateStoreError, OSError, ValueError) as exc:
+        print(f"approve-real-operation: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(
+        "approve-real-operation: written "
+        f"{args.output} run={approval.run_id} repo={approval.repo_id} step={approval.step_id}"
+    )
+    return 0
+
+
+def _cmd_permission_manifest(args: argparse.Namespace) -> int:
+    from . import state as state_mod
+    from .config import load_config
+    from .operation import RealOperationError, compile_role_permission_manifest
+    from .plan import load_normalized_plan
+    from .state_store import StateStoreError
+
+    try:
+        config = load_config(args.config)
+        _setup_logging(config.observability.log_level)
+        store = state_mod.open_state_store(config)
+        record, _generation = store.load_run(args.run_id)
+        plan = load_normalized_plan(args.plan, config)
+        manifest = compile_role_permission_manifest(
+            config=config,
+            plan=plan,
+            record=record,
+            repo_id=args.repo_id,
+        )
+        atomic_write_private_text(args.output, manifest.model_dump_json(indent=2) + "\n")
+    except (RealOperationError, StateStoreError, OSError, ValueError) as exc:
+        print(f"permission-manifest: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(
+        "permission-manifest: written "
+        f"{args.output} repo={manifest.repo_id} step={manifest.step_id} "
+        f"roles={','.join(manifest.roles)}"
+    )
+    return 0
 
 
 def _cmd_preflight(args: argparse.Namespace) -> int:
@@ -302,6 +430,96 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"pre-flight: FAILED — {exc}", file=sys.stderr)
         return 1
+
+
+def produce_live_smoke_proof(
+    config: Config,
+    *,
+    model: str,
+    output: str | Path,
+    run_session: Callable[..., SessionResult] = real_run_session,
+) -> LiveSmokeProof:
+    """Run the isolated live smoke call and persist its sanitized proof."""
+    if os.environ.get("DISPATCHER_LIVE_OPENCODE") != "1":
+        raise RuntimeError(_LIVE_SMOKE_ENV_MESSAGE)
+
+    with tempfile.TemporaryDirectory(prefix="dispatcher-live-smoke-workdir-") as workdir_name:
+        with tempfile.TemporaryDirectory(prefix="dispatcher-live-smoke-state-") as state_dir_name:
+            workdir = Path(workdir_name)
+            result = run_session(
+                prompt=_LIVE_SMOKE_PROMPT,
+                model=model,
+                variant="",
+                session_id=None,
+                mode="new",
+                workdir=workdir,
+                title="dispatcher-read-only-live-smoke",
+                auto_approve=False,
+                timeout_seconds=30,
+                termination_grace_seconds=5,
+                max_output_bytes=65_536,
+                state_dir=Path(state_dir_name),
+                permission_config=_LIVE_SMOKE_PERMISSION_CONFIG,
+                snapshot_dirs=[str(workdir)],
+            )
+
+    response = result.chat_response.strip()
+    proof = LiveSmokeProof(
+        proof_version=1,
+        config_digest=config.config_digest,
+        model=model,
+        opencode_version=result.opencode_version,
+        passed=(result.exit_code == 0 and "LIVE_SMOKE_OK" in result.chat_response),
+        session_id_present=bool(result.session_id),
+        workdir_clean=(result.evidence_written == []),
+        evidence_written=result.evidence_written,
+        response=response,
+        completed_at=datetime.now(UTC),
+    )
+    success = (
+        proof.passed
+        and proof.session_id_present
+        and proof.workdir_clean
+        and proof.response == "LIVE_SMOKE_OK"
+        and proof.opencode_version == SUPPORTED_OPENCODE_VERSION
+    )
+    if not success:
+        failed_proof = proof if not proof.passed else proof.model_copy(update={"passed": False})
+        atomic_write_private_text(output, failed_proof.model_dump_json(indent=2) + "\n")
+        raise RuntimeError(
+            "live smoke result did not meet expectations: "
+            f"exit_code={result.exit_code}, session_id_present={proof.session_id_present}, "
+            f"workdir_clean={proof.workdir_clean}, response={proof.response!r}"
+        )
+    atomic_write_private_text(output, proof.model_dump_json(indent=2) + "\n")
+    return proof
+
+
+def _cmd_smoke_proof(
+    args: argparse.Namespace,
+    *,
+    run_session: Callable[..., SessionResult] = real_run_session,
+) -> int:
+    if os.environ.get("DISPATCHER_LIVE_OPENCODE") != "1":
+        print(f"smoke-proof: {_LIVE_SMOKE_ENV_MESSAGE}", file=sys.stderr)
+        return 2
+
+    from .config import load_config
+
+    try:
+        config = load_config(args.config)
+        _setup_logging(config.observability.log_level)
+        proof = produce_live_smoke_proof(
+            config,
+            model=args.model,
+            output=args.output,
+            run_session=run_session,
+        )
+    except Exception as exc:
+        print(f"smoke-proof: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(f"smoke-proof: written {args.output} passed={proof.passed}")
+    return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -371,6 +589,7 @@ def _print_status_text(snapshot: dict[str, object]) -> None:
 def _cmd_recover(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
+    from .sequential import SequentialWorkflow, SequentialWorkflowError
     from .state_store import StateStoreError
 
     cfg = load_config(args.config)
@@ -378,10 +597,55 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     try:
         store = state_mod.open_state_store(cfg)
         items = store.classify_recovery(args.run_id)
+        workflow = SequentialWorkflow(cfg, store, owner_id=f"recovery-{os.getpid()}")
+        adopted: list[str] = []
+        recovered_forwardings: list[str] = []
+        recovery_failures: list[str] = []
+        candidates = [
+            item for item in items if item.disposition == "structured_commit_adoption_required"
+        ]
+        completed = [item for item in items if item.disposition == "forwarding_required"]
+        if candidates or completed:
+            recovery_owner = f"recovery-{os.getpid()}"
+            store.acquire_run_lease(
+                project_id=cfg.project_id,
+                run_id=args.run_id,
+                owner_id=recovery_owner,
+                recovery_approved_by="recover-command",
+            )
+            try:
+                for item in candidates:
+                    structured = store.load_structured_git_record(args.run_id, item.dispatch_id)
+                    if structured.state != "STAGED":
+                        continue
+                    try:
+                        workflow.adopt_interrupted_structured_commit(args.run_id, item.dispatch_id)
+                    except SequentialWorkflowError:
+                        continue
+                    adopted.append(item.dispatch_id)
+                for item in completed:
+                    try:
+                        workflow.recover_completed_dispatch(args.run_id, item.dispatch_id)
+                    except (SequentialWorkflowError, StateStoreError) as exc:
+                        recovery_failures.append(f"{item.dispatch_id}: {exc}")
+                        continue
+                    recovered_forwardings.append(item.dispatch_id)
+            finally:
+                store.release_leases(
+                    owner_id=recovery_owner,
+                    resource_keys=[f"run:{cfg.project_id}"],
+                )
+        items = store.classify_recovery(args.run_id)
         workspace_items = store.classify_workspace_recovery(args.run_id)
     except StateStoreError as exc:
         print(f"recover: FAILED - {exc}", file=sys.stderr)
         return 2
+    for dispatch_id in adopted:
+        print(f"{dispatch_id}: adopted exact interrupted structured Git commit")
+    for dispatch_id in recovered_forwardings:
+        print(f"{dispatch_id}: recovered durable forwarding from completed result")
+    for failure in recovery_failures:
+        print(f"recover: forwarding recovery failed - {failure}", file=sys.stderr)
     if not items and not workspace_items:
         print("recover: no unresolved dispatches or workspaces")
         return 0
@@ -393,6 +657,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             f"-> {workspace_item.disposition}: {workspace_item.detail}"
         )
     needs_reconciliation = any(item.disposition == "operator_reconciliation_required" for item in items)
+    needs_reconciliation = needs_reconciliation or any(
+        item.disposition == "structured_commit_adoption_required" for item in items
+    )
+    needs_reconciliation = needs_reconciliation or any(
+        item.disposition == "forwarding_required" for item in items
+    )
     needs_reconciliation = needs_reconciliation or any(
         item.disposition == "operator_reconciliation_required" for item in workspace_items
     )
@@ -487,12 +757,27 @@ def _cmd_answer(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
     from .state_store import StateStoreError
+    from .workspaces import WorkspaceCoordinator, WorkspaceError
 
     cfg = load_config(args.config)
     _setup_logging(args.log_level or cfg.observability.log_level)
     try:
         store = state_mod.open_state_store(cfg)
-        _record, generation = store.load_run(args.run_id)
+        record, generation = store.load_run(args.run_id)
+        request = record.operator_request
+        if (
+            request is not None
+            and request.request_id == args.request_id
+            and request.kind == "workspace_reconciliation"
+            and args.answer == "reconcile"
+        ):
+            cleanup = WorkspaceCoordinator(cfg, store).cleanup(
+                run_id=args.run_id,
+                expected_generation=generation,
+                workspace_group_id=request.context_ref,
+                force=False,
+            )
+            generation = cleanup.generation
         updated, new_generation = store.answer_operator_request(
             run_id=args.run_id,
             expected_generation=generation,
@@ -500,7 +785,7 @@ def _cmd_answer(args: argparse.Namespace) -> int:
             answer=args.answer,
             actor_id=args.actor_id,
         )
-    except StateStoreError as exc:
+    except (StateStoreError, WorkspaceError) as exc:
         print(f"answer: FAILED - {exc}", file=sys.stderr)
         return 2
     print(f"answer: recorded  run={updated.run_id} state={updated.state.value} generation={new_generation}")
@@ -518,22 +803,34 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     try:
         store = state_mod.open_state_store(cfg)
         record, generation = store.load_run(args.run_id)
-        _updated, _generation, process_id, process_host = store.request_dispatch_cancellation(
-            run_id=args.run_id,
-            expected_generation=generation,
-            dispatch_id=args.dispatch_id,
-            actor_id=args.actor_id,
+        _updated, _generation, process_id, process_host, process_create_time = (
+            store.request_dispatch_cancellation(
+                run_id=args.run_id,
+                expected_generation=generation,
+                dispatch_id=args.dispatch_id,
+                actor_id=args.actor_id,
+            )
         )
         stopped = cancel_process_group(
             process_id,
             process_host,
             cfg.execution.termination_grace_seconds,
+            process_create_time,
         )
     except (OpenCodeAdapterError, OSError, StateStoreError, ValueError) as exc:
         print(f"cancel: FAILED - {exc}", file=sys.stderr)
         return 2
     print(f"cancel: recorded  run={record.run_id} dispatch={args.dispatch_id} process_stopped={stopped}")
     return 0
+
+
+def _reject_duplicate_decisions_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BaselineError(f"duplicate JSON key in decisions file: {key}")
+        result[key] = value
+    return result
 
 
 def _cmd_baseline(args: argparse.Namespace) -> int:
@@ -571,7 +868,10 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
                 print(payload, end="")
             return 0
         observation = BaselineObservation.model_validate_json(Path(args.observation).read_text(encoding="utf-8"))
-        raw_decisions = json.loads(Path(args.decisions).read_text(encoding="utf-8"))
+        raw_decisions = json.loads(
+            Path(args.decisions).read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_decisions_keys,
+        )
         if isinstance(raw_decisions, dict):
             raw_decisions = raw_decisions.get("decisions")
         if not isinstance(raw_decisions, list):
@@ -595,10 +895,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.command == "run":
         return _cmd_run(args)
+    elif args.command == "approve-real-operation":
+        return _cmd_approve_real_operation(args)
+    elif args.command == "permission-manifest":
+        return _cmd_permission_manifest(args)
     elif args.command == "execute":
         return _cmd_execute(args)
     elif args.command == "preflight":
         return _cmd_preflight(args)
+    elif args.command == "smoke-proof":
+        return _cmd_smoke_proof(args)
     elif args.command == "status":
         return _cmd_status(args)
     elif args.command == "start":

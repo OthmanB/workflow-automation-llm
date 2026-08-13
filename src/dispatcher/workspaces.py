@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import Config
-from .repository import inspect_repository
+from .repository import SAFE_GIT_ARGS, hardened_git_environment, inspect_repository
 from .state_store import StateStore
 from .workflow import (
     RunRecord,
@@ -187,6 +187,8 @@ class WorktreeManager:
             raise WorkspaceError("workspace cleanup must be recorded before removal")
         self._validate_group(group)
         source = self.config.repository_root(group.repo_id)
+        if not force:
+            self._validate_non_force_cleanup(group, source)
         errors: list[str] = []
         for child in group.children:
             path = Path(child.worktree_path)
@@ -229,6 +231,23 @@ class WorktreeManager:
         if group_root.exists():
             shutil.rmtree(group_root)
         return transition_workspace_group(group, WorkspaceGroupStatus.CLEANED, event)
+
+    def _validate_non_force_cleanup(self, group: WorkspaceGroup, source: Path) -> None:
+        source_head = self._git(source, "rev-parse", "HEAD")
+        owned = [(child.worktree_path, child.branch) for child in group.children]
+        owned.append((group.integration_worktree_path, group.integration_branch))
+        for path_value, branch in owned:
+            path = Path(path_value)
+            if path.exists():
+                actual_branch = self._git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+                if actual_branch != branch:
+                    raise WorkspaceError(f"workspace branch mismatch before cleanup: {path}")
+                if self._git(path, "status", "--porcelain", "--untracked-files=all"):
+                    raise WorkspaceError(f"workspace has uncommitted changes: {path}")
+            if self._branch_exists(source, branch):
+                branch_head = self._git(source, "rev-parse", f"refs/heads/{branch}")
+                if not _is_descendant(source, branch_head, source_head):
+                    raise WorkspaceError(f"workspace branch is not merged: {branch}")
 
     def _validate_group(self, group: WorkspaceGroup) -> None:
         if group.repo_id not in self.config.model.repositories:
@@ -275,8 +294,9 @@ class WorktreeManager:
     def _git(cwd: Path, *args: str) -> str:
         try:
             result = subprocess.run(
-                ["git", *args],
+                ["git", *SAFE_GIT_ARGS, *args],
                 cwd=cwd,
+                env=hardened_git_environment(),
                 capture_output=True,
                 check=True,
                 text=True,
@@ -322,8 +342,9 @@ def _worktree_map(output: str) -> dict[Path, dict[str, str]]:
 def _is_descendant(cwd: Path, base_revision: str, head_revision: str) -> bool:
     try:
         subprocess.run(
-            ["git", "merge-base", "--is-ancestor", base_revision, head_revision],
+            ["git", *SAFE_GIT_ARGS, "merge-base", "--is-ancestor", base_revision, head_revision],
             cwd=cwd,
+            env=hardened_git_environment(),
             capture_output=True,
             check=True,
             text=True,
@@ -415,6 +436,8 @@ class WorkspaceCoordinator:
             group = record.workspace_groups[workspace_group_id]
         except KeyError as exc:
             raise WorkspaceError(f"unknown workspace group: {workspace_group_id}") from exc
+        if group.state is WorkspaceGroupStatus.CLEANED:
+            return WorkspaceOutcome(record, generation, group)
         if group.state is WorkspaceGroupStatus.CLEANUP_PENDING:
             pending = group
         else:

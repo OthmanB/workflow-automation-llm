@@ -17,8 +17,9 @@ or complete work by prose alone.
 
 | Capability | Status | Limit |
 |---|---|---|
-| Schema-v1 config, plans, commands, results, and state | Implemented | Unknown or missing fields fail closed |
-| SQLite state, leases, recovery, and evidence | Implemented | `RUNNING` work is never retried automatically |
+| Versioned config, plan-v2, commands, proposals, results, and state | Implemented | Unknown or missing fields fail closed |
+| SQLite state, leases, recovery, and evidence | Implemented | `RUNNING` work is never retried; only an exact interrupted structured commit is adopted |
+| Dispatcher-owned verification and structured Git commits | Implemented | Exact writable scopes, configured identity, bounded subprocesses, no model Git authority |
 | Review profiles, budgets, and operator gates | Implemented | Measured worker usage only; live execution remains disabled |
 | Bounded worktree barriers | Implemented | Same-repository writes require clean `commit_policy: required` repositories; patch-only barriers remain unsupported |
 | Permission compilation | Implemented and fake-child tested | Live enforcement needs the opt-in compatibility suite |
@@ -49,10 +50,18 @@ plan are authoritative for current behavior.
 
 ```text
 dispatcher preflight --config <project.yaml>
+dispatcher permission-manifest --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
+   --repo-id <repo> --output <manifest.json>
 dispatcher execute --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
-  --repo-id <repo> --smoke-proof <proof.json> --smoke-model <provider/model> \
-  --permission-digest <sha256> --stall-policy-digest <sha256> \
-  --approval-ref <decision> --confirm-real-operation
+   --repo-id <repo> --smoke-proof <proof.json> --smoke-model <provider/model> \
+   --permission-digest <role>=<sha256> [--permission-digest <role>=<sha256> ...] \
+   --stall-policy-digest <sha256> \
+   --approval-record <approval.json> --confirm-real-operation
+dispatcher smoke-proof --config <private-v2.yaml> --model <provider/model> --output <proof.json>
+dispatcher approve-real-operation --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
+   --repo-id <repo> --approval-ref <decision> \
+   --permission-digest <role>=<sha256> [--permission-digest <role>=<sha256> ...] \
+   --output <approval.json>
 dispatcher start --config <project.yaml> --run-record <run.json>
 dispatcher status --config <project.yaml> [--run-id <id>] [--format text|json]
 dispatcher resume --config <project.yaml> --run-id <id>

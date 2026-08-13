@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
 import socket
 import threading
 import uuid
@@ -16,7 +18,22 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Protocol, TypeVar, cast
 
 from .config import Config
-from .permissions import compile_effective_policy, generate_opencode_config, should_auto_approve
+from .git_commit import (
+    StructuredGitError,
+    StructuredGitIntent,
+    adopt_structured_git_commit,
+    execute_structured_git_commit,
+    prepare_structured_git_intent,
+)
+from .mcp import compile_role_mcp_servers, resolve_role_mcp_tools
+from .permissions import (
+    READ_ONLY_DIAGNOSTIC_COMMANDS,
+    READ_ONLY_NATIVE_TOOLS,
+    compile_effective_policy,
+    generate_opencode_config,
+    role_scoped_authorized_actions,
+    should_auto_approve,
+)
 from .plan import PlanError, PlanStep, validate_plan_approval, verify_plan_sources
 from .policy import PolicyError, compile_run_policy
 from .protocol import (
@@ -31,15 +48,24 @@ from .protocol import (
 from .repository import (
     RepositorySnapshot,
     RepositoryValidationError,
+    authoritative_evidence,
     inspect_repository,
     inspect_workspace,
     validate_executor_snapshot,
+    validate_pending_executor_changes,
     validate_review_snapshot,
+    working_patch_sha256,
 )
 from .results import (
-    EXECUTOR_RESPONSE_CONTRACT,
+    EXECUTOR_PROPOSAL_CONTRACT,
+    EXECUTOR_PROPOSAL_OUTCOME_OPTIONS,
     REVIEWER_RESPONSE_CONTRACT,
+    REVIEWER_VERDICT_OPTIONS,
+    ExecutorBlockedResult,
+    ExecutorCompletedProposal,
     ExecutorCompletedResult,
+    ExecutorFailedResult,
+    ExecutorProposal,
     ExecutorResult,
     ResultError,
     ResultExpectation,
@@ -47,11 +73,20 @@ from .results import (
     ReviewerChangesRequestedResult,
     ReviewerResult,
     ReviewTarget,
+    VerificationResult,
+    parse_executor_proposal,
+    parse_executor_result,
+    parse_reviewer_result,
+    validate_executor_proposal_context,
     validate_executor_result_context,
     validate_reviewer_result_context,
 )
+from .results import RepositoryCoordinate as ResultRepositoryCoordinate
 from .scheduler import SchedulingError, resource_keys, validate_batch, validate_workspace_batch
-from .state_store import DispatchPayload, StateStore
+from .schema_export import schema_documents
+from .security import redact_text
+from .state_store import DispatchPayload, StateStore, StateStoreError
+from .verification import AuthoritativeVerification
 from .workflow import (
     ACTIVE_DISPATCH_STATES,
     BatchRecord,
@@ -73,6 +108,7 @@ from .workflow import (
     WorkspaceGroupStatus,
     completion_obligations,
     transition_batch,
+    transition_dispatch,
     transition_run,
     transition_step,
 )
@@ -94,6 +130,10 @@ class RepositoryInspector(Protocol):
 
 class SequentialWorkflowError(ValueError):
     """A supervisor request or worker result violates dispatcher-owned invariants."""
+
+
+class WorkerResultValidationError(SequentialWorkflowError):
+    """A structurally valid worker result violates its active plan context."""
 
 
 T = TypeVar("T")
@@ -191,6 +231,7 @@ class SequentialWorkflow:
             "baseline": _baseline_markdown(record),
             "dispatch_example": _dispatch_example(self.config, record),
             "completion_example": _completion_example(),
+            "observation_tools": _observation_tools_markdown(self.config),
         }
         rendered = template.format(**values)
         path = self.store.write_transcript(
@@ -328,6 +369,10 @@ class SequentialWorkflow:
                 f"supervisor repository assertion {command.repo_id!r} does not match step repository {step.repo_id!r}"
             )
         role_kind = self._role_kind(command.target_role)
+        authorized_actions = role_scoped_authorized_actions(
+            step.authorization.authorized_actions,
+            role_kind,
+        )
         if not record.steps[step.step_id].operator_gate_resolved:
             return self._request_risk_gate(record, generation, step)
         self._ensure_budget_allows_dispatch(
@@ -350,15 +395,25 @@ class SequentialWorkflow:
                 self.config,
                 repo_id=step.repo_id,
                 role_key=command.target_role,
-                dispatch_authorized_actions=step.authorization.authorized_actions,
-            )
+                dispatch_authorized_actions=authorized_actions,
+            ),
+            mcp_servers=compile_role_mcp_servers(self.config, command.target_role),
         )
+        evidence_diagnostic_commands: tuple[str, ...] = ()
         policy_rules = policy["permission"]
         step_record = record.steps[step.step_id]
         attempt = step_record.executor_attempts + 1 if role_kind == "executor" else step_record.reviewer_attempts + 1
         dispatch_id = f"dispatch-{uuid.uuid4().hex}"
         event = self._event(record, "dispatcher", f"prepared {role_kind} dispatch", dispatch_id)
         review_target = self._review_target(record, step) if role_kind == "reviewer" else None
+        review_authoritative_verification = (
+            self.store.load_dispatch_payload(
+                record.run_id,
+                review_target.executor_dispatch_id,
+            ).authoritative_verification
+            if review_target is not None
+            else None
+        )
         worker_prompt = _worker_prompt(
             dispatch_id=dispatch_id,
             attempt=attempt,
@@ -370,6 +425,10 @@ class SequentialWorkflow:
             ),
             evidence_roots=self.config.repository(step.repo_id).evidence_roots,
             review_target=review_target,
+            review_authoritative_verification=review_authoritative_verification,
+            evidence_diagnostic_commands=evidence_diagnostic_commands,
+            authorized_actions=authorized_actions,
+            mcp_tools=resolve_role_mcp_tools(self.config, command.target_role),
         )
         dispatch = DispatchRecord(
             dispatch_id=dispatch_id,
@@ -527,6 +586,10 @@ class SequentialWorkflow:
                     f"supervisor repository assertion {child.repo_id!r} does not match step repository {step.repo_id!r}"
                 )
             role_kind = self._role_kind(child.target_role)
+            authorized_actions = role_scoped_authorized_actions(
+                step.authorization.authorized_actions,
+                role_kind,
+            )
             if not working.steps[step.step_id].operator_gate_resolved:
                 raise SequentialWorkflowError(f"batch step {step.step_id} has an unresolved operator gate")
             self._ensure_budget_allows_dispatch(
@@ -548,9 +611,11 @@ class SequentialWorkflow:
                     self.config,
                     repo_id=step.repo_id,
                     role_key=child.target_role,
-                    dispatch_authorized_actions=step.authorization.authorized_actions,
-                )
+                    dispatch_authorized_actions=authorized_actions,
+                ),
+                mcp_servers=compile_role_mcp_servers(self.config, child.target_role),
             )
+            evidence_diagnostic_commands: tuple[str, ...] = ()
             step_record = working.steps[step.step_id]
             attempt = (
                 step_record.executor_attempts + 1
@@ -565,6 +630,14 @@ class SequentialWorkflow:
                 dispatch_id,
             )
             review_target = self._review_target(working, step) if role_kind == "reviewer" else None
+            review_authoritative_verification = (
+                self.store.load_dispatch_payload(
+                    working.run_id,
+                    review_target.executor_dispatch_id,
+                ).authoritative_verification
+                if review_target is not None
+                else None
+            )
             worker_prompt = _worker_prompt(
                 dispatch_id=dispatch_id,
                 attempt=attempt,
@@ -576,6 +649,10 @@ class SequentialWorkflow:
                 ),
                 evidence_roots=self.config.repository(step.repo_id).evidence_roots,
                 review_target=review_target,
+                review_authoritative_verification=review_authoritative_verification,
+                evidence_diagnostic_commands=evidence_diagnostic_commands,
+                authorized_actions=authorized_actions,
+                mcp_tools=resolve_role_mcp_tools(self.config, child.target_role),
             )
             dispatch = DispatchRecord(
                 dispatch_id=dispatch_id,
@@ -715,6 +792,7 @@ class SequentialWorkflow:
         prepared: PreparedDispatch,
         *,
         process_id: int,
+        process_create_time: float,
     ) -> PreparedDispatch:
         """Durably record a worker launch before accepting any worker result."""
         record, generation = self.store.load_run(prepared.run_id)
@@ -748,6 +826,7 @@ class SequentialWorkflow:
             process_id=process_id,
             process_host=socket.gethostname(),
             process_started_at=event.occurred_at,
+            process_create_time=process_create_time,
         )
         return PreparedDispatch(
             run_id=prepared.run_id,
@@ -780,8 +859,7 @@ class SequentialWorkflow:
         if dispatch.state is not DispatchStatus.RUNNING:
             raise SequentialWorkflowError("session ID arrived for a dispatch that is not RUNNING")
         event = self._event(record, "dispatcher", "OpenCode session identified", dispatch.dispatch_id)
-        pool = "executors" if dispatch.role_kind == "executor" else "reviewers"
-        session_registry_key = dispatch.logical_session_key if dispatch.batch_id is not None else dispatch.role_key
+        pool, session_registry_key = session_registry_identity(dispatch)
         updated, next_generation = self.store.bind_dispatch_session(
             record,
             expected_generation=generation,
@@ -820,7 +898,10 @@ class SequentialWorkflow:
         prepared: PreparedDispatch,
         result: ExecutorResult,
         *,
+        authoritative_verification: tuple[AuthoritativeVerification, ...] = (),
         usage: Mapping[str, object] | None = None,
+        repository_after: RepositorySnapshot | None = None,
+        structured_git_final: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, int, str]:
         """Apply a typed executor result and persist the next supervisor message."""
         if prepared.dispatch.role_kind != "executor":
@@ -829,11 +910,26 @@ class SequentialWorkflow:
         if generation != prepared.generation and self.config.execution.scheduling == "sequential":
             raise SequentialWorkflowError("running dispatch generation is stale")
         dispatch = record.dispatches[prepared.dispatch.dispatch_id]
-        record, generation = self._record_usage(record, generation, dispatch, usage)
+        record, generation = self._record_usage(
+            record,
+            generation,
+            dispatch,
+            usage,
+            persist=structured_git_final is None,
+        )
         _validate_executor_result(result, dispatch)
         step = _plan_step(record, dispatch.step_id)
-        self._validate_executor_evidence(step, result)
-        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
+        authoritative_verification = _effective_authoritative_verification(
+            self.config,
+            result,
+            authoritative_verification,
+        )
+        _validate_result_verification(step, result, authoritative_verification)
+        if isinstance(result, ExecutorCompletedResult):
+            self._validate_executor_evidence(step, result)
+        repository_after = repository_after or self._inspect_dispatch_repository(
+            record, dispatch, require_clean=False
+        )
         try:
             validate_executor_snapshot(
                 self.config,
@@ -845,64 +941,26 @@ class SequentialWorkflow:
         except RepositoryValidationError as exc:
             raise SequentialWorkflowError(str(exc)) from exc
         completion_event = self._event(record, "executor", "typed executor result received", dispatch.dispatch_id)
-        record, generation = self.store.commit_dispatch_transition(
-            record,
-            expected_generation=generation,
-            dispatch_id=dispatch.dispatch_id,
-            target=DispatchStatus.COMPLETED,
-            event=completion_event,
+        completed = transition_dispatch(
+            dispatch,
+            DispatchStatus.COMPLETED,
+            completion_event,
             result_digest=_sha256_json(result.model_dump(mode="json")),
-            result=result.model_dump(mode="json"),
-            repository_after=repository_after.model_dump(mode="json"),
+        )
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch.dispatch_id] = completed
+        record = record.model_copy(
+            update={
+                "dispatches": dispatches,
+                "sequence": completion_event.sequence,
+                "updated_at": completion_event.occurred_at,
+            }
         )
         step_record = record.steps[step.step_id]
         result_event = self._event(record, "dispatcher", f"executor outcome {result.outcome}", dispatch.dispatch_id)
-        escalation_required = False
-        if isinstance(result, ExecutorCompletedResult):
-            executed = transition_step(step_record, StepStatus.EXECUTED, result_event)
-            obligation = self._review_obligation(record, step)
-            target = StepStatus.REVIEW_REQUIRED if obligation.required else StepStatus.ACCEPTED
-            final_event = self._event(
-                record,
-                "dispatcher",
-                f"step moved to {target.value}",
-                dispatch.dispatch_id,
-                sequence=result_event.sequence + 1,
-            )
-            updated_step = transition_step(executed, target, final_event)
-            updated_step = updated_step.model_copy(
-                update={
-                    "accepted_artifact_ids": [item.artifact_id for item in result.evidence],
-                    # A fresh executor result invalidates prior reviewer votes on older work.
-                    "review_acceptances": 0,
-                    "accepted_reviewer_role_keys": [],
-                }
-            )
-        elif result.outcome == "blocked":
-            blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
-            updated_step = self._retry_or_terminal_step(
-                record,
-                step,
-                blocked,
-                policy=step.retry.on_blocked,
-                correlation_id=dispatch.dispatch_id,
-            )
-            escalation_required = step.retry.on_blocked == "escalate"
-        else:
-            if step.retry.on_failed == "retry" and step_record.executor_attempts < step.retry.max_executor_attempts:
-                blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
-                updated_step = self._retry_or_terminal_step(
-                    record,
-                    step,
-                    blocked,
-                    policy="retry",
-                    correlation_id=dispatch.dispatch_id,
-                )
-            elif step.retry.on_failed == "escalate":
-                updated_step = transition_step(step_record, StepStatus.BLOCKED, result_event)
-                escalation_required = True
-            else:
-                updated_step = transition_step(step_record, StepStatus.FAILED, result_event)
+        updated_step, escalation_required = self._executor_step_outcome(
+            record, step, step_record, dispatch, result, result_event
+        )
         record, generation = self._replace_step(record, generation, updated_step)
         forwarding = _executor_forwarding(
             result,
@@ -910,21 +968,674 @@ class SequentialWorkflow:
                 dispatch.runtime_session_id or dispatch.logical_session_key,
                 UsageAmount(),
             ),
+            authoritative_verification,
         )
-        forward_event = self._event(record, "dispatcher", "supervisor forwarding persisted", dispatch.dispatch_id)
-        record, generation = self.store.commit_dispatch_transition(
+        record = self._forwarding_record(
+            record,
+            completed,
+            dispatch_id=dispatch.dispatch_id,
+            event_reason="supervisor forwarding persisted",
+            forwarding=forwarding,
+        )
+        if escalation_required:
+            record = self._escalation_waiting_record(record, step, dispatch)
+        record, generation = self.store.persist_forwarded_dispatch(
             record,
             expected_generation=generation,
             dispatch_id=dispatch.dispatch_id,
-            target=DispatchStatus.FORWARDED,
-            event=forward_event,
-            forwarding_digest=_sha256_text(forwarding),
+            result=result.model_dump(mode="json"),
+            authoritative_verification=[
+                item.model_dump(mode="json") for item in authoritative_verification
+            ],
+            repository_after=repository_after.model_dump(mode="json"),
             forwarding_payload=forwarding,
+            structured_git_final=structured_git_final,
         )
         self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         if escalation_required:
-            return self._request_escalation(record, generation, step, dispatch, forwarding)
+            return record, generation, forwarding
         return self._apply_budget_limit(record, generation, dispatch, forwarding)
+
+    def record_executor_proposal(
+        self,
+        prepared: PreparedDispatch,
+        proposal: ExecutorProposal,
+    ) -> RepositorySnapshot:
+        """Validate and persist one model proposal before dispatcher side effects."""
+        if prepared.dispatch.role_kind != "executor":
+            raise SequentialWorkflowError("executor proposal does not match a reviewer dispatch")
+        record, _generation = self.store.load_run(prepared.run_id)
+        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        step = _plan_step(record, dispatch.step_id)
+        _validate_executor_proposal(step, proposal, dispatch)
+        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
+        if isinstance(proposal, ExecutorCompletedProposal):
+            validate_pending_executor_changes(
+                self.config,
+                coordinate=dispatch.intent.repository,
+                before=prepared.repository_before,
+                after=repository_after,
+                root=prepared.workdir,
+                writable_paths=step.authorization.writable_paths,
+                require_changes=self.config.repository(step.repo_id).commit_policy == "required",
+            )
+            authoritative_evidence(
+                self.config,
+                repo_id=step.repo_id,
+                snapshot=repository_after,
+                requirements=step.evidence_requirements,
+                declarations=proposal.evidence,
+            )
+        elif repository_after != prepared.repository_before:
+            raise SequentialWorkflowError(
+                "blocked or failed executor proposal left repository changes"
+            )
+        self.store.record_executor_proposal(
+            run_id=record.run_id,
+            dispatch_id=dispatch.dispatch_id,
+            proposal=proposal.model_dump(mode="json"),
+        )
+        return repository_after
+
+    def materialize_executor_proposal(
+        self,
+        prepared: PreparedDispatch,
+        proposal: ExecutorProposal,
+        *,
+        authoritative_verification: tuple[AuthoritativeVerification, ...],
+        usage: Mapping[str, object] | None,
+        verified_snapshot: RepositorySnapshot | None = None,
+    ) -> tuple[RunRecord, int, str]:
+        """Convert a proposal into one dispatcher-authoritative executor result."""
+        record, _generation = self.store.load_run(prepared.run_id)
+        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+        step = _plan_step(record, dispatch.step_id)
+        repository = self.config.repository(step.repo_id)
+        canonical_usage: Mapping[str, object] | None = None
+        if usage is not None:
+            canonical_usage = _usage_amount(usage).model_dump(mode="json")
+        elif self.config.model.budget.enabled:
+            raise SequentialWorkflowError(
+                "measured OpenCode usage is required while budget enforcement is enabled"
+            )
+        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
+        if verified_snapshot is not None and repository_after != verified_snapshot:
+            raise WorkerResultValidationError(
+                "repository changed between proposal inspection and verification materialization"
+            )
+        verification = [
+            VerificationResult(check_id=item.check_id, status=item.status, summary=item.summary)
+            for item in authoritative_verification
+        ]
+        structured_git_final: Mapping[str, Any]
+
+        if isinstance(proposal, ExecutorCompletedProposal):
+            if [item.check_id for item in authoritative_verification] != [
+                criterion.criterion_id for criterion in step.acceptance_criteria
+            ] or any(item.status != "passed" for item in authoritative_verification):
+                raise WorkerResultValidationError(
+                    "completed executor proposal requires exact passing dispatcher verification"
+                )
+            artifacts = authoritative_evidence(
+                self.config,
+                repo_id=step.repo_id,
+                snapshot=repository_after,
+                requirements=step.evidence_requirements,
+                declarations=proposal.evidence,
+            )
+            checked_payload = {
+                "authoritative_verification": [
+                    item.model_dump(mode="json") for item in authoritative_verification
+                ],
+                "evidence": [item.model_dump(mode="json") for item in artifacts],
+                "repository_before": prepared.repository_before.model_dump(mode="json"),
+                "repository_dirty": repository_after.model_dump(mode="json"),
+                "usage": canonical_usage,
+            }
+            if repository.commit_policy == "required":
+                try:
+                    intent = prepare_structured_git_intent(
+                        self.config,
+                        step=step,
+                        attempt=dispatch.attempt,
+                        worktree=prepared.workdir,
+                        coordinate=dispatch.intent.repository,
+                        before=prepared.repository_before,
+                        dirty=repository_after,
+                    )
+                    self.store.record_structured_git_checked(
+                        run_id=record.run_id,
+                        dispatch_id=dispatch.dispatch_id,
+                        checked=checked_payload,
+                        intent=intent.model_dump(mode="json"),
+                    )
+
+                    def record_staged(stage: Any) -> None:
+                        self.store.record_structured_git_staged(
+                            run_id=record.run_id,
+                            dispatch_id=dispatch.dispatch_id,
+                            stage=stage.model_dump(mode="json"),
+                        )
+
+                    outcome = execute_structured_git_commit(
+                        self.config,
+                        worktree=prepared.workdir,
+                        intent=intent,
+                        on_staged=record_staged,
+                    )
+                except (RepositoryValidationError, StructuredGitError, StateStoreError) as exc:
+                    try:
+                        self.store.mark_structured_git_reconciliation(
+                            run_id=record.run_id,
+                            dispatch_id=dispatch.dispatch_id,
+                            detail=str(exc),
+                        )
+                    except StateStoreError:
+                        pass
+                    raise SequentialWorkflowError(str(exc)) from exc
+                repository_after = outcome.repository_after
+                artifacts = authoritative_evidence(
+                    self.config,
+                    repo_id=step.repo_id,
+                    snapshot=repository_after,
+                    requirements=step.evidence_requirements,
+                    declarations=proposal.evidence,
+                )
+                result_coordinate = ResultRepositoryCoordinate(
+                    repo_id=step.repo_id,
+                    base_revision=dispatch.intent.repository.base_revision,
+                    result_revision=outcome.result_revision,
+                    patch_sha256=None,
+                )
+                structured_git_final = {
+                    "state": "COMMITTED",
+                    "commit": outcome.commit.model_dump(mode="json"),
+                    "result_revision": outcome.result_revision,
+                    "repository_after": repository_after.model_dump(mode="json"),
+                }
+            else:
+                validate_pending_executor_changes(
+                    self.config,
+                    coordinate=dispatch.intent.repository,
+                    before=prepared.repository_before,
+                    after=repository_after,
+                    root=prepared.workdir,
+                    writable_paths=step.authorization.writable_paths,
+                    require_changes=False,
+                )
+                patch_sha256 = working_patch_sha256(prepared.workdir)
+                self.store.record_structured_git_checked(
+                    run_id=record.run_id,
+                    dispatch_id=dispatch.dispatch_id,
+                    checked=checked_payload,
+                    intent=None,
+                )
+                result_coordinate = ResultRepositoryCoordinate(
+                    repo_id=step.repo_id,
+                    base_revision=dispatch.intent.repository.base_revision,
+                    result_revision=repository_after.revision,
+                    patch_sha256=patch_sha256,
+                )
+                structured_git_final = {
+                    "state": "NO_COMMIT_FINALIZED",
+                    "commit": None,
+                    "result_revision": repository_after.revision,
+                    "repository_after": repository_after.model_dump(mode="json"),
+                }
+            result: ExecutorResult = ExecutorCompletedResult(
+                result_version=1,
+                response_contract="dispatcher.executor_result.v1",
+                dispatch_id=proposal.dispatch_id,
+                attempt=proposal.attempt,
+                step_id=proposal.step_id,
+                repository=result_coordinate,
+                evidence=artifacts,
+                verification=verification,
+                summary=proposal.summary,
+                transcript_ref=proposal.transcript_ref,
+                outcome="completed",
+            )
+        else:
+            clean_after = self._inspect_dispatch_repository(record, dispatch, require_clean=True)
+            if clean_after != prepared.repository_before:
+                raise SequentialWorkflowError(
+                    "blocked or failed executor proposal left repository changes"
+                )
+            self.store.record_structured_git_checked(
+                run_id=record.run_id,
+                dispatch_id=dispatch.dispatch_id,
+                checked={
+                    "repository_after": clean_after.model_dump(mode="json"),
+                    "usage": canonical_usage,
+                },
+                intent=None,
+            )
+            skipped = [
+                VerificationResult(
+                    check_id=item.check_id,
+                    status="skipped",
+                    summary=item.summary,
+                )
+                for item in proposal.criterion_self_reports
+            ]
+            coordinate = ResultRepositoryCoordinate(
+                repo_id=step.repo_id,
+                base_revision=dispatch.intent.repository.base_revision,
+                result_revision=clean_after.revision,
+                patch_sha256=None,
+            )
+            if proposal.outcome == "blocked":
+                result = ExecutorBlockedResult(
+                    result_version=1,
+                    response_contract="dispatcher.executor_result.v1",
+                    dispatch_id=proposal.dispatch_id,
+                    attempt=proposal.attempt,
+                    step_id=proposal.step_id,
+                    repository=coordinate,
+                    evidence=[],
+                    verification=skipped,
+                    summary=proposal.summary,
+                    transcript_ref=proposal.transcript_ref,
+                    outcome="blocked",
+                    blockers=proposal.blockers,
+                )
+            else:
+                result = ExecutorFailedResult(
+                    result_version=1,
+                    response_contract="dispatcher.executor_result.v1",
+                    dispatch_id=proposal.dispatch_id,
+                    attempt=proposal.attempt,
+                    step_id=proposal.step_id,
+                    repository=coordinate,
+                    evidence=[],
+                    verification=skipped,
+                    summary=proposal.summary,
+                    transcript_ref=proposal.transcript_ref,
+                    outcome="failed",
+                    failure_code=proposal.failure_code,
+                )
+            repository_after = clean_after
+            structured_git_final = {
+                "state": "NO_COMMIT_FINALIZED",
+                "commit": None,
+                "result_revision": clean_after.revision,
+                "repository_after": clean_after.model_dump(mode="json"),
+            }
+        return self.apply_executor_result(
+            prepared,
+            result,
+            authoritative_verification=authoritative_verification,
+            usage=canonical_usage,
+            repository_after=repository_after,
+            structured_git_final=structured_git_final,
+        )
+
+    @_serialized_transition
+    def adopt_interrupted_structured_commit(
+        self,
+        run_id: str,
+        dispatch_id: str,
+    ) -> tuple[RunRecord, int, str]:
+        """Adopt one exact dispatcher-created commit after its final state write was interrupted."""
+        record, generation = self.store.load_run(run_id)
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown recovery dispatch: {dispatch_id}") from exc
+        if dispatch.role_kind != "executor" or dispatch.state is not DispatchStatus.RUNNING:
+            raise SequentialWorkflowError(
+                "structured commit adoption requires a RUNNING executor dispatch"
+            )
+        if _dispatch_process_is_active(dispatch):
+            raise SequentialWorkflowError(
+                "structured commit adoption is unavailable while the recorded worker process is active"
+            )
+        structured = self.store.load_structured_git_record(run_id, dispatch_id)
+        if structured.state != "STAGED" or structured.intent is None or structured.checked is None:
+            raise SequentialWorkflowError(
+                "structured commit adoption requires durable STAGED intent and checked observations"
+            )
+        payload = self.store.load_dispatch_payload(run_id, dispatch_id)
+        if payload.repository_before is None:
+            raise SequentialWorkflowError("structured commit recovery has no durable pre-dispatch snapshot")
+        step = _plan_step(record, dispatch.step_id)
+        group = self._workspace_group_for_step(
+            record,
+            dispatch.step_id,
+            dispatch.workspace_group_id,
+        )
+        workdir = (
+            Path(_workspace_child(group, dispatch.step_id).worktree_path)
+            if group is not None
+            else self.config.repository_root(step.repo_id)
+        )
+        try:
+            proposal = parse_executor_proposal(structured.proposal)
+            if not isinstance(proposal, ExecutorCompletedProposal):
+                raise SequentialWorkflowError(
+                    "only a completed executor proposal can have an adoptable commit"
+                )
+            _validate_executor_proposal(step, proposal, dispatch)
+            intent = StructuredGitIntent.model_validate_json(json.dumps(structured.intent))
+            before = RepositorySnapshot.model_validate_json(json.dumps(payload.repository_before))
+            checked_before = structured.checked.get("repository_before")
+            if checked_before != before.model_dump(mode="json"):
+                raise SequentialWorkflowError(
+                    "structured commit checked snapshot differs from durable dispatch input"
+                )
+            raw_dirty = structured.checked.get("repository_dirty")
+            if not isinstance(raw_dirty, dict):
+                raise SequentialWorkflowError(
+                    "structured commit recovery has no durable dirty repository observation"
+                )
+            dirty = RepositorySnapshot.model_validate_json(json.dumps(raw_dirty))
+            if dirty.manifest_sha256 != intent.pre_commit_snapshot_sha256:
+                raise SequentialWorkflowError(
+                    "structured commit dirty snapshot does not match the durable commit intent"
+                )
+            if dirty.worktree_id != intent.worktree_id or dirty.revision != intent.base_revision:
+                raise SequentialWorkflowError(
+                    "structured commit dirty snapshot identity does not match the durable commit intent"
+                )
+            if dirty.git_metadata_sha256 != before.git_metadata_sha256:
+                raise SequentialWorkflowError(
+                    "structured commit dirty snapshot records Git metadata mutation"
+                )
+            if dirty.git_refs_sha256 != before.git_refs_sha256:
+                raise SequentialWorkflowError(
+                    "structured commit dirty snapshot records Git refs mutation"
+                )
+            raw_verification = structured.checked.get("authoritative_verification")
+            if not isinstance(raw_verification, list):
+                raise SequentialWorkflowError(
+                    "structured commit recovery has no durable authoritative verification"
+                )
+            authoritative_verification = tuple(
+                AuthoritativeVerification.model_validate_json(json.dumps(item))
+                for item in raw_verification
+            )
+            raw_usage = structured.checked.get("usage")
+            if raw_usage is None:
+                if self.config.model.budget.enabled:
+                    raise SequentialWorkflowError(
+                        "structured commit recovery has no durable measured usage"
+                    )
+                recovery_usage: Mapping[str, object] | None = None
+            elif isinstance(raw_usage, dict):
+                recovery_usage = _usage_amount(raw_usage).model_dump(mode="json")
+            else:
+                raise SequentialWorkflowError(
+                    "structured commit recovery has malformed durable measured usage"
+                )
+            adoption, repository_after = adopt_structured_git_commit(
+                self.config,
+                worktree=workdir,
+                intent=intent,
+            )
+            artifacts = authoritative_evidence(
+                self.config,
+                repo_id=step.repo_id,
+                snapshot=repository_after,
+                requirements=step.evidence_requirements,
+                declarations=proposal.evidence,
+            )
+            if structured.checked.get("evidence") != [
+                artifact.model_dump(mode="json") for artifact in artifacts
+            ]:
+                raise SequentialWorkflowError(
+                    "structured commit evidence differs from the durable checked observation"
+                )
+            if repository_after.git_metadata_sha256 != dirty.git_metadata_sha256:
+                raise SequentialWorkflowError(
+                    "adopted commit repository Git metadata differs from the durable dirty observation"
+                )
+        except (
+            ResultError,
+            RepositoryValidationError,
+            StructuredGitError,
+            SequentialWorkflowError,
+            ValueError,
+        ) as exc:
+            try:
+                self.store.mark_structured_git_reconciliation(
+                    run_id=run_id,
+                    dispatch_id=dispatch_id,
+                    detail=str(exc),
+                )
+            except StateStoreError:
+                pass
+            if isinstance(exc, SequentialWorkflowError):
+                raise
+            raise SequentialWorkflowError(str(exc)) from exc
+
+        verification = [
+            VerificationResult(check_id=item.check_id, status=item.status, summary=item.summary)
+            for item in authoritative_verification
+        ]
+        result = ExecutorCompletedResult(
+            result_version=1,
+            response_contract="dispatcher.executor_result.v1",
+            dispatch_id=proposal.dispatch_id,
+            attempt=proposal.attempt,
+            step_id=proposal.step_id,
+            repository=ResultRepositoryCoordinate(
+                repo_id=step.repo_id,
+                base_revision=dispatch.intent.repository.base_revision,
+                result_revision=adoption.result_revision,
+                patch_sha256=None,
+            ),
+            evidence=artifacts,
+            verification=verification,
+            summary=proposal.summary,
+            transcript_ref=proposal.transcript_ref,
+            outcome="completed",
+        )
+        dispatch_leases = [
+            lease
+            for lease in self.store.leases_for_run(run_id)
+            if lease.owner_id.endswith(f".dispatch.{dispatch_id}")
+        ]
+        lease_owners = {lease.owner_id for lease in dispatch_leases}
+        if len(lease_owners) > 1:
+            raise SequentialWorkflowError(
+                "structured commit recovery found multiple dispatch lease owners"
+            )
+        prepared = PreparedDispatch(
+            run_id=run_id,
+            generation=generation,
+            dispatch=dispatch,
+            prompt=payload.prompt,
+            workdir=workdir,
+            permission_config=dict(payload.policy),
+            auto_approve=False,
+            lease_keys=tuple(lease.resource_key for lease in dispatch_leases),
+            lease_owner_id=(
+                next(iter(lease_owners))
+                if lease_owners
+                else _dispatch_lease_owner_id(self.owner_id, dispatch_id)
+            ),
+            review_target=None,
+            session_mode="new",
+            session_id=None,
+            repository_before=before,
+        )
+        try:
+            return self.apply_executor_result(
+                prepared,
+                result,
+                authoritative_verification=authoritative_verification,
+                usage=recovery_usage,
+                repository_after=repository_after,
+                structured_git_final={
+                    "state": "COMMITTED",
+                    "commit": adoption.model_dump(mode="json"),
+                    "result_revision": adoption.result_revision,
+                    "repository_after": repository_after.model_dump(mode="json"),
+                },
+            )
+        except (SequentialWorkflowError, StateStoreError) as exc:
+            try:
+                self.store.mark_structured_git_reconciliation(
+                    run_id=run_id,
+                    dispatch_id=dispatch_id,
+                    detail=str(exc),
+                )
+            except StateStoreError:
+                pass
+            raise
+
+    @_serialized_transition
+    def recover_completed_dispatch(
+        self,
+        run_id: str,
+        dispatch_id: str,
+    ) -> tuple[RunRecord, int, str]:
+        """Reconstruct and persist forwarding for a durable COMPLETED dispatch.
+
+        Recovery uses only the durable result payload, authoritative
+        verification, and dispatch/step state. It never reruns Git commands,
+        verification checks, or a model. Step-outcome transitions replay only
+        when the step's last durable event was not correlated to this dispatch,
+        so acceptance and rework accounting apply exactly once.
+        """
+        record, generation = self.store.load_run(run_id)
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown recovery dispatch: {dispatch_id}") from exc
+        if dispatch.state is not DispatchStatus.COMPLETED:
+            raise SequentialWorkflowError(
+                "completed forwarding recovery requires a COMPLETED dispatch"
+            )
+        payload = self.store.load_dispatch_payload(run_id, dispatch_id)
+        if payload.result is None:
+            raise SequentialWorkflowError("completed dispatch has no durable result payload")
+        if payload.forwarding_payload:
+            raise SequentialWorkflowError(
+                "completed dispatch already has a durable forwarding payload"
+            )
+        step = _plan_step(record, dispatch.step_id)
+        step_record = record.steps[dispatch.step_id]
+        applied = step_record.active_dispatch_id != dispatch_id
+        escalation_required = False
+        review_id: str | None = None
+        review: Mapping[str, Any] | None = None
+        if dispatch.role_kind == "executor":
+            result: ExecutorResult = parse_executor_result(payload.result)
+            expectation = ResultExpectation(
+                dispatch_id=dispatch.dispatch_id,
+                attempt=dispatch.attempt,
+                step_id=dispatch.step_id,
+                repo_id=dispatch.intent.repository.repo_id,
+                expected_review_target=None,
+            )
+            try:
+                validate_executor_result_context(result, expectation)
+            except ResultError as exc:
+                raise SequentialWorkflowError(
+                    f"completed executor dispatch has an invalid durable result: {exc}"
+                ) from exc
+            verification = tuple(
+                AuthoritativeVerification.model_validate_json(json.dumps(item))
+                for item in payload.authoritative_verification or ()
+            )
+            if not applied:
+                if step_record.state is not StepStatus.EXECUTING:
+                    raise SequentialWorkflowError(
+                        "completed executor dispatch has incompatible step state "
+                        f"{step_record.state.value}"
+                    )
+                result_event = self._event(
+                    record,
+                    "dispatcher",
+                    f"executor outcome {result.outcome}",
+                    dispatch_id,
+                )
+                updated_step, escalation_required = self._executor_step_outcome(
+                    record, step, step_record, dispatch, result, result_event
+                )
+                record = self._step_replacement_record(record, updated_step)
+            usage = record.usage.by_session.get(
+                dispatch.runtime_session_id or dispatch.logical_session_key,
+                UsageAmount(),
+            )
+            forwarding = _executor_forwarding(result, usage, verification)
+        else:
+            reviewer_result: ReviewerResult = parse_reviewer_result(payload.result)
+            expectation = ResultExpectation(
+                dispatch_id=dispatch.dispatch_id,
+                attempt=dispatch.attempt,
+                step_id=dispatch.step_id,
+                repo_id=dispatch.intent.repository.repo_id,
+                expected_review_target=self._review_target(record, step),
+            )
+            try:
+                validate_reviewer_result_context(reviewer_result, expectation)
+            except ResultError as exc:
+                raise SequentialWorkflowError(
+                    f"completed reviewer dispatch has an invalid durable result: {exc}"
+                ) from exc
+            verification = tuple(
+                AuthoritativeVerification.model_validate_json(json.dumps(item))
+                for item in payload.authoritative_verification or ()
+            )
+            if (
+                isinstance(reviewer_result, ReviewerAcceptedResult)
+                and dispatch.role_key in step_record.accepted_reviewer_role_keys
+                and not applied
+            ):
+                raise SequentialWorkflowError(
+                    "completed reviewer dispatch was already accepted; "
+                    "duplicate acceptance recovery is forbidden"
+                )
+            review = payload.result
+            review_id = (
+                None
+                if self.store.review_for_dispatch(run_id, dispatch_id)
+                else f"review-{uuid.uuid4().hex}"
+            )
+            if not applied:
+                if step_record.state is not StepStatus.REVIEWING:
+                    raise SequentialWorkflowError(
+                        "completed reviewer dispatch has incompatible step state "
+                        f"{step_record.state.value}"
+                    )
+                verdict_event = self._event(
+                    record,
+                    "dispatcher",
+                    f"review verdict {reviewer_result.verdict}",
+                    dispatch_id,
+                )
+                updated_step, escalation_required = self._reviewer_step_outcome(
+                    record, step, step_record, dispatch, reviewer_result, verdict_event
+                )
+                record = self._step_replacement_record(record, updated_step)
+            usage = record.usage.by_session.get(
+                dispatch.runtime_session_id or dispatch.logical_session_key,
+                UsageAmount(),
+            )
+            forwarding = _reviewer_forwarding(reviewer_result, usage, verification)
+        record = self._forwarding_record(
+            record,
+            dispatch,
+            dispatch_id=dispatch_id,
+            event_reason="supervisor forwarding recovered",
+            forwarding=forwarding,
+        )
+        if escalation_required:
+            record = self._escalation_waiting_record(record, step, dispatch)
+        record, generation = self.store.persist_forwarded_dispatch(
+            record,
+            expected_generation=generation,
+            dispatch_id=dispatch_id,
+            result=payload.result,
+            authoritative_verification=list(payload.authoritative_verification or ()),
+            repository_after=payload.repository_after,
+            forwarding_payload=forwarding,
+            review_id=review_id,
+            review=review if review_id is not None else None,
+        )
+        return record, generation, forwarding
 
     @_serialized_transition
     def apply_reviewer_result(
@@ -932,6 +1643,7 @@ class SequentialWorkflow:
         prepared: PreparedDispatch,
         result: ReviewerResult,
         *,
+        authoritative_verification: tuple[AuthoritativeVerification, ...] = (),
         usage: Mapping[str, object] | None = None,
     ) -> tuple[RunRecord, int, str]:
         """Apply an immutable reviewer verdict to the exact reviewed work product."""
@@ -952,7 +1664,22 @@ class SequentialWorkflow:
         try:
             validate_reviewer_result_context(result, expectation)
         except ResultError as exc:
-            raise SequentialWorkflowError(str(exc)) from exc
+            raise WorkerResultValidationError(str(exc)) from exc
+        step = _plan_step(record, dispatch.step_id)
+        step_record = record.steps[step.step_id]
+        if (
+            isinstance(result, ReviewerAcceptedResult)
+            and dispatch.role_key in step_record.accepted_reviewer_role_keys
+        ):
+            raise WorkerResultValidationError(
+                "reviewer role already accepted this immutable artifact"
+            )
+        authoritative_verification = _effective_authoritative_verification(
+            self.config,
+            result,
+            authoritative_verification,
+        )
+        _validate_result_verification(step, result, authoritative_verification)
         repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
         try:
             validate_review_snapshot(
@@ -965,123 +1692,26 @@ class SequentialWorkflow:
         except RepositoryValidationError as exc:
             raise SequentialWorkflowError(str(exc)) from exc
         completion_event = self._event(record, "reviewer", "typed reviewer result received", dispatch.dispatch_id)
-        record, generation = self.store.commit_dispatch_transition(
-            record,
-            expected_generation=generation,
-            dispatch_id=dispatch.dispatch_id,
-            target=DispatchStatus.COMPLETED,
-            event=completion_event,
+        completed = transition_dispatch(
+            dispatch,
+            DispatchStatus.COMPLETED,
+            completion_event,
             result_digest=_sha256_json(result.model_dump(mode="json")),
-            result=result.model_dump(mode="json"),
-            repository_after=repository_after.model_dump(mode="json"),
         )
-        self.store.record_review(
-            run_id=record.run_id,
-            dispatch_id=dispatch.dispatch_id,
-            review_id=f"review-{uuid.uuid4().hex}",
-            review=result.model_dump(mode="json"),
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch.dispatch_id] = completed
+        record = record.model_copy(
+            update={
+                "dispatches": dispatches,
+                "sequence": completion_event.sequence,
+                "updated_at": completion_event.occurred_at,
+            }
         )
-        step = _plan_step(record, dispatch.step_id)
         step_record = record.steps[step.step_id]
         verdict_event = self._event(record, "dispatcher", f"review verdict {result.verdict}", dispatch.dispatch_id)
-        escalation_required = False
-        if isinstance(result, ReviewerAcceptedResult):
-            obligation = self._review_obligation(record, step)
-            if dispatch.role_key in step_record.accepted_reviewer_role_keys:
-                raise SequentialWorkflowError("reviewer role already accepted this immutable artifact")
-            accepted_roles = [*step_record.accepted_reviewer_role_keys, dispatch.role_key]
-            accepted_count = step_record.review_acceptances + 1
-            target = (
-                StepStatus.ACCEPTED
-                if accepted_count >= obligation.required_acceptances
-                else StepStatus.REVIEW_REQUIRED
-            )
-            updated_step = transition_step(step_record, target, verdict_event)
-            updated_step = updated_step.model_copy(
-                update={
-                    "review_acceptances": accepted_count,
-                    "accepted_reviewer_role_keys": accepted_roles,
-                    "accepted_artifact_ids": (
-                        [requirement.artifact_id for requirement in step.evidence_requirements]
-                        if target is StepStatus.ACCEPTED
-                        else []
-                    ),
-                }
-            )
-        elif isinstance(result, ReviewerChangesRequestedResult):
-            changed = transition_step(step_record, StepStatus.CHANGES_REQUESTED, verdict_event)
-            changed = changed.model_copy(update={"rework_rounds": step_record.rework_rounds + 1})
-            obligation = self._review_obligation(record, step)
-            remaining_reviewer_roles = set(obligation.reviewer_role_keys) - {
-                *step_record.accepted_reviewer_role_keys,
-                dispatch.role_key,
-            }
-            if remaining_reviewer_roles and step_record.review_acceptances:
-                tie_break_event = self._event(
-                    record,
-                    "dispatcher",
-                    "conflicting review requires a fresh tie-break on the immutable artifact",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(changed, StepStatus.REVIEW_REQUIRED, tie_break_event)
-            elif (
-                step.retry.on_changes_requested == "retry"
-                and changed.rework_rounds < self.config.execution.max_rounds_per_step
-                and (
-                step_record.executor_attempts < step.retry.max_executor_attempts
-                )
-            ):
-                ready_event = self._event(
-                    record,
-                    "dispatcher",
-                    "review rework is ready",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(changed, StepStatus.READY, ready_event)
-            elif step.retry.on_changes_requested == "escalate":
-                blocked_event = self._event(
-                    record,
-                    "dispatcher",
-                    "review rework requires escalation",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(changed, StepStatus.BLOCKED, blocked_event)
-                escalation_required = True
-            else:
-                failed_event = self._event(
-                    record,
-                    "dispatcher",
-                    "review rework policy halted the step",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(changed, StepStatus.FAILED, failed_event)
-        else:
-            blocked = transition_step(step_record, StepStatus.BLOCKED, verdict_event)
-            if step.retry.on_blocked == "retry" and step_record.reviewer_attempts < step.retry.max_reviewer_attempts:
-                retry_event = self._event(
-                    record,
-                    "dispatcher",
-                    "review retry is ready",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(blocked, StepStatus.REVIEW_REQUIRED, retry_event)
-            elif step.retry.on_blocked == "escalate":
-                updated_step = blocked
-                escalation_required = True
-            else:
-                failed_event = self._event(
-                    record,
-                    "dispatcher",
-                    "review blocked policy halted the step",
-                    dispatch.dispatch_id,
-                    sequence=verdict_event.sequence + 1,
-                )
-                updated_step = transition_step(blocked, StepStatus.FAILED, failed_event)
+        updated_step, escalation_required = self._reviewer_step_outcome(
+            record, step, step_record, dispatch, result, verdict_event
+        )
         record, generation = self._replace_step(record, generation, updated_step)
         forwarding = _reviewer_forwarding(
             result,
@@ -1089,20 +1719,33 @@ class SequentialWorkflow:
                 dispatch.runtime_session_id or dispatch.logical_session_key,
                 UsageAmount(),
             ),
+            authoritative_verification,
         )
-        forward_event = self._event(record, "dispatcher", "review forwarding persisted", dispatch.dispatch_id)
-        record, generation = self.store.commit_dispatch_transition(
+        record = self._forwarding_record(
+            record,
+            completed,
+            dispatch_id=dispatch.dispatch_id,
+            event_reason="review forwarding persisted",
+            forwarding=forwarding,
+        )
+        if escalation_required:
+            record = self._escalation_waiting_record(record, step, dispatch)
+        record, generation = self.store.persist_forwarded_dispatch(
             record,
             expected_generation=generation,
             dispatch_id=dispatch.dispatch_id,
-            target=DispatchStatus.FORWARDED,
-            event=forward_event,
-            forwarding_digest=_sha256_text(forwarding),
+            result=result.model_dump(mode="json"),
+            authoritative_verification=[
+                item.model_dump(mode="json") for item in authoritative_verification
+            ],
+            repository_after=repository_after.model_dump(mode="json"),
             forwarding_payload=forwarding,
+            review_id=f"review-{uuid.uuid4().hex}",
+            review=result.model_dump(mode="json"),
         )
         self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
         if escalation_required:
-            return self._request_escalation(record, generation, step, dispatch, forwarding)
+            return record, generation, forwarding
         return self._apply_budget_limit(record, generation, dispatch, forwarding)
 
     def acknowledge_forwarding(
@@ -1188,74 +1831,82 @@ class SequentialWorkflow:
         prepared: PreparedDispatch,
         *,
         reason: str,
+        failure_category: str,
+        failure_detail: str,
     ) -> tuple[RunRecord, int]:
         """Record a failed adapter/result boundary without advancing the plan step."""
-        record, generation = self.store.load_run(prepared.run_id)
-        if generation != prepared.generation and self.config.execution.scheduling == "sequential":
-            raise SequentialWorkflowError("failed dispatch generation is stale")
-        dispatch = record.dispatches[prepared.dispatch.dispatch_id]
-        if dispatch.state is DispatchStatus.PREPARED:
-            target = DispatchStatus.ABANDONED
-        elif dispatch.state is DispatchStatus.RUNNING:
-            target = DispatchStatus.FAILED
-        else:
-            raise SequentialWorkflowError(
-                f"cannot fail dispatch from state {dispatch.state.value}"
+        safe_reason = redact_text(reason)[:5000]
+        safe_detail = redact_text(failure_detail)[:5000]
+        try:
+            record, generation = self.store.load_run(prepared.run_id)
+            if generation != prepared.generation and self.config.execution.scheduling == "sequential":
+                raise SequentialWorkflowError("failed dispatch generation is stale")
+            dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+            if dispatch.state is DispatchStatus.PREPARED:
+                target = DispatchStatus.ABANDONED
+            elif dispatch.state is DispatchStatus.RUNNING:
+                target = DispatchStatus.FAILED
+            else:
+                raise SequentialWorkflowError(
+                    f"cannot fail dispatch from state {dispatch.state.value}"
+                )
+            event = self._event(record, "dispatcher", safe_reason, dispatch.dispatch_id)
+            record, generation = self.store.commit_dispatch_transition(
+                record,
+                expected_generation=generation,
+                dispatch_id=dispatch.dispatch_id,
+                target=target,
+                event=event,
+                failure_category=failure_category,
+                failure_detail=safe_detail,
             )
-        event = self._event(record, "dispatcher", reason, dispatch.dispatch_id)
-        record, generation = self.store.commit_dispatch_transition(
-            record,
-            expected_generation=generation,
-            dispatch_id=dispatch.dispatch_id,
-            target=target,
-            event=event,
-        )
-        step = record.steps[dispatch.step_id]
-        step_event = self._event(
-            record,
-            "dispatcher",
-            "worker boundary failed",
-            dispatch.dispatch_id,
-        )
-        if step.state is StepStatus.EXECUTING:
-            updated_step = transition_step(step, StepStatus.BLOCKED, step_event)
-        elif step.state is StepStatus.REVIEWING:
-            updated_step = transition_step(step, StepStatus.REVIEW_REQUIRED, step_event)
-        else:
-            raise SequentialWorkflowError(
-                f"failed dispatch has incompatible step state {step.state.value}"
-            )
-        record, generation = self._replace_step(record, generation, updated_step)
-        if dispatch.state is DispatchStatus.RUNNING and dispatch.batch_id is None:
-            request_event = self._event(
+            step = record.steps[dispatch.step_id]
+            step_event = self._event(
                 record,
                 "dispatcher",
-                "uncertain external side effect requires operator reconciliation",
+                "worker boundary failed",
                 dispatch.dispatch_id,
             )
-            request = OperatorRequest(
-                request_id=f"request-{uuid.uuid4().hex}",
-                question=(
-                    "The worker process started but did not produce an applicable result. "
-                    "Reconcile repository and session state before any retry."
-                ),
-                allowed_answers=["reconcile", "halt"],
-                context_ref=dispatch.dispatch_id,
-                resume_to=RunStatus.RUNNING,
-                expires_at=None,
-                required_role=None,
-                kind="reconciliation",
-                step_id=dispatch.step_id,
-            )
-            record = transition_run(
-                record,
-                RunStatus.WAITING_OPERATOR,
-                request_event,
-                operator_request=request,
-            )
-            generation = self.store.save_run(record, expected_generation=generation)
-        self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
-        return record, generation
+            if step.state is StepStatus.EXECUTING:
+                updated_step = transition_step(step, StepStatus.BLOCKED, step_event)
+            elif step.state is StepStatus.REVIEWING:
+                updated_step = transition_step(step, StepStatus.REVIEW_REQUIRED, step_event)
+            else:
+                raise SequentialWorkflowError(
+                    f"failed dispatch has incompatible step state {step.state.value}"
+                )
+            record, generation = self._replace_step(record, generation, updated_step)
+            if dispatch.state is DispatchStatus.RUNNING and dispatch.batch_id is None:
+                request_event = self._event(
+                    record,
+                    "dispatcher",
+                    "uncertain external side effect requires operator reconciliation",
+                    dispatch.dispatch_id,
+                )
+                request = OperatorRequest(
+                    request_id=f"request-{uuid.uuid4().hex}",
+                    question=(
+                        "The worker process started but did not produce an applicable result. "
+                        "Reconcile repository and session state before any retry."
+                    ),
+                    allowed_answers=["reconcile", "halt"],
+                    context_ref=dispatch.dispatch_id,
+                    resume_to=RunStatus.RUNNING,
+                    expires_at=None,
+                    required_role=None,
+                    kind="reconciliation",
+                    step_id=dispatch.step_id,
+                )
+                record = transition_run(
+                    record,
+                    RunStatus.WAITING_OPERATOR,
+                    request_event,
+                    operator_request=request,
+                )
+                generation = self.store.save_run(record, expected_generation=generation)
+            return record, generation
+        finally:
+            self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
 
     @_serialized_transition
     def handle_stall(
@@ -1313,6 +1964,15 @@ class SequentialWorkflow:
             updated_step = updated_step.model_copy(
                 update={"stalls": stall_count, "last_stall_category": category, "last_stall_reason": reason[:5000]}
             )
+        elif self.config.execution.stall_policy.on_exhausted == "fail":
+            failed_event = self._event(
+                record,
+                "dispatcher",
+                "stall retry limit exhausted; step failed",
+                dispatch.step_id,
+                sequence=updated_step.last_event.sequence + 1,
+            )
+            updated_step = transition_step(updated_step, StepStatus.FAILED, failed_event)
         record, generation = self._replace_step(record, generation, updated_step)
         if not retry_allowed:
             if self.config.execution.stall_policy.on_exhausted == "ask":
@@ -1333,7 +1993,7 @@ class SequentialWorkflow:
                 )
                 record = transition_run(record, RunStatus.WAITING_OPERATOR, request_event, operator_request=request)
                 generation = self.store.save_run(record, expected_generation=generation)
-            else:
+            elif self.config.execution.stall_policy.on_exhausted == "halt":
                 halt_event = self._event(record, "dispatcher", "stall retry limit exhausted; halted", dispatch.step_id)
                 record = transition_run(record, RunStatus.HALTED, halt_event)
                 generation = self.store.save_run(record, expected_generation=generation)
@@ -1485,6 +2145,15 @@ class SequentialWorkflow:
         generation: int,
         updated_step: StepRecord,
     ) -> tuple[RunRecord, int]:
+        updated = self._step_replacement_record(record, updated_step)
+        return updated, self.store.save_run(updated, expected_generation=generation)
+
+    def _step_replacement_record(
+        self,
+        record: RunRecord,
+        updated_step: StepRecord,
+    ) -> RunRecord:
+        """Build the record with one replaced step and the terminal-failure invariant."""
         steps = dict(record.steps)
         steps[updated_step.step_id] = updated_step
         updated = record.model_copy(
@@ -1494,7 +2163,234 @@ class SequentialWorkflow:
                 "updated_at": updated_step.last_event.occurred_at,
             }
         )
-        return updated, self.store.save_run(updated, expected_generation=generation)
+        if updated_step.state is StepStatus.FAILED:
+            if record.state in {RunStatus.RUNNING, RunStatus.WAITING_OPERATOR}:
+                failed_event = self._event(
+                    record,
+                    "dispatcher",
+                    f"step {updated_step.step_id} entered FAILED; run failed",
+                    updated_step.step_id,
+                    sequence=updated_step.last_event.sequence + 1,
+                )
+                updated = transition_run(updated, RunStatus.FAILED, failed_event)
+            elif record.state is not RunStatus.FAILED:
+                raise SequentialWorkflowError(
+                    f"cannot persist a failed step while run is {record.state.value}"
+                )
+        return updated
+
+    def _forwarding_record(
+        self,
+        record: RunRecord,
+        completed: DispatchRecord,
+        *,
+        dispatch_id: str,
+        event_reason: str,
+        forwarding: str,
+    ) -> RunRecord:
+        """Transition one completed dispatch to FORWARDED in memory."""
+        forward_event = self._event(record, "dispatcher", event_reason, dispatch_id)
+        forwarded = transition_dispatch(
+            completed,
+            DispatchStatus.FORWARDED,
+            forward_event,
+            forwarding_digest=_sha256_text(forwarding),
+        )
+        dispatches = dict(record.dispatches)
+        dispatches[dispatch_id] = forwarded
+        return record.model_copy(
+            update={
+                "dispatches": dispatches,
+                "sequence": forward_event.sequence,
+                "updated_at": forward_event.occurred_at,
+            }
+        )
+
+    def _executor_step_outcome(
+        self,
+        record: RunRecord,
+        step: PlanStep,
+        step_record: StepRecord,
+        dispatch: DispatchRecord,
+        result: ExecutorResult,
+        result_event: TransitionEvent,
+    ) -> tuple[StepRecord, bool]:
+        """Apply one executor outcome to its step and report escalation need."""
+        if isinstance(result, ExecutorCompletedResult):
+            executed = transition_step(step_record, StepStatus.EXECUTED, result_event)
+            obligation = self._review_obligation(record, step)
+            target = StepStatus.REVIEW_REQUIRED if obligation.required else StepStatus.ACCEPTED
+            final_event = self._event(
+                record,
+                "dispatcher",
+                f"step moved to {target.value}",
+                dispatch.dispatch_id,
+                sequence=result_event.sequence + 1,
+            )
+            updated_step = transition_step(executed, target, final_event)
+            return (
+                updated_step.model_copy(
+                    update={
+                        "accepted_artifact_ids": [item.artifact_id for item in result.evidence],
+                        # A fresh executor result invalidates prior reviewer votes on older work.
+                        "review_acceptances": 0,
+                        "accepted_reviewer_role_keys": [],
+                    }
+                ),
+                False,
+            )
+        if result.outcome == "blocked":
+            blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
+            updated_step = self._retry_or_terminal_step(
+                record,
+                step,
+                blocked,
+                policy=step.retry.on_blocked,
+                correlation_id=dispatch.dispatch_id,
+            )
+            return updated_step, step.retry.on_blocked == "escalate"
+        if step.retry.on_failed == "retry" and step_record.executor_attempts < step.retry.max_executor_attempts:
+            blocked = transition_step(step_record, StepStatus.BLOCKED, result_event)
+            updated_step = self._retry_or_terminal_step(
+                record,
+                step,
+                blocked,
+                policy="retry",
+                correlation_id=dispatch.dispatch_id,
+            )
+            return updated_step, False
+        if step.retry.on_failed == "escalate":
+            return transition_step(step_record, StepStatus.BLOCKED, result_event), True
+        return transition_step(step_record, StepStatus.FAILED, result_event), False
+
+    def _reviewer_step_outcome(
+        self,
+        record: RunRecord,
+        step: PlanStep,
+        step_record: StepRecord,
+        dispatch: DispatchRecord,
+        result: ReviewerResult,
+        verdict_event: TransitionEvent,
+    ) -> tuple[StepRecord, bool]:
+        """Apply one reviewer verdict to its step and report escalation need."""
+        if isinstance(result, ReviewerAcceptedResult):
+            obligation = self._review_obligation(record, step)
+            accepted_roles = [*step_record.accepted_reviewer_role_keys, dispatch.role_key]
+            accepted_count = step_record.review_acceptances + 1
+            target = (
+                StepStatus.ACCEPTED
+                if accepted_count >= obligation.required_acceptances
+                else StepStatus.REVIEW_REQUIRED
+            )
+            updated_step = transition_step(step_record, target, verdict_event)
+            return (
+                updated_step.model_copy(
+                    update={
+                        "review_acceptances": accepted_count,
+                        "accepted_reviewer_role_keys": accepted_roles,
+                        "accepted_artifact_ids": (
+                            [requirement.artifact_id for requirement in step.evidence_requirements]
+                            if target is StepStatus.ACCEPTED
+                            else []
+                        ),
+                    }
+                ),
+                False,
+            )
+        if isinstance(result, ReviewerChangesRequestedResult):
+            changed = transition_step(step_record, StepStatus.CHANGES_REQUESTED, verdict_event)
+            changed = changed.model_copy(update={"rework_rounds": step_record.rework_rounds + 1})
+            obligation = self._review_obligation(record, step)
+            remaining_reviewer_roles = set(obligation.reviewer_role_keys) - {
+                *step_record.accepted_reviewer_role_keys,
+                dispatch.role_key,
+            }
+            if remaining_reviewer_roles and step_record.review_acceptances:
+                tie_break_event = self._event(
+                    record,
+                    "dispatcher",
+                    "conflicting review requires a fresh tie-break on the immutable artifact",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                return transition_step(changed, StepStatus.REVIEW_REQUIRED, tie_break_event), False
+            if (
+                step.retry.on_changes_requested == "retry"
+                and changed.rework_rounds < self.config.execution.max_rounds_per_step
+                and step_record.executor_attempts < step.retry.max_executor_attempts
+            ):
+                ready_event = self._event(
+                    record,
+                    "dispatcher",
+                    "review rework is ready",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                return transition_step(changed, StepStatus.READY, ready_event), False
+            if step.retry.on_changes_requested == "escalate":
+                blocked_event = self._event(
+                    record,
+                    "dispatcher",
+                    "review rework requires escalation",
+                    dispatch.dispatch_id,
+                    sequence=verdict_event.sequence + 1,
+                )
+                return transition_step(changed, StepStatus.BLOCKED, blocked_event), True
+            failed_event = self._event(
+                record,
+                "dispatcher",
+                "review rework policy halted the step",
+                dispatch.dispatch_id,
+                sequence=verdict_event.sequence + 1,
+            )
+            return transition_step(changed, StepStatus.FAILED, failed_event), False
+        blocked = transition_step(step_record, StepStatus.BLOCKED, verdict_event)
+        if step.retry.on_blocked == "retry" and step_record.reviewer_attempts < step.retry.max_reviewer_attempts:
+            retry_event = self._event(
+                record,
+                "dispatcher",
+                "review retry is ready",
+                dispatch.dispatch_id,
+                sequence=verdict_event.sequence + 1,
+            )
+            return transition_step(blocked, StepStatus.REVIEW_REQUIRED, retry_event), False
+        if step.retry.on_blocked == "escalate":
+            return blocked, True
+        failed_event = self._event(
+            record,
+            "dispatcher",
+            "review blocked policy halted the step",
+            dispatch.dispatch_id,
+            sequence=verdict_event.sequence + 1,
+        )
+        return transition_step(blocked, StepStatus.FAILED, failed_event), False
+
+    def _escalation_waiting_record(
+        self,
+        record: RunRecord,
+        step: PlanStep,
+        dispatch: DispatchRecord,
+    ) -> RunRecord:
+        """Build the WAITING_OPERATOR escalation request without persisting it."""
+        if step.retry.escalation_role_key is None:
+            raise SequentialWorkflowError("escalation policy has no configured executor reassignment role")
+        event = self._event(record, "dispatcher", "review escalation requires operator reassignment", dispatch.dispatch_id)
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=(
+                f"Step {step.step_id} requires escalation. Reassign executor "
+                f"{step.retry.escalation_role_key} for a new attempt or halt?"
+            ),
+            allowed_answers=["reassign", "halt"],
+            context_ref=dispatch.dispatch_id,
+            resume_to=RunStatus.RUNNING,
+            expires_at=None,
+            required_role=None,
+            kind="escalation",
+            step_id=step.step_id,
+            reassignment_role_key=step.retry.escalation_role_key,
+        )
+        return transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
 
     def _wait_for_operator(
         self,
@@ -1567,35 +2463,6 @@ class SequentialWorkflow:
         self.store.save_run(waiting, expected_generation=generation)
         return waiting
 
-    def _request_escalation(
-        self,
-        record: RunRecord,
-        generation: int,
-        step: PlanStep,
-        dispatch: DispatchRecord,
-        forwarding: str,
-    ) -> tuple[RunRecord, int, str]:
-        if step.retry.escalation_role_key is None:
-            raise SequentialWorkflowError("escalation policy has no configured executor reassignment role")
-        event = self._event(record, "dispatcher", "review escalation requires operator reassignment", dispatch.dispatch_id)
-        request = OperatorRequest(
-            request_id=f"request-{uuid.uuid4().hex}",
-            question=(
-                f"Step {step.step_id} requires escalation. Reassign executor "
-                f"{step.retry.escalation_role_key} for a new attempt or halt?"
-            ),
-            allowed_answers=["reassign", "halt"],
-            context_ref=dispatch.dispatch_id,
-            resume_to=RunStatus.RUNNING,
-            expires_at=None,
-            required_role=None,
-            kind="escalation",
-            step_id=step.step_id,
-            reassignment_role_key=step.retry.escalation_role_key,
-        )
-        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
-        return waiting, self.store.save_run(waiting, expected_generation=generation), forwarding
-
     def _ensure_budget_allows_dispatch(
         self,
         record: RunRecord,
@@ -1629,6 +2496,8 @@ class SequentialWorkflow:
         generation: int,
         dispatch: DispatchRecord,
         usage: Mapping[str, object] | None,
+        *,
+        persist: bool = True,
     ) -> tuple[RunRecord, int]:
         if usage is None:
             if self.config.model.budget.enabled:
@@ -1647,6 +2516,8 @@ class SequentialWorkflow:
             ),
         )
         updated = record.model_copy(update={"usage": updated_ledger})
+        if not persist:
+            return updated, generation
         return updated, self.store.save_run(updated, expected_generation=generation)
 
     def _apply_budget_limit(
@@ -1656,6 +2527,8 @@ class SequentialWorkflow:
         dispatch: DispatchRecord,
         forwarding: str,
     ) -> tuple[RunRecord, int, str]:
+        if record.state is not RunStatus.RUNNING:
+            return record, generation, forwarding
         if not self.config.model.budget.enabled:
             return record, generation, forwarding
         budget = self.config.model.budget
@@ -1708,12 +2581,17 @@ class SequentialWorkflow:
         updated = record.model_copy(update={"policy": compiled})
         return updated, self.store.save_run(updated, expected_generation=generation)
 
-    @staticmethod
-    def _review_obligation(record: RunRecord, step: PlanStep) -> CompiledReviewObligation:
-        if record.policy is None:
-            raise SequentialWorkflowError("run policy must be compiled before dispatch")
+    def _review_obligation(self, record: RunRecord, step: PlanStep) -> CompiledReviewObligation:
+        policy = record.policy
+        if policy is None:
+            try:
+                policy = compile_run_policy(self.config, record.plan)
+            except PolicyError as exc:
+                raise SequentialWorkflowError(
+                    f"run policy must be compiled before dispatch: {exc}"
+                ) from exc
         try:
-            return record.policy.review_obligations[step.step_id]
+            return policy.review_obligations[step.step_id]
         except KeyError as exc:
             raise SequentialWorkflowError(f"run policy has no obligation for step {step.step_id}") from exc
 
@@ -1872,11 +2750,13 @@ class SequentialWorkflow:
         expected = {item.artifact_id: item for item in step.evidence_requirements}
         actual = {item.artifact_id: item for item in result.evidence}
         if set(actual) != set(expected):
-            raise SequentialWorkflowError("executor result evidence does not exactly match step requirements")
+            raise WorkerResultValidationError(
+                "executor result evidence does not exactly match step requirements"
+            )
         for artifact_id, requirement in expected.items():
             artifact = actual[artifact_id]
             if artifact.relative_path != requirement.relative_path or artifact.media_type != requirement.media_type:
-                raise SequentialWorkflowError(
+                raise WorkerResultValidationError(
                     f"evidence artifact {artifact_id} does not match its required path or media type"
                 )
 
@@ -1956,6 +2836,17 @@ def _plan_step(record: RunRecord, step_id: str) -> PlanStep:
     raise SequentialWorkflowError(f"supervisor requested unknown plan step: {step_id}")
 
 
+def session_registry_identity(
+    dispatch: DispatchRecord,
+) -> tuple[Literal["executors", "reviewers"], str]:
+    """Return the durable session-registry identity for one dispatch."""
+    pool: Literal["executors", "reviewers"] = (
+        "executors" if dispatch.role_kind == "executor" else "reviewers"
+    )
+    key = dispatch.logical_session_key if dispatch.batch_id is not None else dispatch.role_key
+    return pool, key
+
+
 def _lease_keys(step: PlanStep, *, include_repository: bool = True) -> tuple[str, ...]:
     keys = set(resource_keys(step.repo_id, tuple(lock.resource_id for lock in step.resource_locks)))
     if not include_repository:
@@ -1972,6 +2863,23 @@ def _workspace_child(group: WorkspaceGroup, step_id: str) -> WorkspaceChild:
 
 def _dispatch_lease_owner_id(owner_id: str, dispatch_id: str) -> str:
     return f"{owner_id}.dispatch.{dispatch_id}"
+
+
+def _dispatch_process_is_active(dispatch: DispatchRecord) -> bool:
+    """Fail closed unless the recorded local worker is known to have exited."""
+    if (
+        dispatch.process_id is None
+        or dispatch.process_create_time is None
+        or dispatch.process_host != socket.gethostname()
+    ):
+        return True
+    try:
+        os.kill(dispatch.process_id, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 
 def _bootstrap_template() -> str:
@@ -2024,6 +2932,37 @@ def _baseline_markdown(record: RunRecord) -> str:
     )
 
 
+def _observation_tools_markdown(config: Config) -> str:
+    native = ", ".join(f"`{tool}`" for tool in READ_ONLY_NATIVE_TOOLS)
+    diagnostics = "\n".join(f"- `{command}`" for command in READ_ONLY_DIAGNOSTIC_COMMANDS)
+    supervisor_role = next(iter(config.model.roles.supervisor))
+    mcp_tools = resolve_role_mcp_tools(config, supervisor_role)
+    mcp_line = (
+        "- MCP tools: " + ", ".join(f"`{tool}`" for tool in mcp_tools) + "."
+        if mcp_tools
+        else "- MCP tools: none."
+    )
+    return (
+        f"- Native content inspection: {native}.\n"
+        "- Exact diagnostic shell commands:\n"
+        f"{diagnostics}\n"
+        f"{mcp_line}"
+    )
+
+
+def _evidence_diagnostic_commands(
+    step: PlanStep,
+    evidence_roots: list[str],
+) -> tuple[str, ...]:
+    """Return exact non-mutating hash/size commands for declared evidence paths."""
+    commands: list[str] = []
+    for root in evidence_roots:
+        for requirement in step.evidence_requirements:
+            path = shlex.quote(str(Path(root) / requirement.relative_path))
+            commands.extend((f"shasum -a 256 {path}", f"wc -c {path}"))
+    return tuple(commands)
+
+
 def _dispatch_example(config: Config, record: RunRecord) -> str:
     step = record.plan.steps[0]
     role = next(iter(config.model.roles.executors))
@@ -2060,8 +2999,15 @@ def _worker_prompt(
     repository: DispatchRepositoryCoordinate,
     evidence_roots: list[str],
     review_target: ReviewTarget | None,
+    review_authoritative_verification: tuple[Mapping[str, Any], ...] | None,
+    evidence_diagnostic_commands: tuple[str, ...],
+    authorized_actions: tuple[str, ...],
+    mcp_tools: tuple[str, ...] = (),
 ) -> str:
     """Render the exact machine context a worker needs to return a typed result."""
+    response_schema_name = (
+        "executor-proposal-v2.json" if role_kind == "executor" else "reviewer-result-v1.json"
+    )
     return json.dumps(
         {
             "context_version": 1,
@@ -2077,20 +3023,72 @@ def _worker_prompt(
             "remote_name": repository.remote_name,
             "remote_url": repository.remote_url,
             "task": task,
+            **(
+                {
+                    "role_instruction": (
+                        "You are a reviewer. Use native read, glob, and grep to inspect file contents "
+                        "and locate files. Use exact diagnostic shell commands only for current "
+                        "directory, branch, revision, status, and diff metadata. Do not add shell "
+                        "arguments, redirection, chaining, pipes, substitutions, or other shell syntax. "
+                        "Do not run tests. Do not create, edit, stage, commit, delete, or otherwise "
+                        "modify files or Git state. "
+                        "If remediation is required, describe it in required_remediation for the "
+                        "executor; do not perform it."
+                    ),
+                    "observation_tools": {
+                        "native": list(READ_ONLY_NATIVE_TOOLS),
+                        "diagnostic_commands": list(READ_ONLY_DIAGNOSTIC_COMMANDS),
+                        "mcp": list(mcp_tools),
+                    },
+                }
+                if role_kind == "reviewer"
+                else {
+                    "role_instruction": (
+                        "Write only paths authorized by writable_paths. Do not run acceptance tests "
+                        "or substitute verification commands. Do not stage, commit, push, modify "
+                        "branches, or modify Git configuration. The dispatcher inspects changes, "
+                        "executes every structured check, derives evidence metadata, and performs "
+                        "any authorized commit after your response."
+                    ),
+                    "writable_paths": list(step.authorization.writable_paths),
+                    "research_tools": {
+                        "mcp": list(mcp_tools),
+                        "rule": (
+                            "Research MCP tools are optional capabilities for discovering library "
+                            "documentation, packing code for analysis, and semantic code search. "
+                            "They do not expand writable_paths and cannot replace dispatcher checks."
+                        ),
+                    },
+                }
+            ),
             "evidence_roots": evidence_roots,
             "evidence_path_rule": (
                 "Each evidence relative_path is relative to one listed evidence_root; "
                 "do not include the evidence_root directory name in relative_path."
             ),
-            "authorized_actions": list(step.authorization.authorized_actions),
+            "authorized_actions": list(authorized_actions),
+            "verification_authority": (
+                "The dispatcher executes every acceptance criterion check from structured argv. "
+                "Do not invent, alter, or substitute commands. Model verification is a self-report; "
+                "state advancement uses dispatcher-owned results."
+            ),
+            **(
+                {
+                    "executor_authoritative_verification": list(
+                        review_authoritative_verification or ()
+                    )
+                }
+                if role_kind == "reviewer"
+                else {}
+            ),
             "response_contract": (
-                EXECUTOR_RESPONSE_CONTRACT
+                EXECUTOR_PROPOSAL_CONTRACT
                 if role_kind == "executor"
                 else REVIEWER_RESPONSE_CONTRACT
             ),
             "response_contract_rule": (
                 "MUST return exactly one JSON object with a required response_contract field equal to "
-                f"{EXECUTOR_RESPONSE_CONTRACT}; MUST NOT return prose, Markdown, or code fences."
+                f"{EXECUTOR_PROPOSAL_CONTRACT}; MUST NOT return prose, Markdown, or code fences."
                 if role_kind == "executor"
                 else "MUST return exactly one JSON object with a required response_contract field equal to "
                 f"{REVIEWER_RESPONSE_CONTRACT}; MUST NOT return prose, Markdown, or code fences."
@@ -2098,13 +3096,13 @@ def _worker_prompt(
             "required_response_fields": (
                 [
                     "response_contract",
-                    "result_version",
+                    "proposal_version",
                     "dispatch_id",
                     "attempt",
                     "step_id",
                     "repository",
                     "evidence",
-                    "verification",
+                    "criterion_self_reports",
                     "summary",
                     "outcome",
                 ]
@@ -2124,9 +3122,40 @@ def _worker_prompt(
                     "verdict",
                 ]
             ),
+            **(
+                {"outcome_options": list(EXECUTOR_PROPOSAL_OUTCOME_OPTIONS)}
+                if role_kind == "executor"
+                else {"verdict_options": list(REVIEWER_VERDICT_OPTIONS)}
+            ),
+            "response_json_schema": schema_documents()[response_schema_name],
+            "required_verification_check_ids": [
+                criterion.criterion_id for criterion in step.acceptance_criteria
+            ],
+            "verification_contract": (
+                "Executor criterion_self_reports MUST contain exactly one not_run entry for every "
+                "acceptance criterion in plan order; executor checks are never authoritative."
+                if role_kind == "executor"
+                else "verification MUST contain exactly one entry for every acceptance criterion; "
+                "accepted requires every status to be passed."
+            ),
             "final_response_check": (
                 "Before sending, verify the JSON object contains every item in required_response_fields, "
-                "especially response_contract and attempt. Missing, null, empty, or renamed fields are invalid."
+                "especially response_contract and attempt. Missing, null, empty, or renamed fields are invalid. "
+                f"The outcome field MUST be exactly one of: {', '.join(EXECUTOR_PROPOSAL_OUTCOME_OPTIONS)}; "
+                "no other word, synonym, or variation is acceptable. Conform to response_json_schema exactly: "
+                "no extra fields, no missing required fields, and no values outside any defined enum. "
+                "criterion_self_reports MUST provide exact ordered criterion coverage, and every status "
+                "must be not_run. Do not claim final revisions, patch hashes, evidence hashes/sizes, or "
+                "Git control fields."
+                if role_kind == "executor"
+                else "Before sending, verify the JSON object contains every item in required_response_fields, "
+                "especially response_contract and attempt. Missing, null, empty, or renamed fields are invalid. "
+                f"The verdict field MUST be exactly one of: {', '.join(REVIEWER_VERDICT_OPTIONS)}; "
+                "no other word, synonym, or variation is acceptable. Conform to response_json_schema exactly: "
+                "no extra fields, no missing required fields, and no values outside any defined enum. "
+                "verification MUST provide exact one-to-one criterion_id/check_id coverage with no duplicate, "
+                "missing, renamed, or extra IDs; accepted requires every verification status to be passed, "
+                "while non-success verdicts still require exact coverage."
             ),
             "acceptance_criteria": [
                 criterion.model_dump(mode="json") for criterion in step.acceptance_criteria
@@ -2140,7 +3169,7 @@ def _worker_prompt(
             "response_template": _worker_response_template(
                 role_kind=role_kind,
                 contract=(
-                    EXECUTOR_RESPONSE_CONTRACT
+                    EXECUTOR_PROPOSAL_CONTRACT
                     if role_kind == "executor"
                     else REVIEWER_RESPONSE_CONTRACT
                 ),
@@ -2149,8 +3178,27 @@ def _worker_prompt(
                 step_id=step.step_id,
                 repo_id=step.repo_id,
                 base_revision=repository.base_revision,
+                acceptance_criteria=step.acceptance_criteria,
                 evidence_requirements=step.evidence_requirements,
                 review_target=review_target,
+                requires_attention=False,
+            ),
+            "response_requires_attention_template": _worker_response_template(
+                role_kind=role_kind,
+                contract=(
+                    EXECUTOR_PROPOSAL_CONTRACT
+                    if role_kind == "executor"
+                    else REVIEWER_RESPONSE_CONTRACT
+                ),
+                dispatch_id=dispatch_id,
+                attempt=attempt,
+                step_id=step.step_id,
+                repo_id=step.repo_id,
+                base_revision=repository.base_revision,
+                acceptance_criteria=step.acceptance_criteria,
+                evidence_requirements=step.evidence_requirements,
+                review_target=review_target,
+                requires_attention=True,
             ),
         },
         ensure_ascii=False,
@@ -2168,40 +3216,52 @@ def _worker_response_template(
     step_id: str,
     repo_id: str,
     base_revision: str,
+    acceptance_criteria: Iterable[Any],
     evidence_requirements: Iterable[Any],
     review_target: ReviewTarget | None,
+    requires_attention: bool,
 ) -> dict[str, Any]:
     """Give workers a concrete response shape instead of an undocumented schema name."""
     if role_kind == "executor":
-        return {
+        template = {
             "response_contract": contract,
-            "result_version": 1,
+            "proposal_version": 2,
             "dispatch_id": dispatch_id,
             "attempt": attempt,
             "step_id": step_id,
             "repository": {
                 "repo_id": repo_id,
                 "base_revision": base_revision,
-                "result_revision": "<non-empty Git revision>",
-                "patch_sha256": None,
             },
             "evidence": [
                 {
                     "artifact_id": requirement.artifact_id,
                     "relative_path": requirement.relative_path,
-                    "sha256": "<64 lowercase hexadecimal characters>",
                     "media_type": requirement.media_type,
-                    "size_bytes": 0,
                 }
                 for requirement in evidence_requirements
             ],
-            "verification": [
-                {"check_id": "<non-empty check ID>", "status": "passed", "summary": "<non-empty summary>"}
+            "criterion_self_reports": [
+                {
+                    "check_id": criterion.criterion_id,
+                    "status": "not_run",
+                    "summary": "The dispatcher owns this acceptance check.",
+                }
+                for criterion in acceptance_criteria
             ],
             "summary": "<non-empty summary>",
             "outcome": "completed",
         }
-    return {
+        if requires_attention:
+            template.update(
+                {
+                    "summary": "The worker cannot complete the authorized task.",
+                    "outcome": "blocked",
+                    "blockers": ["A concrete blocker prevents completion."],
+                }
+            )
+        return template
+    template = {
         "response_contract": contract,
         "result_version": 1,
         "dispatch_id": dispatch_id,
@@ -2211,12 +3271,41 @@ def _worker_response_template(
         "review_target": review_target.model_dump(mode="json") if review_target is not None else {},
         "findings": [],
         "verification": [
-            {"check_id": "<non-empty check ID>", "status": "passed", "summary": "<non-empty summary>"}
+            {
+                "check_id": criterion.criterion_id,
+                "status": "passed",
+                "summary": "The acceptance criterion passed.",
+            }
+            for criterion in acceptance_criteria
         ],
         "required_remediation": [],
         "summary": "<non-empty summary>",
         "verdict": "accepted",
     }
+    if requires_attention:
+        template.update(
+            {
+                "findings": [
+                    {
+                        "finding_id": "required-change",
+                        "severity": "blocking",
+                        "summary": "The reviewed result requires a concrete correction.",
+                    }
+                ],
+                "verification": [
+                    {
+                        "check_id": criterion.criterion_id,
+                        "status": "failed",
+                        "summary": "The reviewed result did not satisfy a required check.",
+                    }
+                    for criterion in acceptance_criteria
+                ],
+                "required_remediation": ["Correct the identified blocking finding."],
+                "summary": "The reviewed result requires changes before acceptance.",
+                "verdict": "changes_requested",
+            }
+        )
+    return template
 
 
 def _validate_executor_result(result: ExecutorResult, dispatch: DispatchRecord) -> None:
@@ -2230,12 +3319,160 @@ def _validate_executor_result(result: ExecutorResult, dispatch: DispatchRecord) 
     try:
         validate_executor_result_context(result, expectation)
     except ResultError as exc:
-        raise SequentialWorkflowError(str(exc)) from exc
+        raise WorkerResultValidationError(str(exc)) from exc
     if result.repository.base_revision != dispatch.intent.repository.base_revision:
-        raise SequentialWorkflowError("executor result base revision does not match prepared dispatch")
+        raise WorkerResultValidationError(
+            "executor result base revision does not match prepared dispatch"
+        )
 
 
-def _executor_forwarding(result: ExecutorResult, usage: UsageAmount) -> str:
+def _validate_executor_proposal(
+    step: PlanStep,
+    proposal: ExecutorProposal,
+    dispatch: DispatchRecord,
+) -> None:
+    expectation = ResultExpectation(
+        dispatch_id=dispatch.dispatch_id,
+        attempt=dispatch.attempt,
+        step_id=dispatch.step_id,
+        repo_id=dispatch.intent.repository.repo_id,
+        expected_review_target=None,
+    )
+    try:
+        validate_executor_proposal_context(proposal, expectation)
+    except ResultError as exc:
+        raise WorkerResultValidationError(str(exc)) from exc
+    if proposal.repository.base_revision != dispatch.intent.repository.base_revision:
+        raise WorkerResultValidationError(
+            "executor proposal base revision does not match prepared dispatch"
+        )
+    expected_ids = [criterion.criterion_id for criterion in step.acceptance_criteria]
+    actual_ids = [item.check_id for item in proposal.criterion_self_reports]
+    if actual_ids != expected_ids:
+        raise WorkerResultValidationError(
+            "executor proposal criterion self-reports must exactly match plan order"
+        )
+    expected_evidence = [
+        (item.artifact_id, item.relative_path, item.media_type)
+        for item in step.evidence_requirements
+    ]
+    actual_evidence = [
+        (item.artifact_id, item.relative_path, item.media_type)
+        for item in proposal.evidence
+    ]
+    if isinstance(proposal, ExecutorCompletedProposal) and actual_evidence != expected_evidence:
+        raise WorkerResultValidationError(
+            "completed executor proposal evidence must exactly match plan order"
+        )
+
+
+def _validate_result_verification(
+    step: PlanStep,
+    result: ExecutorResult | ReviewerResult,
+    authoritative_verification: tuple[AuthoritativeVerification, ...] = (),
+) -> None:
+    """Require exact model coverage and dispatcher-owned success verification."""
+    expected_ids = [criterion.criterion_id for criterion in step.acceptance_criteria]
+    actual_ids = [verification.check_id for verification in result.verification]
+    duplicate_ids = sorted(
+        check_id for check_id in set(actual_ids) if actual_ids.count(check_id) > 1
+    )
+    missing_ids = sorted(set(expected_ids) - set(actual_ids))
+    unknown_ids = sorted(set(actual_ids) - set(expected_ids))
+    success = isinstance(result, (ExecutorCompletedResult, ReviewerAcceptedResult))
+    non_passing = sorted(
+        f"{verification.check_id}={verification.status}"
+        for verification in result.verification
+        if success and verification.status != "passed"
+    )
+    problems = []
+    if duplicate_ids:
+        problems.append(f"duplicate check IDs={duplicate_ids}")
+    if missing_ids:
+        problems.append(f"missing criterion IDs={missing_ids}")
+    if unknown_ids:
+        problems.append(f"unknown check IDs={unknown_ids}")
+    if non_passing:
+        problems.append(f"non-passing checks={non_passing}")
+    if success:
+        authoritative_ids = [item.check_id for item in authoritative_verification]
+        if authoritative_ids != expected_ids:
+            problems.append(
+                "authoritative verification IDs do not exactly match plan criteria"
+            )
+        authoritative_by_id = {
+            item.check_id: item for item in authoritative_verification
+        }
+        failed_authoritative = sorted(
+            item.check_id
+            for item in authoritative_verification
+            if item.status != "passed"
+        )
+        if failed_authoritative:
+            problems.append(
+                f"dispatcher-owned checks failed={failed_authoritative}"
+            )
+        disagreements = sorted(
+            verification.check_id
+            for verification in result.verification
+            if verification.check_id in authoritative_by_id
+            and verification.status
+            != authoritative_by_id[verification.check_id].status
+        )
+        if disagreements:
+            problems.append(
+                f"model verification disagrees with dispatcher checks={disagreements}"
+            )
+    if problems:
+        variant = (
+            f"executor {result.outcome}"
+            if hasattr(result, "outcome")
+            else f"reviewer {result.verdict}"
+        )
+        raise WorkerResultValidationError(
+            f"{variant} result verification is invalid for step {step.step_id}: "
+            + "; ".join(problems)
+        )
+
+
+def _effective_authoritative_verification(
+    config: Config,
+    result: ExecutorResult | ReviewerResult,
+    authoritative_verification: tuple[AuthoritativeVerification, ...],
+) -> tuple[AuthoritativeVerification, ...]:
+    """Provide deterministic synthetic authority only in explicit mock mode."""
+    success = isinstance(result, (ExecutorCompletedResult, ReviewerAcceptedResult))
+    if authoritative_verification or not success:
+        return authoritative_verification
+    if config.execution.mode != "mock_workflow_test":
+        return authoritative_verification
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    return tuple(
+        AuthoritativeVerification(
+            check_id=item.check_id,
+            status="passed" if item.status == "passed" else "failed",
+            argv=("dispatcher-mock-verification", item.check_id),
+            exit_code=0 if item.status == "passed" else 1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256=empty_hash,
+            stderr_sha256=empty_hash,
+            transcript_sha256=hashlib.sha256(
+                f"mock:{item.check_id}:{item.status}".encode("utf-8")
+            ).hexdigest(),
+            duration_ms=0,
+            backend="mock-workflow-test",
+            summary="synthetic dispatcher verification for explicit mock mode",
+        )
+        for item in result.verification
+    )
+
+
+def _executor_forwarding(
+    result: ExecutorResult,
+    usage: UsageAmount,
+    authoritative_verification: tuple[AuthoritativeVerification, ...],
+) -> str:
     return json.dumps(
         {
             "kind": "executor_result",
@@ -2243,18 +3480,28 @@ def _executor_forwarding(result: ExecutorResult, usage: UsageAmount) -> str:
             "outcome": result.outcome,
             "summary": result.summary,
             "evidence": [item.model_dump(mode="json") for item in result.evidence],
+            "authoritative_verification": [
+                item.model_dump(mode="json") for item in authoritative_verification
+            ],
             "usage": usage.model_dump(mode="json"),
         },
         sort_keys=True,
     )
 
 
-def _reviewer_forwarding(result: ReviewerResult, usage: UsageAmount) -> str:
+def _reviewer_forwarding(
+    result: ReviewerResult,
+    usage: UsageAmount,
+    authoritative_verification: tuple[AuthoritativeVerification, ...],
+) -> str:
     return json.dumps(
         {
             "kind": "reviewer_result",
             "dispatch_id": result.dispatch_id,
             "verdict": result.verdict,
+            "authoritative_verification": [
+                item.model_dump(mode="json") for item in authoritative_verification
+            ],
             "summary": result.summary,
             "review_target": result.review_target.model_dump(mode="json"),
             "usage": usage.model_dump(mode="json"),

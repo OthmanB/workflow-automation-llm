@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,14 +11,16 @@ from helpers import config_values, create_fixture_project, valid_plan_values, wr
 
 from dispatcher.execution import SequentialExecutionCoordinator
 from dispatcher.plan import NormalizedPlan, approve_plan
-from dispatcher.repository import EvidenceManifestEntry, RepositorySnapshot
 from dispatcher.sequential import PreparedBatch, SequentialWorkflow
 from dispatcher.sessions import OpenCodeProcessError, SessionResult
 from dispatcher.state_store import StateStore
 from dispatcher.workflow import RunStatus, TransitionEvent, new_run_record
 
 
-def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(tmp_path: Path) -> None:
+def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(
+    tmp_path: Path,
+    caplog,
+) -> None:
     project = create_fixture_project(tmp_path)
     sibling = _initialize_sibling_repository(project.root / "sibling")
     config = _parallel_two_repository_config(project, sibling)
@@ -40,7 +43,6 @@ def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(tmp_p
         config,
         store,
         owner_id="batch-owner",
-        repository_inspector=_repository_snapshot,
     )
     coordinator = SequentialExecutionCoordinator(
         config,
@@ -114,7 +116,8 @@ def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(tmp_p
         assert len(persisted.dispatches) == 2
         assert persisted.batches[prepared.batch_id].state.value == "PREPARED"
 
-        outcome = coordinator.execute_batch(prepared)
+        with caplog.at_level(logging.WARNING, logger="dispatcher.execution"):
+            outcome = coordinator.execute_batch(prepared)
     finally:
         coordinator.release_run()
 
@@ -124,10 +127,40 @@ def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(tmp_p
     assert outcome.record.batches[outcome.batch_id].state.value == "FAILED"
     assert len(outcome.record.batches[outcome.batch_id].failed_dispatch_ids) == 2
     assert {dispatch.state.value for dispatch in outcome.record.dispatches.values()} == {"FAILED"}
+    for dispatch in outcome.record.dispatches.values():
+        assert dispatch.failure_category == "unknown"
+        assert dispatch.failure_detail == "deterministic batch child failure token=[REDACTED]"
+        assert "batch-secret" not in dispatch.last_event.reason
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "dispatcher.execution" and "batch child dispatch" in record.getMessage()
+    ]
+    assert len(warnings) == 2
+    assert all(
+        any(dispatch_id in record.getMessage() for record in warnings)
+        for dispatch_id in outcome.record.batches[outcome.batch_id].failed_dispatch_ids
+    )
+    assert all("[unknown]" in record.getMessage() for record in warnings)
+    assert all("token=[REDACTED]" in record.getMessage() for record in warnings)
+    assert "batch-secret" not in caplog.text
     assert store.classify_recovery(record.run_id) == []
+    reconciled, _generation = store.answer_operator_request(
+        run_id=record.run_id,
+        expected_generation=outcome.generation,
+        request_id=outcome.record.operator_request.request_id,
+        answer="reconcile",
+        actor_id="operator",
+    )
+    assert reconciled.state is RunStatus.RUNNING
+    assert {step.state.value for step in reconciled.steps.values()} == {"READY"}
+    assert reconciled.batches[outcome.batch_id].state.value == "FAILED"
 
 
-def test_successful_batch_forwards_and_acknowledges_every_child(tmp_path: Path) -> None:
+def test_successful_batch_forwards_and_acknowledges_every_child(
+    tmp_path: Path,
+    caplog,
+) -> None:
     project = create_fixture_project(tmp_path)
     sibling = _initialize_sibling_repository(project.root / "sibling")
     config = _parallel_two_repository_config(project, sibling)
@@ -150,7 +183,6 @@ def test_successful_batch_forwards_and_acknowledges_every_child(tmp_path: Path) 
         config,
         store,
         owner_id="successful-batch-owner",
-        repository_inspector=_repository_snapshot,
     )
     coordinator = SequentialExecutionCoordinator(
         config,
@@ -187,7 +219,8 @@ def test_successful_batch_forwards_and_acknowledges_every_child(tmp_path: Path) 
             ),
         )
         assert isinstance(prepared, PreparedBatch)
-        outcome = coordinator.execute_batch(prepared)
+        with caplog.at_level(logging.WARNING, logger="dispatcher.execution"):
+            outcome = coordinator.execute_batch(prepared)
         assert outcome.record.state is RunStatus.RUNNING, [
             dispatch.last_event.reason for dispatch in outcome.record.dispatches.values()
         ]
@@ -206,9 +239,115 @@ def test_successful_batch_forwards_and_acknowledges_every_child(tmp_path: Path) 
 
     assert {dispatch.state.value for dispatch in acknowledged.dispatches.values()} == {"ACKNOWLEDGED"}
     assert {step.state.value for step in acknowledged.steps.values()} == {"ACCEPTED"}
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "dispatcher.execution" and "batch child dispatch" in record.getMessage()
+    ]
+
+
+def test_failed_batch_child_warns_once_and_preserves_successful_sibling(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    project = create_fixture_project(tmp_path)
+    sibling = _initialize_sibling_repository(project.root / "sibling")
+    config = _parallel_two_repository_config(project, sibling)
+    plan = _two_repository_plan(project)
+    record = new_run_record(
+        run_id="mixed-batch-run",
+        project_id=config.project_id,
+        config_digest=config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-mixed-batch"),
+        event=_event(1),
+    )
+    store = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+    generation = store.create_run(record)
+    workflow = SequentialWorkflow(
+        config,
+        store,
+        owner_id="mixed-batch-owner",
+    )
+    coordinator = SequentialExecutionCoordinator(
+        config,
+        store,
+        workflow,
+        owner_id="mixed-batch-owner",
+        session_runner=_mixed_session_runner,
+    )
+    coordinator.acquire_run(record.run_id)
+    try:
+        active, generation = workflow.activate(record.run_id, expected_generation=generation)
+        prepared = workflow.prepare_from_supervisor(
+            active.run_id,
+            expected_generation=generation,
+            supervisor_text=json.dumps(
+                {
+                    "protocol_version": 2,
+                    "action": "dispatch_batch",
+                    "children": [
+                        {
+                            "step_id": "prepare-fixture",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "first fixture",
+                        },
+                        {
+                            "step_id": "prepare-sibling",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "second fixture",
+                        },
+                    ],
+                }
+            ),
+        )
+        assert isinstance(prepared, PreparedBatch)
+        with caplog.at_level(logging.WARNING, logger="dispatcher.execution"):
+            outcome = coordinator.execute_batch(prepared)
+    finally:
+        coordinator.release_run()
+
+    failed_ids = outcome.record.batches[outcome.batch_id].failed_dispatch_ids
+    assert len(failed_ids) == 1
+    failed_id = failed_ids[0]
+    successful_id = next(
+        dispatch_id
+        for dispatch_id in outcome.record.batches[outcome.batch_id].dispatch_ids
+        if dispatch_id != failed_id
+    )
+    assert outcome.record.dispatches[failed_id].step_id == "prepare-sibling"
+    assert outcome.record.dispatches[failed_id].state.value == "FAILED"
+    assert outcome.record.dispatches[successful_id].state.value == "FORWARDED"
+    assert outcome.record.steps["prepare-fixture"].state.value == "ACCEPTED"
+    assert outcome.record.steps["prepare-sibling"].state.value == "BLOCKED"
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "dispatcher.execution" and "batch child dispatch" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert failed_id in warnings[0].getMessage()
+    assert successful_id not in warnings[0].getMessage()
+
+    reconciled, _generation = store.answer_operator_request(
+        run_id=outcome.record.run_id,
+        expected_generation=outcome.generation,
+        request_id=outcome.record.operator_request.request_id,
+        answer="reconcile",
+        actor_id="operator",
+    )
+    assert reconciled.steps["prepare-fixture"].state.value == "ACCEPTED"
+    assert reconciled.steps["prepare-sibling"].state.value == "READY"
 
 
 def _parallel_two_repository_config(project, sibling: Path):
+    _commit_initial_repository(project.repository, "fixture.md")
     values = config_values(project)
     values["execution"].update(
         {
@@ -226,8 +365,15 @@ def _parallel_two_repository_config(project, sibling: Path):
     )
     values["permission_policies"]["policies"]["sibling-repository"] = {
         "default": "deny",
-        "actions": {"inspect": "allow"},
+        "actions": {
+            "inspect": "allow",
+            "modify": "allow",
+            "verify": "allow",
+            "commit": "allow",
+        },
     }
+    values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
     values["repositories"]["sibling-repo"] = {
         "root": str(sibling),
         "expected_remote": {"name": "origin", "url": "https://example.invalid/sibling.git"},
@@ -244,6 +390,11 @@ def _parallel_two_repository_config(project, sibling: Path):
 
 def _two_repository_plan(project) -> NormalizedPlan:
     values = valid_plan_values(project)
+    values["steps"][0]["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "verify", "commit"],
+        "writable_paths": ["evidence/fixture.md"],
+        "requires_operator_approval": False,
+    }
     second = json.loads(json.dumps(values["steps"][0]))
     second.update(
         {
@@ -266,81 +417,70 @@ def _two_repository_plan(project) -> NormalizedPlan:
                     "media_type": "text/markdown",
                 }
             ],
+            "authorization": {
+                "authorized_actions": ["inspect", "modify", "verify", "commit"],
+                "writable_paths": ["evidence/sibling.md"],
+                "requires_operator_approval": False,
+            },
         }
     )
     values["steps"].append(second)
     return NormalizedPlan.model_validate(values)
 
 
-def _repository_snapshot(_config, repo_id: str, *, require_clean: bool) -> RepositorySnapshot:
-    filename = "fixture.md" if repo_id == "fixture-repo" else "sibling.md"
-    return RepositorySnapshot(
-        repo_id=repo_id,
-        branch="main",
-        revision="base-sha",
-        worktree_id="b" * 64,
-        remote_name="origin",
-        remote_url="https://example.invalid/fixture.git",
-        clean=True,
-        evidence=(
-            EvidenceManifestEntry(
-                root="evidence",
-                relative_path=f"evidence/{filename}",
-                file_type="file",
-                size_bytes=10,
-                mode=0o644,
-                mtime_ns=1,
-                sha256="a" * 64,
-            ),
-        ),
-        external=(),
-        changes=(),
-        manifest_sha256="c" * 64,
-    )
-
-
 def _failing_session_runner(**kwargs: Any):
     lifecycle = kwargs["lifecycle"]
-    lifecycle.on_process_started(1000)
+    lifecycle.on_process_started(1000, 1000.0)
     lifecycle.on_session_identified(f"session-{json.loads(kwargs['prompt'])['dispatch_id']}")
-    raise OpenCodeProcessError("deterministic batch child failure")
+    raise OpenCodeProcessError("deterministic batch child failure token=batch-secret")
+
+
+def _mixed_session_runner(**kwargs: Any) -> SessionResult:
+    if json.loads(kwargs["prompt"])["step_id"] == "prepare-sibling":
+        return _failing_session_runner(**kwargs)
+    return _successful_session_runner(**kwargs)
 
 
 def _successful_session_runner(**kwargs: Any) -> SessionResult:
     lifecycle = kwargs["lifecycle"]
     prompt = json.loads(kwargs["prompt"])
     session_id = f"session-{prompt['dispatch_id']}"
-    lifecycle.on_process_started(1000)
+    lifecycle.on_process_started(1000, 1000.0)
     lifecycle.on_session_identified(session_id)
     sibling = prompt["step_id"] == "prepare-sibling"
+    evidence_path = Path(kwargs["workdir"]) / "evidence" / (
+        "sibling.md" if sibling else "fixture.md"
+    )
+    evidence_path.write_text("successful batch evidence\n", encoding="utf-8")
     return SessionResult(
         session_id=session_id,
         exit_code=0,
         evidence_written=[],
         chat_response=json.dumps(
             {
-                "result_version": 1,
-                "response_contract": "dispatcher.executor_result.v1",
+                "proposal_version": 2,
+                "response_contract": "dispatcher.executor_proposal.v2",
                 "dispatch_id": prompt["dispatch_id"],
                 "attempt": prompt["attempt"],
                 "step_id": prompt["step_id"],
                 "repository": {
                     "repo_id": prompt["repo_id"],
-                    "base_revision": "base-sha",
-                    "result_revision": "base-sha",
-                    "patch_sha256": None,
+                    "base_revision": prompt["base_revision"],
                 },
                 "evidence": [
                     {
                         "artifact_id": "sibling-evidence" if sibling else "fixture-evidence",
                         "relative_path": "sibling.md" if sibling else "fixture.md",
-                        "sha256": "a" * 64,
                         "media_type": "text/markdown",
-                        "size_bytes": 10,
                     }
                 ],
-                "verification": [
-                    {"check_id": "fixture-check", "status": "passed", "summary": "passed"}
+                "criterion_self_reports": [
+                    {
+                        "check_id": criterion["criterion_id"],
+                        "status": "not_run",
+                        "summary": "dispatcher owns this check",
+                    }
+                    for criterion in prompt["acceptance_criteria"]
                 ],
                 "summary": "successful batch child",
                 "outcome": "completed",
@@ -360,7 +500,21 @@ def _initialize_sibling_repository(path: Path) -> Path:
         text=True,
         timeout=10,
     )
+    _commit_initial_repository(path, "sibling.md")
     return path
+
+
+def _commit_initial_repository(path: Path, evidence_name: str) -> None:
+    evidence = path / "evidence" / evidence_name
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("initial evidence\n", encoding="utf-8")
+    subprocess.run(["git", "config", "user.name", "Fixture Initializer"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fixture@example.invalid"], cwd=path, check=True
+    )
+    subprocess.run(["git", "branch", "-M", "main"], cwd=path, check=True)
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial fixture"], cwd=path, check=True)
 
 
 def _event(sequence: int) -> TransitionEvent:

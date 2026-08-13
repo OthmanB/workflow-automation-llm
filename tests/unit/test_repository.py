@@ -11,6 +11,7 @@ from dispatcher.repository import (
     RepositoryValidationError,
     inspect_repository,
     validate_executor_snapshot,
+    validate_pending_executor_changes,
     validate_review_snapshot,
     working_patch_sha256,
 )
@@ -174,6 +175,147 @@ def test_concurrent_repository_write_halts_acceptance(project: FixtureProject) -
             after=after,
             result=_executor_result(before),
         )
+
+
+def test_external_diff_drivers_never_run_during_inspection_or_patch_hashing(
+    project: FixtureProject,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "diff-external-ran"
+    script = tmp_path / "evil-diff.sh"
+    script.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    script.chmod(0o700)
+    _git(project.repository, "config", "diff.external", str(script))
+
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    (project.repository / "src" / "value.txt").write_text("value=9\n", encoding="utf-8")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=False)
+    patch_sha256 = working_patch_sha256(project.repository)
+
+    assert not marker.exists()
+    assert patch_sha256
+    assert len(after.changes) == 1
+    assert before.clean and not after.clean
+
+
+def test_executor_git_config_mutation_is_rejected_before_checks(project: FixtureProject) -> None:
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    _git(project.repository, "config", "filter.evil.clean", "/usr/bin/false")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=True)
+
+    with pytest.raises(RepositoryValidationError, match="Git metadata changed"):
+        validate_executor_snapshot(
+            project.config,
+            coordinate=before.dispatch_coordinate(),
+            before=before,
+            after=after,
+            result=_executor_result(before),
+        )
+
+
+def test_executor_hook_mutation_is_rejected_before_checks(project: FixtureProject) -> None:
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    (project.repository / ".git" / "hooks" / "pre-commit").write_text(
+        "#!/bin/sh\necho executor-injected hook\n", encoding="utf-8"
+    )
+    after = inspect_repository(project.config, "fixture-repo", require_clean=True)
+
+    with pytest.raises(RepositoryValidationError, match="Git metadata changed"):
+        validate_pending_executor_changes(
+            project.config,
+            coordinate=before.dispatch_coordinate(),
+            before=before,
+            after=after,
+            root=project.repository,
+            writable_paths=("evidence/",),
+            require_changes=False,
+        )
+
+
+def test_executor_refs_mutation_is_rejected_before_staging(project: FixtureProject) -> None:
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    _git(project.repository, "branch", "executor-injected-branch")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=True)
+
+    with pytest.raises(RepositoryValidationError, match="refs changed"):
+        validate_pending_executor_changes(
+            project.config,
+            coordinate=before.dispatch_coordinate(),
+            before=before,
+            after=after,
+            root=project.repository,
+            writable_paths=("evidence/",),
+            require_changes=False,
+        )
+
+
+def test_pre_existing_exclude_rules_cannot_hide_out_of_scope_writes(
+    project: FixtureProject,
+) -> None:
+    (project.repository / "excludes").write_text("hidden-area/\n", encoding="utf-8")
+    _git(project.repository, "add", "excludes")
+    _git(project.repository, "commit", "-m", "add baseline excludes file")
+    _git(project.repository, "config", "core.excludesFile", "excludes")
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    (project.repository / "hidden-area").mkdir()
+    (project.repository / "hidden-area" / "outside.txt").write_text("hidden write\n", encoding="utf-8")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=False)
+
+    assert "hidden-area/outside.txt" in after.ignored
+    with pytest.raises(RepositoryValidationError, match="created ignored paths outside step writable_paths"):
+        validate_pending_executor_changes(
+            project.config,
+            coordinate=before.dispatch_coordinate(),
+            before=before,
+            after=after,
+            root=project.repository,
+            writable_paths=("evidence/",),
+            require_changes=False,
+        )
+
+
+def test_in_scope_ignored_writes_remain_visible_and_authorized(project: FixtureProject) -> None:
+    (project.repository / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(project.repository, "add", ".gitignore")
+    _git(project.repository, "commit", "-m", "add baseline gitignore")
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    (project.repository / "cache").mkdir()
+    (project.repository / "cache" / "note.txt").write_text("in-scope cache write\n", encoding="utf-8")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=False)
+
+    paths = validate_pending_executor_changes(
+        project.config,
+        coordinate=before.dispatch_coordinate(),
+        before=before,
+        after=after,
+        root=project.repository,
+        writable_paths=("cache/",),
+        require_changes=False,
+    )
+
+    assert any("cache/" in path for path in after.ignored)
+    assert paths == ()
+
+
+def test_dispatcher_commit_moves_refs_without_metadata_rejection(project: FixtureProject) -> None:
+    before = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    (project.repository / "src" / "value.txt").write_text("value=3\n", encoding="utf-8")
+    _git(project.repository, "add", "src/value.txt")
+    _git(project.repository, "commit", "-m", "dispatcher-owned commit moves the branch ref")
+    after = inspect_repository(project.config, "fixture-repo", require_clean=True)
+    assert after.revision != before.revision
+
+    # Metadata must be stable across a dispatcher-owned commit; only the ref
+    # fingerprint may change, and executor-snapshot validation must not reject it.
+    assert after.git_metadata_sha256 == before.git_metadata_sha256
+    assert after.git_refs_sha256 != before.git_refs_sha256
+    validate_executor_snapshot(
+        project.config,
+        coordinate=before.dispatch_coordinate(),
+        before=before,
+        after=after,
+        result=_executor_result(after, result_revision=after.revision),
+    )
 
 
 def _executor_result(

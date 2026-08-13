@@ -26,6 +26,7 @@ from .security import (
     write_private_text_exclusive,
 )
 from .workflow import (
+    BatchStatus,
     DispatchRecord,
     DispatchStatus,
     RunRecord,
@@ -39,7 +40,7 @@ from .workflow import (
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 7
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -94,6 +95,7 @@ class DispatchPayload:
     prompt: str
     policy: Mapping[str, Any]
     result: Mapping[str, Any] | None = None
+    authoritative_verification: tuple[Mapping[str, Any], ...] | None = None
     forwarding_payload: str | None = None
     process_id: int | None = None
     session_metadata: Mapping[str, Any] | None = None
@@ -109,6 +111,7 @@ class RecoveryItem:
     state: DispatchStatus
     disposition: Literal[
         "safe_to_retry",
+        "structured_commit_adoption_required",
         "operator_reconciliation_required",
         "forwarding_required",
         "acknowledgement_required",
@@ -124,6 +127,33 @@ class WorkspaceRecoveryItem:
     state: WorkspaceGroupStatus
     disposition: Literal["cleanup_required", "operator_reconciliation_required"]
     detail: str
+
+
+@dataclass(frozen=True)
+class StructuredGitRecord:
+    """Durable proposal and dispatcher Git lifecycle for one executor attempt."""
+
+    run_id: str
+    dispatch_id: str
+    state: Literal[
+        "PROPOSAL_RECEIVED",
+        "CHECKED",
+        "COMMIT_INTENT_PERSISTED",
+        "STAGED",
+        "COMMITTED",
+        "NO_COMMIT_FINALIZED",
+        "RECONCILIATION_REQUIRED",
+    ]
+    proposal: Mapping[str, Any]
+    proposal_digest: str
+    checked: Mapping[str, Any] | None
+    intent: Mapping[str, Any] | None
+    stage: Mapping[str, Any] | None
+    commit: Mapping[str, Any] | None
+    result_revision: str | None
+    repository_after: Mapping[str, Any] | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class StateStore:
@@ -239,6 +269,7 @@ class StateStore:
         expected_generation: int,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
         dispatch_payloads: Mapping[str, DispatchPayload] | None = None,
+        structured_git_updates: Mapping[str, Mapping[str, Any]] | None = None,
         fault_hook: Callable[[], None] | None = None,
     ) -> int:
         """Atomically commit a complete run generation and optional dispatch payloads."""
@@ -259,6 +290,13 @@ class StateStore:
             self._write_snapshot(connection, record, generation=generation, sessions=current_sessions)
             for dispatch_id, payload in (dispatch_payloads or {}).items():
                 self._write_dispatch_payload(connection, record.run_id, dispatch_id, payload)
+            for dispatch_id, update in (structured_git_updates or {}).items():
+                self._write_structured_git_final(
+                    connection,
+                    run_id=record.run_id,
+                    dispatch_id=dispatch_id,
+                    update=update,
+                )
             if fault_hook is not None:
                 fault_hook()
         self._secure_database_files()
@@ -333,7 +371,7 @@ class StateStore:
         expected_generation: int,
         dispatch_id: str,
         actor_id: str,
-    ) -> tuple[RunRecord, int, int, str]:
+    ) -> tuple[RunRecord, int, int, str, float]:
         """Record cancellation intent before a separate process may be signalled."""
         record, generation = self.load_run(run_id)
         if generation != expected_generation:
@@ -347,6 +385,8 @@ class StateStore:
             raise StateStoreError("dispatch cancellation was already requested")
         if dispatch.process_host is None:
             raise StateStoreCorruptionError("running dispatch has no recorded process host")
+        if dispatch.process_create_time is None:
+            raise StateStoreCorruptionError("running dispatch has no recorded OS process creation time")
         event = TransitionEvent(
             event_id=f"event-{uuid.uuid4().hex}",
             sequence=record.sequence + 1,
@@ -373,7 +413,13 @@ class StateStore:
             causation_id=None,
             payload={"actor_id": actor_id, "process_host": dispatch.process_host},
         )
-        return updated, next_generation, dispatch.process_id, dispatch.process_host
+        return (
+            updated,
+            next_generation,
+            dispatch.process_id,
+            dispatch.process_host,
+            dispatch.process_create_time,
+        )
 
     def leases_for_run(self, run_id: str) -> tuple[Lease, ...]:
         """Return every durable lease currently associated with one run."""
@@ -585,6 +631,7 @@ class StateStore:
         process_id: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         result: Mapping[str, Any] | None = None,
+        authoritative_verification: list[Mapping[str, Any]] | None = None,
         forwarding_payload: str | None = None,
     ) -> None:
         """Persist external process, result, or forwarding data before the next side effect."""
@@ -602,6 +649,7 @@ class StateStore:
                 SET process_id = COALESCE(?, process_id),
                     session_metadata_json = COALESCE(?, session_metadata_json),
                     result_json = COALESCE(?, result_json),
+                    authoritative_verification_json = COALESCE(?, authoritative_verification_json),
                     forwarding_payload = COALESCE(?, forwarding_payload)
                 WHERE run_id = ? AND dispatch_id = ?
                 """,
@@ -609,6 +657,9 @@ class StateStore:
                     process_id,
                     _json_text(session_metadata) if session_metadata is not None else None,
                     _json_text(result) if result is not None else None,
+                    _json_text(authoritative_verification)
+                    if authoritative_verification is not None
+                    else None,
                     redact_text(forwarding_payload) if forwarding_payload is not None else None,
                     run_id,
                     dispatch_id,
@@ -627,15 +678,18 @@ class StateStore:
         result_digest: str | None = None,
         forwarding_digest: str | None = None,
         result: Mapping[str, Any] | None = None,
+        authoritative_verification: list[Mapping[str, Any]] | None = None,
         forwarding_payload: str | None = None,
         process_id: int | None = None,
         process_host: str | None = None,
         process_started_at: datetime | None = None,
+        process_create_time: float | None = None,
         failure_category: str | None = None,
         failure_detail: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         repository_after: Mapping[str, Any] | None = None,
         sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
+        structured_git_final: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, int]:
         """Atomically transition a dispatch and its durable external payloads."""
         try:
@@ -646,8 +700,12 @@ class StateStore:
             raise StateStoreError("COMPLETED dispatch transition requires the exact result payload")
         if target is DispatchStatus.COMPLETED and repository_after is None:
             raise StateStoreError("COMPLETED dispatch transition requires the inspected repository snapshot")
-        if target is DispatchStatus.RUNNING and (process_id is None or process_id < 1):
-            raise StateStoreError("RUNNING dispatch transition requires a positive process_id")
+        if target is DispatchStatus.RUNNING and (
+            process_id is None or process_id < 1 or process_create_time is None
+        ):
+            raise StateStoreError(
+                "RUNNING dispatch transition requires a positive process_id and OS process creation time"
+            )
         if target is DispatchStatus.FORWARDED and forwarding_payload is None:
             raise StateStoreError("FORWARDED dispatch transition requires the complete forwarding payload")
         transitioned = transition_dispatch_record(
@@ -659,6 +717,7 @@ class StateStore:
             forwarding_digest=forwarding_digest,
             process_host=process_host,
             process_started_at=process_started_at,
+            process_create_time=process_create_time,
             process_id=process_id,
             failure_category=failure_category,
             failure_detail=failure_detail,
@@ -677,6 +736,11 @@ class StateStore:
             prompt=payload.prompt,
             policy=payload.policy,
             result=result if result is not None else payload.result,
+            authoritative_verification=(
+                tuple(authoritative_verification)
+                if authoritative_verification is not None
+                else payload.authoritative_verification
+            ),
             forwarding_payload=(
                 forwarding_payload if forwarding_payload is not None else payload.forwarding_payload
             ),
@@ -694,6 +758,11 @@ class StateStore:
             expected_generation=expected_generation,
             sessions=sessions,
             dispatch_payloads={dispatch_id: replacement},
+            structured_git_updates=(
+                {dispatch_id: structured_git_final}
+                if structured_git_final is not None
+                else None
+            ),
         )
         logger.info(
             "dispatch transitioned",
@@ -707,6 +776,139 @@ class StateStore:
             },
         )
         return updated, generation
+
+    def persist_forwarded_dispatch(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        dispatch_id: str,
+        result: Mapping[str, Any],
+        authoritative_verification: list[Mapping[str, Any]] | None,
+        repository_after: Mapping[str, Any] | None,
+        forwarding_payload: str,
+        review_id: str | None = None,
+        review: Mapping[str, Any] | None = None,
+        structured_git_final: Mapping[str, Any] | None = None,
+        sessions: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
+        fault_hook: Callable[[], None] | None = None,
+    ) -> tuple[RunRecord, int]:
+        """Atomically persist a completed worker result with its forwarding.
+
+        The dispatch record must already be transitioned to FORWARDED in
+        memory. Result payload, authoritative verification, repository
+        observation, forwarding payload, optional review row, and optional
+        structured Git final state commit in one transaction so a crash can
+        never strand a durable result without its forwarding.
+        """
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise StateStoreError(f"run record does not contain dispatch: {dispatch_id}") from exc
+        if dispatch.state is not DispatchStatus.FORWARDED:
+            raise StateStoreError("forwarded persistence requires a FORWARDED dispatch record")
+        if dispatch.result_digest is None:
+            raise StateStoreError("forwarded persistence requires a durable result digest")
+        if dispatch.forwarding_digest is None:
+            raise StateStoreError("forwarded persistence requires a durable forwarding digest")
+        forwarding_digest = hashlib.sha256(forwarding_payload.encode("utf-8")).hexdigest()
+        if dispatch.forwarding_digest != forwarding_digest:
+            raise StateStoreError("forwarding payload does not match the durable forwarding digest")
+        if _sha256_json(result) != dispatch.result_digest:
+            raise StateStoreError("result payload does not match the durable result digest")
+        if review is not None and review_id is None:
+            raise StateStoreError("review persistence requires a review_id")
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            row = connection.execute(
+                "SELECT generation, state FROM dispatches WHERE run_id = ? AND dispatch_id = ?",
+                (record.run_id, dispatch_id),
+            ).fetchone()
+            if row is None:
+                raise StateStoreConflictError(f"dispatch does not exist: {dispatch_id}")
+            if row["state"] not in {"RUNNING", "COMPLETED"}:
+                raise StateStoreConflictError(
+                    f"dispatch cannot be forwarded from durable state {row['state']}"
+                )
+            generation_row = connection.execute(
+                "SELECT generation FROM runs WHERE run_id = ?", (record.run_id,)
+            ).fetchone()
+            if generation_row is None or generation_row["generation"] != expected_generation:
+                raise StateStoreConflictError(
+                    f"run {record.run_id} generation conflict: expected {expected_generation}, "
+                    f"found {generation_row['generation'] if generation_row else None}"
+                )
+            existing = self.load_dispatch_payload(record.run_id, dispatch_id)
+            replacement = DispatchPayload(
+                prompt=existing.prompt,
+                policy=existing.policy,
+                result=result,
+                authoritative_verification=(
+                    tuple(authoritative_verification)
+                    if authoritative_verification is not None
+                    else existing.authoritative_verification
+                ),
+                forwarding_payload=forwarding_payload,
+                process_id=existing.process_id,
+                session_metadata=existing.session_metadata,
+                repository_before=existing.repository_before,
+                repository_after=(
+                    repository_after
+                    if repository_after is not None
+                    else existing.repository_after
+                ),
+            )
+            generation = expected_generation + 1
+            self._write_snapshot(
+                connection,
+                record,
+                generation=generation,
+                sessions=self.sessions_for_run(record.run_id) if sessions is None else sessions,
+            )
+            self._write_dispatch_payload(
+                connection,
+                record.run_id,
+                dispatch_id,
+                replacement,
+            )
+            if review_id is not None and review is not None:
+                connection.execute(
+                    """
+                    INSERT INTO reviews(review_id, run_id, dispatch_id, review_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (review_id, record.run_id, dispatch_id, _json_text(review), _utc_now()),
+                )
+            if structured_git_final is not None:
+                self._write_structured_git_final(
+                    connection,
+                    run_id=record.run_id,
+                    dispatch_id=dispatch_id,
+                    update=structured_git_final,
+                )
+            if fault_hook is not None:
+                fault_hook()
+        self._secure_database_files()
+        logger.info(
+            "dispatch forwarded",
+            extra={
+                "dispatcher_context": {
+                    "project_id": record.project_id,
+                    "run_id": record.run_id,
+                    "dispatch_id": dispatch_id,
+                    "step_id": dispatch.step_id,
+                }
+            },
+        )
+        return record, generation
+
+    def review_for_dispatch(self, run_id: str, dispatch_id: str) -> bool:
+        """Return whether a durable review row already exists for a dispatch."""
+        row = self._ready_connection().execute(
+            "SELECT 1 FROM reviews WHERE run_id = ? AND dispatch_id = ?",
+            (run_id, dispatch_id),
+        ).fetchone()
+        return row is not None
 
     def bind_dispatch_session(
         self,
@@ -754,6 +956,7 @@ class StateStore:
                     prompt=payload.prompt,
                     policy=payload.policy,
                     result=payload.result,
+                    authoritative_verification=payload.authoritative_verification,
                     forwarding_payload=payload.forwarding_payload,
                     process_id=payload.process_id,
                     session_metadata=metadata,
@@ -769,7 +972,8 @@ class StateStore:
         with self._connection_lock:
             row = self._ready_connection().execute(
                 """
-                SELECT prompt, policy_json, result_json, forwarding_payload, process_id, session_metadata_json,
+                SELECT prompt, policy_json, result_json, authoritative_verification_json,
+                       forwarding_payload, process_id, session_metadata_json,
                        repository_before_json, repository_after_json
                 FROM dispatch_payloads WHERE run_id = ? AND dispatch_id = ?
                 """,
@@ -781,6 +985,11 @@ class StateStore:
                 prompt=str(row["prompt"]),
                 policy=json.loads(row["policy_json"]),
                 result=json.loads(row["result_json"]) if row["result_json"] is not None else None,
+                authoritative_verification=(
+                    tuple(json.loads(row["authoritative_verification_json"]))
+                    if row["authoritative_verification_json"] is not None
+                    else None
+                ),
                 forwarding_payload=(
                     str(row["forwarding_payload"]) if row["forwarding_payload"] is not None else None
                 ),
@@ -802,6 +1011,189 @@ class StateStore:
                 ),
             )
 
+    def record_executor_proposal(
+        self,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        proposal: Mapping[str, Any],
+    ) -> StructuredGitRecord:
+        """Persist one immutable executor proposal before dispatcher side effects."""
+        proposal_json = _json_text(proposal)
+        proposal_digest = hashlib.sha256(proposal_json.encode("utf-8")).hexdigest()
+        now = _utc_now()
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            dispatch = connection.execute(
+                "SELECT state FROM dispatches WHERE run_id = ? AND dispatch_id = ?",
+                (run_id, dispatch_id),
+            ).fetchone()
+            if dispatch is None:
+                raise StateStoreError(f"executor proposal references unknown dispatch: {dispatch_id}")
+            existing = connection.execute(
+                "SELECT proposal_digest FROM structured_git_commits WHERE run_id = ? AND dispatch_id = ?",
+                (run_id, dispatch_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["proposal_digest"] != proposal_digest:
+                    raise StateStoreConflictError("executor proposal differs from the durable proposal")
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO structured_git_commits(
+                        run_id, dispatch_id, state, proposal_json, proposal_digest,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'PROPOSAL_RECEIVED', ?, ?, ?, ?)
+                    """,
+                    (run_id, dispatch_id, proposal_json, proposal_digest, now, now),
+                )
+        return self.load_structured_git_record(run_id, dispatch_id)
+
+    def record_structured_git_checked(
+        self,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        checked: Mapping[str, Any],
+        intent: Mapping[str, Any] | None,
+    ) -> StructuredGitRecord:
+        """Persist checks and optional commit intent before changing the real index."""
+        target = "COMMIT_INTENT_PERSISTED" if intent is not None else "CHECKED"
+        self._transition_structured_git_record(
+            run_id=run_id,
+            dispatch_id=dispatch_id,
+            allowed_states=("PROPOSAL_RECEIVED",),
+            target=target,
+            checked_json=_json_text(checked),
+            intent_json=_json_text(intent) if intent is not None else None,
+        )
+        return self.load_structured_git_record(run_id, dispatch_id)
+
+    def record_structured_git_staged(
+        self,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        stage: Mapping[str, Any],
+    ) -> StructuredGitRecord:
+        """Persist the exact staged-tree observation before running Git commit."""
+        self._transition_structured_git_record(
+            run_id=run_id,
+            dispatch_id=dispatch_id,
+            allowed_states=("COMMIT_INTENT_PERSISTED",),
+            target="STAGED",
+            stage_json=_json_text(stage),
+        )
+        return self.load_structured_git_record(run_id, dispatch_id)
+
+    def mark_structured_git_reconciliation(
+        self,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        detail: str,
+    ) -> StructuredGitRecord:
+        """Fail closed after an ambiguous checked, staged, or committed side effect."""
+        self._transition_structured_git_record(
+            run_id=run_id,
+            dispatch_id=dispatch_id,
+            allowed_states=(
+                "PROPOSAL_RECEIVED",
+                "CHECKED",
+                "COMMIT_INTENT_PERSISTED",
+                "STAGED",
+            ),
+            target="RECONCILIATION_REQUIRED",
+            failure_detail=redact_text(detail)[:5000],
+        )
+        return self.load_structured_git_record(run_id, dispatch_id)
+
+    def load_structured_git_record(
+        self,
+        run_id: str,
+        dispatch_id: str,
+    ) -> StructuredGitRecord:
+        """Load one exact proposal/commit lifecycle record."""
+        row = self._ready_connection().execute(
+            "SELECT * FROM structured_git_commits WHERE run_id = ? AND dispatch_id = ?",
+            (run_id, dispatch_id),
+        ).fetchone()
+        if row is None:
+            raise StateStoreError(f"structured Git record not found: {dispatch_id}")
+        return StructuredGitRecord(
+            run_id=str(row["run_id"]),
+            dispatch_id=str(row["dispatch_id"]),
+            state=str(row["state"]),  # type: ignore[arg-type]
+            proposal=json.loads(row["proposal_json"]),
+            proposal_digest=str(row["proposal_digest"]),
+            checked=json.loads(row["checked_json"]) if row["checked_json"] else None,
+            intent=json.loads(row["intent_json"]) if row["intent_json"] else None,
+            stage=json.loads(row["stage_json"]) if row["stage_json"] else None,
+            commit=json.loads(row["commit_json"]) if row["commit_json"] else None,
+            result_revision=str(row["result_revision"]) if row["result_revision"] else None,
+            repository_after=(
+                json.loads(row["repository_after_json"])
+                if row["repository_after_json"]
+                else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    def _transition_structured_git_record(
+        self,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        allowed_states: tuple[str, ...],
+        target: str,
+        checked_json: str | None = None,
+        intent_json: str | None = None,
+        stage_json: str | None = None,
+        commit_json: str | None = None,
+        result_revision: str | None = None,
+        repository_after_json: str | None = None,
+        failure_detail: str | None = None,
+    ) -> None:
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            row = connection.execute(
+                "SELECT state FROM structured_git_commits WHERE run_id = ? AND dispatch_id = ?",
+                (run_id, dispatch_id),
+            ).fetchone()
+            if row is None:
+                raise StateStoreError(f"structured Git record not found: {dispatch_id}")
+            if row["state"] not in allowed_states:
+                raise StateStoreConflictError(
+                    f"structured Git record cannot move from {row['state']} to {target}"
+                )
+            connection.execute(
+                """
+                UPDATE structured_git_commits
+                SET state = ?, checked_json = COALESCE(?, checked_json),
+                    intent_json = COALESCE(?, intent_json),
+                    stage_json = COALESCE(?, stage_json),
+                    commit_json = COALESCE(?, commit_json),
+                    result_revision = COALESCE(?, result_revision),
+                    repository_after_json = COALESCE(?, repository_after_json),
+                    failure_detail = COALESCE(?, failure_detail), updated_at = ?
+                WHERE run_id = ? AND dispatch_id = ?
+                """,
+                (
+                    target,
+                    checked_json,
+                    intent_json,
+                    stage_json,
+                    commit_json,
+                    result_revision,
+                    repository_after_json,
+                    failure_detail,
+                    _utc_now(),
+                    run_id,
+                    dispatch_id,
+                ),
+            )
+
     def classify_recovery(self, run_id: str) -> list[RecoveryItem]:
         """Classify unresolved dispatches without launching or retrying any work."""
         record, _generation = self.load_run(run_id)
@@ -817,12 +1209,36 @@ class StateStore:
                     )
                 )
             elif dispatch.state is DispatchStatus.RUNNING:
+                commit_row = self._ready_connection().execute(
+                    "SELECT state FROM structured_git_commits WHERE run_id = ? AND dispatch_id = ?",
+                    (run_id, dispatch.dispatch_id),
+                ).fetchone()
+                detail = "external side effects may have completed; automatic retry is forbidden"
+                disposition: Literal[
+                    "structured_commit_adoption_required",
+                    "operator_reconciliation_required",
+                ] = "operator_reconciliation_required"
+                if commit_row is not None and commit_row["state"] == "STAGED":
+                    disposition = "structured_commit_adoption_required"
+                    detail = (
+                        "durable staged intent requires exact committed HEAD adoption; "
+                        "any mismatch requires operator reconciliation"
+                    )
+                elif commit_row is not None and commit_row["state"] in {
+                    "CHECKED",
+                    "COMMIT_INTENT_PERSISTED",
+                    "RECONCILIATION_REQUIRED",
+                }:
+                    detail = (
+                        f"structured Git state {commit_row['state']} may have external side effects; "
+                        "exact commit adoption or operator reconciliation is required"
+                    )
                 items.append(
                     RecoveryItem(
                         dispatch.dispatch_id,
                         dispatch.state,
-                        "operator_reconciliation_required",
-                        "external side effects may have completed; automatic retry is forbidden",
+                        disposition,
+                        detail,
                     )
                 )
             elif dispatch.state is DispatchStatus.COMPLETED:
@@ -908,7 +1324,6 @@ class StateStore:
         )
         decision_id = f"decision-{uuid.uuid4().hex}"
         updated_record = record
-        target = request.resume_to
         if request.kind == "risk_gate":
             if request.step_id is None or request.step_id not in record.steps:
                 raise StateStoreCorruptionError("risk gate request does not reference a known step")
@@ -924,8 +1339,10 @@ class StateStore:
                     update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
                 )
                 target = RunStatus.RUNNING
-            else:
+            elif answer == "deny":
                 target = RunStatus.HALTED
+            else:
+                raise StateStoreCorruptionError(f"invalid risk gate answer {answer!r}")
         elif request.kind == "escalation":
             if request.step_id is None or request.step_id not in record.steps:
                 raise StateStoreCorruptionError("escalation request does not reference a known step")
@@ -947,8 +1364,10 @@ class StateStore:
                     update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
                 )
                 target = RunStatus.RUNNING
-            else:
+            elif answer == "halt":
                 target = RunStatus.HALTED
+            else:
+                raise StateStoreCorruptionError(f"invalid escalation answer {answer!r}")
         elif request.kind == "review_waiver":
             if request.step_id is None or request.step_id not in record.steps or record.policy is None:
                 raise StateStoreCorruptionError("review waiver request does not reference a compiled policy step")
@@ -969,8 +1388,10 @@ class StateStore:
                     update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
                 )
                 target = RunStatus.RUNNING
-            else:
+            elif answer == "halt":
                 target = RunStatus.HALTED
+            else:
+                raise StateStoreCorruptionError(f"invalid review waiver answer {answer!r}")
         elif request.kind == "stall_recovery":
             if request.step_id is None or request.step_id not in record.steps:
                 raise StateStoreCorruptionError("stall recovery request does not reference a known step")
@@ -982,11 +1403,141 @@ class StateStore:
                     updated_record = record.model_copy(
                         update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
                     )
-                elif step.state is not StepStatus.REVIEW_REQUIRED:
+                elif step.state is StepStatus.REVIEW_REQUIRED:
+                    steps = dict(record.steps)
+                    steps[request.step_id] = step.model_copy(update={"last_event": event})
+                    updated_record = record.model_copy(
+                        update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                    )
+                else:
                     raise StateStoreError("stall retry requires a blocked or review-required step")
                 target = RunStatus.RUNNING
-            else:
+            elif answer == "halt":
                 target = RunStatus.HALTED
+            else:
+                raise StateStoreCorruptionError(f"invalid stall recovery answer {answer!r}")
+        elif request.kind == "underspecification":
+            if answer == "answer":
+                target = RunStatus.RUNNING
+            elif answer == "halt":
+                target = RunStatus.HALTED
+            else:
+                raise StateStoreCorruptionError(f"invalid underspecification answer {answer!r}")
+        elif request.kind == "budget":
+            if answer != "halt":
+                raise StateStoreCorruptionError(f"invalid budget answer {answer!r}")
+            target = RunStatus.HALTED
+        elif request.kind == "reconciliation":
+            if answer == "halt":
+                target = RunStatus.HALTED
+            elif answer == "reconcile":
+                if request.step_id is None or request.step_id not in record.steps:
+                    raise StateStoreCorruptionError(
+                        "reconciliation request does not reference a known step"
+                    )
+                try:
+                    dispatch = record.dispatches[request.context_ref]
+                except KeyError as exc:
+                    raise StateStoreCorruptionError(
+                        "reconciliation request does not reference a known dispatch"
+                    ) from exc
+                if dispatch.step_id != request.step_id:
+                    raise StateStoreCorruptionError(
+                        "reconciliation dispatch does not belong to the requested step"
+                    )
+                if dispatch.state not in {DispatchStatus.FAILED, DispatchStatus.ABANDONED}:
+                    raise StateStoreError("reconciliation requires a failed or abandoned dispatch")
+                step = record.steps[request.step_id]
+                steps = dict(record.steps)
+                if step.state is StepStatus.BLOCKED:
+                    steps[request.step_id] = transition_step(step, StepStatus.READY, event)
+                elif step.state is StepStatus.REVIEW_REQUIRED:
+                    steps[request.step_id] = step.model_copy(update={"last_event": event})
+                else:
+                    raise StateStoreError(
+                        "reconciliation requires a blocked or review-required step"
+                    )
+                updated_record = record.model_copy(
+                    update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                )
+                target = RunStatus.RUNNING
+            else:
+                raise StateStoreCorruptionError(f"invalid reconciliation answer {answer!r}")
+        elif request.kind == "batch_reconciliation":
+            if answer == "halt":
+                target = RunStatus.HALTED
+            elif answer == "reconcile":
+                try:
+                    batch = record.batches[request.context_ref]
+                except KeyError as exc:
+                    raise StateStoreCorruptionError(
+                        "batch reconciliation request does not reference a known batch"
+                    ) from exc
+                if batch.state is not BatchStatus.FAILED:
+                    raise StateStoreError("batch reconciliation requires a failed batch")
+                if not batch.failed_dispatch_ids:
+                    raise StateStoreCorruptionError(
+                        "failed batch reconciliation requires failed dispatch IDs"
+                    )
+                affected_step_ids: set[str] = set()
+                for dispatch_id in batch.failed_dispatch_ids:
+                    try:
+                        dispatch = record.dispatches[dispatch_id]
+                    except KeyError as exc:
+                        raise StateStoreCorruptionError(
+                            f"batch reconciliation references unknown dispatch {dispatch_id}"
+                        ) from exc
+                    if dispatch.batch_id != batch.batch_id:
+                        raise StateStoreCorruptionError(
+                            f"dispatch {dispatch_id} does not belong to batch {batch.batch_id}"
+                        )
+                    if dispatch.state not in {DispatchStatus.FAILED, DispatchStatus.ABANDONED}:
+                        raise StateStoreError(
+                            f"batch reconciliation dispatch {dispatch_id} is not failed or abandoned"
+                        )
+                    if dispatch.step_id not in record.steps:
+                        raise StateStoreCorruptionError(
+                            f"batch reconciliation dispatch {dispatch_id} references an unknown step"
+                        )
+                    affected_step_ids.add(dispatch.step_id)
+                steps = dict(record.steps)
+                for step_id in sorted(affected_step_ids):
+                    step = record.steps[step_id]
+                    if step.state is StepStatus.BLOCKED:
+                        steps[step_id] = transition_step(step, StepStatus.READY, event)
+                    elif step.state is StepStatus.REVIEW_REQUIRED:
+                        steps[step_id] = step.model_copy(update={"last_event": event})
+                    else:
+                        raise StateStoreError(
+                            f"batch reconciliation step {step_id} has incompatible state {step.state.value}"
+                        )
+                updated_record = record.model_copy(
+                    update={"steps": steps, "sequence": event.sequence, "updated_at": event.occurred_at}
+                )
+                target = RunStatus.RUNNING
+            else:
+                raise StateStoreCorruptionError(f"invalid batch reconciliation answer {answer!r}")
+        elif request.kind == "workspace_reconciliation":
+            if answer == "halt":
+                target = RunStatus.HALTED
+            elif answer == "reconcile":
+                try:
+                    group = record.workspace_groups[request.context_ref]
+                except KeyError as exc:
+                    raise StateStoreCorruptionError(
+                        "workspace reconciliation request does not reference a known workspace group"
+                    ) from exc
+                if group.state is not WorkspaceGroupStatus.CLEANED:
+                    raise StateStoreError(
+                        "workspace reconciliation requires durable cleanup to reach CLEANED"
+                    )
+                target = RunStatus.RUNNING
+            else:
+                raise StateStoreCorruptionError(f"invalid workspace reconciliation answer {answer!r}")
+        else:
+            raise StateStoreCorruptionError(
+                f"no answer handling for operator request kind {request.kind!r}"
+            )
         updated = transition_run(updated_record, target, event)
         sessions = self.sessions_for_run(run_id)
         connection = self._ready_connection()
@@ -1513,6 +2064,12 @@ class StateStore:
             version = 4
         if version == 4:
             self._apply_v5(connection)
+            version = 5
+        if version == 5:
+            self._apply_v6(connection)
+            version = 6
+        if version == 6:
+            self._apply_v7(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -1718,6 +2275,50 @@ class StateStore:
             """
         )
 
+    def _apply_v6(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            ALTER TABLE dispatch_payloads ADD COLUMN authoritative_verification_json TEXT;
+            INSERT INTO schema_migrations(version, applied_at) VALUES (6, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
+    def _apply_v7(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE structured_git_commits (
+                run_id TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'PROPOSAL_RECEIVED', 'CHECKED', 'COMMIT_INTENT_PERSISTED',
+                    'STAGED', 'COMMITTED', 'NO_COMMIT_FINALIZED',
+                    'RECONCILIATION_REQUIRED'
+                )),
+                proposal_json TEXT NOT NULL,
+                proposal_digest TEXT NOT NULL,
+                checked_json TEXT,
+                intent_json TEXT,
+                stage_json TEXT,
+                commit_json TEXT,
+                result_revision TEXT,
+                repository_after_json TEXT,
+                failure_detail TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, dispatch_id),
+                FOREIGN KEY(run_id, dispatch_id)
+                    REFERENCES dispatches(run_id, dispatch_id) ON DELETE CASCADE
+            );
+            CREATE INDEX structured_git_recovery
+                ON structured_git_commits(run_id, state);
+            INSERT INTO schema_migrations(version, applied_at) VALUES (7, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
     def _write_snapshot(
         self,
         connection: sqlite3.Connection,
@@ -1859,13 +2460,14 @@ class StateStore:
             """
             INSERT INTO dispatch_payloads(
                 run_id, dispatch_id, prompt, policy_json, result_json,
-                forwarding_payload, process_id, session_metadata_json,
+                authoritative_verification_json, forwarding_payload, process_id, session_metadata_json,
                 repository_before_json, repository_after_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, dispatch_id) DO UPDATE SET
                 prompt = excluded.prompt,
                 policy_json = excluded.policy_json,
                 result_json = excluded.result_json,
+                authoritative_verification_json = excluded.authoritative_verification_json,
                 forwarding_payload = excluded.forwarding_payload,
                 process_id = excluded.process_id,
                 session_metadata_json = excluded.session_metadata_json,
@@ -1878,6 +2480,9 @@ class StateStore:
                 redact_text(payload.prompt),
                 _json_text(payload.policy),
                 _json_text(payload.result) if payload.result is not None else None,
+                _json_text(payload.authoritative_verification)
+                if payload.authoritative_verification is not None
+                else None,
                 redact_text(payload.forwarding_payload) if payload.forwarding_payload is not None else None,
                 payload.process_id,
                 _json_text(payload.session_metadata) if payload.session_metadata is not None else None,
@@ -1887,6 +2492,47 @@ class StateStore:
         )
         if cursor.rowcount != 1:
             raise StateStoreError(f"dispatch payload references unknown dispatch: {dispatch_id}")
+
+    def _write_structured_git_final(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        dispatch_id: str,
+        update: Mapping[str, Any],
+    ) -> None:
+        target = update.get("state")
+        allowed = {
+            "COMMITTED": {"STAGED"},
+            "NO_COMMIT_FINALIZED": {"CHECKED"},
+        }
+        if target not in allowed:
+            raise StateStoreError("structured Git final update has an invalid target state")
+        row = connection.execute(
+            "SELECT state FROM structured_git_commits WHERE run_id = ? AND dispatch_id = ?",
+            (run_id, dispatch_id),
+        ).fetchone()
+        if row is None or row["state"] not in allowed[target]:
+            raise StateStoreConflictError(
+                f"structured Git final update cannot move from {row['state'] if row else 'missing'} to {target}"
+            )
+        connection.execute(
+            """
+            UPDATE structured_git_commits
+            SET state = ?, commit_json = ?, result_revision = ?,
+                repository_after_json = ?, updated_at = ?
+            WHERE run_id = ? AND dispatch_id = ?
+            """,
+            (
+                target,
+                _json_text(update.get("commit")) if update.get("commit") is not None else None,
+                update.get("result_revision"),
+                _json_text(update.get("repository_after")),
+                _utc_now(),
+                run_id,
+                dispatch_id,
+            ),
+        )
 
     def _lease_is_stale(self, heartbeat_at: str) -> bool:
         try:
@@ -1923,7 +2569,7 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
-def _json_text(value: Mapping[str, Any] | None) -> str:
+def _json_text(value: object) -> str:
     return json.dumps(redact_value(value or {}), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 

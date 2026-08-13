@@ -80,7 +80,7 @@ def test_baseline_backed_run_dispatches_only_the_first_dependency_ready_pending_
     )
     assert isinstance(prepared, PreparedDispatch)
     running = workflow.record_session_id(
-        workflow.mark_running(prepared, process_id=3001),
+        workflow.mark_running(prepared, process_id=3001, process_create_time=3001.0),
         runtime_session_id="session-baseline-pending",
     )
     completed = ExecutorCompletedResult.model_validate(
@@ -202,6 +202,20 @@ def _adoption_plan(project) -> NormalizedPlan:
                     "media_type": "text/markdown",
                 }
             ],
+            "acceptance_criteria": [
+                {
+                    "criterion_id": "pending-check",
+                    "description": "Verify the pending output.",
+                    "check": {
+                        "argv": ["python", "-c", "print('pending')"],
+                        "working_directory": "repository",
+                        "timeout_seconds": 30,
+                        "max_output_bytes": 65536,
+                        "expected_exit_codes": [0],
+                        "network_policy": "deny",
+                    },
+                }
+            ],
             "resource_locks": [{"resource_id": "pending-resource", "mode": "write"}],
         }
     )
@@ -263,6 +277,10 @@ def _repository_snapshot(_config, repo_id: str, *, require_clean: bool) -> Repos
         evidence=evidence,
         external=(),
         changes=(),
+        ignored=(),
+        dirty_patch_sha256="a" * 64,
+        git_metadata_sha256="e" * 64,
+        git_refs_sha256="f" * 64,
         manifest_sha256="d" * 64,
     )
 

@@ -5,7 +5,13 @@ from typing import Any
 
 import pytest
 import yaml
-from helpers import FixtureProject, create_fixture_project, valid_plan_values
+from helpers import (
+    FixtureProject,
+    config_values,
+    create_fixture_project,
+    valid_plan_values,
+    write_config,
+)
 
 from dispatcher.plan import (
     NormalizedPlan,
@@ -47,6 +53,17 @@ def test_yaml_sidecar_verifies_source_hash_and_cross_references(project: Fixture
     assert plan.source_digest != plan.plan_digest
 
 
+def test_duplicate_yaml_keys_fail_before_plan_validation(project: FixtureProject) -> None:
+    sidecar = project.root / "duplicate-plan.yaml"
+    sidecar.write_text(
+        yaml.safe_dump(valid_plan_values(project), sort_keys=False) + "\nsteps: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlanError, match="duplicate YAML key: steps"):
+        load_normalized_plan(sidecar, project.config)
+
+
 def test_semantically_identical_plans_share_digest_despite_source_identity(
     project: FixtureProject,
 ) -> None:
@@ -66,6 +83,10 @@ def test_semantically_identical_plans_share_digest_despite_source_identity(
         (
             lambda values: values["steps"][0].pop("authorization"),
             "authorization\n  Field required",
+        ),
+        (
+            lambda values: values["steps"][0]["authorization"].pop("writable_paths"),
+            "writable_paths\n  Field required",
         ),
         (
             lambda values: values["steps"][0].update({"evidence_requirements": []}),
@@ -102,6 +123,56 @@ def test_unknown_repository_and_unauthorized_action_fail_cross_validation(
     unauthorized_values["steps"][0]["authorization"]["authorized_actions"] = ["delete"]
     with pytest.raises(PlanError, match="authorization exceeds repository policy"):
         validate_plan_for_config(NormalizedPlan.model_validate(unauthorized_values), project.config)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", ".", "../outside", "/absolute", "src//value.py", "src/./value.py", ".git/config"],
+)
+def test_invalid_writable_path_grammar_rejects(project: FixtureProject, value: str) -> None:
+    values = valid_plan_values(project)
+    values["steps"][0]["authorization"] = {
+        "authorized_actions": ["inspect", "modify"],
+        "writable_paths": [value],
+        "requires_operator_approval": False,
+    }
+
+    with pytest.raises(ValueError, match="writable path|at least 1 character"):
+        NormalizedPlan.model_validate(values)
+
+
+def test_writable_path_overlap_and_evidence_escape_reject(project: FixtureProject) -> None:
+    values = valid_plan_values(project)
+    values["steps"][0]["authorization"] = {
+        "authorized_actions": ["inspect", "modify"],
+        "writable_paths": ["evidence/", "evidence/fixture.md"],
+        "requires_operator_approval": False,
+    }
+    with pytest.raises(ValueError, match="overlapping paths"):
+        NormalizedPlan.model_validate(values)
+
+    values["steps"][0]["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "commit"],
+        "writable_paths": ["src/value.py"],
+        "requires_operator_approval": False,
+    }
+    config_data = config_values(project)
+    config_data["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    config = write_config(project, config_data)
+    plan = NormalizedPlan.model_validate(values)
+    with pytest.raises(PlanError, match="inside exactly one writable_paths scope"):
+        validate_plan_for_config(plan, config)
+
+
+def test_commit_scope_requires_modify_and_required_commit_policy(project: FixtureProject) -> None:
+    values = valid_plan_values(project)
+    values["steps"][0]["authorization"] = {
+        "authorized_actions": ["inspect", "commit"],
+        "writable_paths": [],
+        "requires_operator_approval": False,
+    }
+    with pytest.raises(ValueError, match="commit authorization requires modify"):
+        NormalizedPlan.model_validate(values)
 
 
 def test_dependency_and_resource_conflicts_are_rejected(project: FixtureProject) -> None:

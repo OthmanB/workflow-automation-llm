@@ -234,6 +234,15 @@ at operator gates and never treats a waiting state as failure.
 - Changed config, plan, baseline, branch, or repository blocks execution.
 - Permission, review, evidence, cancellation, recovery, and barrier behavior use
   the same dispatcher-owned checks as mock workflow tests.
+- The real model must return exactly one JSON object containing the exact
+  `response_contract` field and every required non-empty field. JSON parsing is
+  only the first check; full schema validation follows.
+- Prose-wrapped JSON, valid JSON with missing or renamed fields, null required
+  fields, empty required strings, incorrect evidence hashes, and incorrect
+  evidence sizes must stop the run before workflow state advances.
+- The disposable test harness must never repair, extract, or reshape a model
+  response into a typed result. It may inspect disposable files for assertions,
+  but production-style result parsing must receive the model response directly.
 
 ## 5. Disposable Real-Operation Test
 
@@ -248,6 +257,9 @@ Run real OpenCode through the dispatcher to:
 - commit and integrate through the normal worktree path;
 - prove cancellation and recovery on a separate disposable attempt;
 - clean all temporary branches, worktrees, sessions, and processes.
+
+The typed result must be emitted directly by the real worker model. A harness or
+dispatcher-side repair of natural-language output does not count as proof.
 
 Repeat for:
 

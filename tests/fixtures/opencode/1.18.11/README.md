@@ -31,6 +31,7 @@ must support before real OpenCode execution is re-enabled.
 - `run-resumed-session.jsonl`: successful resumed-session event stream.
 - `run-forked-session.jsonl`: successful forked-session event stream.
 - `run-tool-events.jsonl`: completed tool and reasoning events.
+- `run-narration-then-result.jsonl`: narrated multi-step session with a final executor result.
 - `run-error.jsonl`: structured session error event.
 - `run-malformed.jsonl`: one malformed line followed by one valid event.
 - `run-nonzero-exit.json`: process-level nonzero-exit metadata.

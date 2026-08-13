@@ -130,6 +130,7 @@ def test_step_and_dispatch_allowed_and_rejected_transitions(project: FixtureProj
         dispatch,
         DispatchStatus.RUNNING,
         _event(2),
+        process_create_time=1234.5,
     )
     assert running.runtime_session_id is None
     identified = running.model_copy(update={"runtime_session_id": "runtime-session-one"})

@@ -26,12 +26,25 @@ Replace ad-hoc paths and implicit defaults with a schema-v2 project YAML:
 Validate the result against `schemas/project-config-v1.json` and the public
 example before starting a run.
 
+The current executable schema does not yet accept MCP fields. Step 21-lite will
+extend schema version 2 in place with Context7, selected Repomix methods, Semble,
+and per-role lists; existing project files will then be updated directly without
+a new schema version or migration subsystem.
+
 ## Plans and Baselines
 
-Convert a plan to `NormalizedPlan` schema-v1 with source hashes, dependencies,
+Convert a plan to `NormalizedPlan` schema-v2 with source hashes, dependencies,
 inputs/outputs, repository and resource ownership, authorization, acceptance,
 evidence, review, and retry policy. A plan requires an explicit approval before
 run creation.
+
+Schema-v2 authorization requires explicit repository-relative `writable_paths`.
+Persisted plans created before this requirement are intentionally not resumed by
+inferring a broad scope; create and approve a new plan and run. Required-commit
+repositories also require explicit `execution.structured_git` author and
+committer identity. Executors now return `dispatcher.executor_proposal.v2` and
+must not run tests, stage, or commit. The dispatcher owns verification, evidence
+metadata, and `dispatcher.executor_result.v1` materialization.
 
 Historical work is not automatically trusted. Baseline inspection records facts
 only; an operator must supply one PENDING, ACCEPTED, or WAIVED decision for each

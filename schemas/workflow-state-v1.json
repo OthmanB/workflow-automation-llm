@@ -4,6 +4,9 @@
       "additionalProperties": false,
       "description": "A check that must pass before a step can be accepted.",
       "properties": {
+        "check": {
+          "$ref": "#/$defs/VerificationCheck"
+        },
         "criterion_id": {
           "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
           "title": "Criterion Id",
@@ -18,7 +21,8 @@
       },
       "required": [
         "criterion_id",
-        "description"
+        "description",
+        "check"
       ],
       "title": "AcceptanceCriterion",
       "type": "object"
@@ -306,6 +310,19 @@
           "title": "Logical Session Key",
           "type": "string"
         },
+        "process_create_time": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Create Time"
+        },
         "process_host": {
           "anyOf": [
             {
@@ -477,7 +494,7 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 1,
+          "const": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1088,10 +1105,20 @@
         "requires_operator_approval": {
           "title": "Requires Operator Approval",
           "type": "boolean"
+        },
+        "writable_paths": {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Writable Paths",
+          "type": "array"
         }
       },
       "required": [
         "authorized_actions",
+        "writable_paths",
         "requires_operator_approval"
       ],
       "title": "StepAuthorization",
@@ -1408,6 +1435,62 @@
         }
       },
       "title": "UsageLedger",
+      "type": "object"
+    },
+    "VerificationCheck": {
+      "additionalProperties": false,
+      "description": "Dispatcher-owned argv check executed without a shell.",
+      "properties": {
+        "argv": {
+          "items": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Argv",
+          "type": "array"
+        },
+        "expected_exit_codes": {
+          "items": {
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": "Expected Exit Codes",
+          "type": "array"
+        },
+        "max_output_bytes": {
+          "maximum": 10000000,
+          "minimum": 1024,
+          "title": "Max Output Bytes",
+          "type": "integer"
+        },
+        "network_policy": {
+          "const": "deny",
+          "title": "Network Policy",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "maximum": 3600,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "working_directory": {
+          "const": "repository",
+          "title": "Working Directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "argv",
+        "working_directory",
+        "timeout_seconds",
+        "max_output_bytes",
+        "expected_exit_codes",
+        "network_policy"
+      ],
+      "title": "VerificationCheck",
       "type": "object"
     },
     "WorkspaceChild": {

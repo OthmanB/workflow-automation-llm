@@ -15,6 +15,9 @@ from pydantic import ValidationError
 from dispatcher.config import ProjectConfigModel
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.protocol import ProtocolError, parse_supervisor_command
+from dispatcher.results import parse_executor_result
+from dispatcher.sequential import SequentialWorkflowError, _validate_result_verification
+from dispatcher.verification import AuthoritativeVerification
 from dispatcher.workflow import (
     STEP_TRANSITIONS,
     StepStatus,
@@ -120,3 +123,88 @@ def test_step_transition_table_rejects_every_invalid_generated_edge(
     else:
         with pytest.raises(ValueError, match="invalid step transition"):
             transition_step(step, target, event)
+
+
+@settings(max_examples=80, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(
+    verification=st.lists(
+        st.tuples(
+            st.sampled_from(["fixture-check", "unknown-check"]),
+            st.sampled_from(["passed", "failed", "skipped"]),
+        ),
+        max_size=4,
+    )
+)
+def test_completed_result_context_requires_exact_unique_all_passed_verification(
+    project: FixtureProject,
+    verification: list[tuple[str, str]],
+) -> None:
+    step = NormalizedPlan.model_validate(valid_plan_values(project)).steps[0]
+    result = parse_executor_result(_executor_payload(verification, outcome="completed"))
+    valid = verification == [("fixture-check", "passed")]
+    authoritative = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="passed",
+            argv=("property-check",),
+            exit_code=0,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="0" * 64,
+            stderr_sha256="0" * 64,
+            transcript_sha256="0" * 64,
+            duration_ms=0,
+            backend="property-test",
+            summary="property verification passed",
+        ),
+    )
+
+    if valid:
+        _validate_result_verification(step, result, authoritative)
+    else:
+        with pytest.raises(SequentialWorkflowError):
+            _validate_result_verification(step, result)
+
+
+@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(status=st.sampled_from(["passed", "failed", "skipped"]))
+def test_blocked_result_context_allows_any_status_only_with_exact_coverage(
+    project: FixtureProject,
+    status: str,
+) -> None:
+    step = NormalizedPlan.model_validate(valid_plan_values(project)).steps[0]
+    result = parse_executor_result(
+        _executor_payload([("fixture-check", status)], outcome="blocked")
+    )
+
+    _validate_result_verification(step, result)
+
+
+def _executor_payload(
+    verification: list[tuple[str, str]],
+    *,
+    outcome: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "result_version": 1,
+        "response_contract": "dispatcher.executor_result.v1",
+        "dispatch_id": "dispatch-property",
+        "attempt": 1,
+        "step_id": "prepare-fixture",
+        "repository": {
+            "repo_id": "fixture-repo",
+            "base_revision": "base-sha",
+            "result_revision": "result-sha",
+            "patch_sha256": None,
+        },
+        "evidence": [],
+        "verification": [
+            {"check_id": check_id, "status": status, "summary": "property check"}
+            for check_id, status in verification
+        ],
+        "summary": "property result",
+        "outcome": outcome,
+    }
+    if outcome == "blocked":
+        payload["blockers"] = ["property blocker"]
+    return payload

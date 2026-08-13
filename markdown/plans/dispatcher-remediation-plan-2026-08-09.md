@@ -138,6 +138,8 @@ dispatch execution.
 - [x] Ensure every check records a typed result and final audit outcome.
 - [x] Add tests for enabled, disabled, skipped-smoke, mocked success, model
   failure, credential failure, Git failure, path failure, and disk failure.
+- [x] Require model smoke output to equal `OK` after trimming surrounding
+  whitespace; reject `NOT OK`, extra text, empty output, and wrappers.
 - [x] Check disk space on the configured state, evidence, archive, and
   repository filesystems rather than only the process working directory.
 
@@ -318,10 +320,23 @@ execution fallback with a strict contract.
 - [x] Require executor results to include dispatch ID, attempt, step ID,
   repository coordinates, base revision, resulting revision or patch hash,
   evidence artifacts, verification results, and a concise summary.
+- [x] Require the exact non-empty field
+  `response_contract: "dispatcher.executor_result.v1"` in every executor
+  result.
+- [x] Require one JSON object only: no prose, Markdown fences, comments,
+  trailing text, renamed fields, missing fields, null required fields, or empty
+  required strings.
+- [x] Give workers a concrete schema-shaped response template, including the
+  required contract field, identity fields, repository coordinates, evidence,
+  verification, summary, and outcome.
 - [x] Define reviewer verdicts: `accepted`, `changes_requested`, `blocked`, and
   `inconclusive`.
 - [x] Require reviewer results to include reviewed revision or artifact hashes,
   findings, verification results, and required remediation.
+- [x] Require the exact non-empty field
+  `response_contract: "dispatcher.reviewer_result.v1"` in every reviewer
+  result, plus dispatch identity, review target, findings, verification,
+  remediation, summary, and verdict fields.
 - [x] Reject results that do not match the active dispatch, step, repository,
   attempt, or immutable review target.
 - [x] Store free-form chat as supplemental transcript content, not workflow
@@ -390,6 +405,8 @@ loop.
 - [x] Reject missing session IDs for new sessions.
 - [x] Reject missing final assistant output for command types that require it.
 - [x] Report malformed lines and unknown required event types explicitly.
+- [x] Reject duplicate JSON object keys in every OpenCode JSONL event before
+  interpreting event fields.
 - [x] Parse output incrementally rather than buffering unbounded JSONL.
 - [x] Run the complete captured fixture corpus as contract tests.
 - [x] Add a runtime version check with a clear unsupported-version error.

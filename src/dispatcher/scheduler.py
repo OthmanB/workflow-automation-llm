@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from .config import Config
-from .plan import PlanStep, ResourceLock
+from .plan import PlanStep, ResourceLock, parse_writable_path
 from .protocol import DispatchRequest
 from .workflow import (
     ACTIVE_DISPATCH_STATES,
@@ -163,6 +164,7 @@ def validate_workspace_batch(
         errors.append("workspace batch exceeds execution.concurrency.max_active_dispatches")
     role_counts = _active_role_counts(active_dispatches)
     selected_resources: set[str] = set()
+    selected_writable_paths: list[tuple[str, str]] = []
     for child in ordered:
         step = plan_steps.get(child.step_id)
         if step is None:
@@ -191,6 +193,14 @@ def validate_workspace_batch(
         if conflict:
             errors.append(f"workspace step {step.step_id} conflicts on {', '.join(sorted(conflict))}")
         selected_resources.update(resources)
+        for writable_path in step.authorization.writable_paths:
+            for selected_step_id, selected_path in selected_writable_paths:
+                if _writable_paths_overlap(writable_path, selected_path):
+                    errors.append(
+                        f"workspace step {step.step_id} writable path {writable_path} "
+                        f"overlaps step {selected_step_id} path {selected_path}"
+                    )
+            selected_writable_paths.append((step.step_id, writable_path))
     if errors:
         raise SchedulingError("; ".join(errors))
     return ordered
@@ -216,3 +226,21 @@ def _active_resource_keys(record: RunRecord, plan_steps: dict[str, PlanStep]) ->
 def _step_resource_keys(repo_id: str, locks: tuple[ResourceLock, ...]) -> tuple[str, ...]:
     resource_ids = tuple(lock.resource_id for lock in locks)
     return resource_keys(repo_id, resource_ids)
+
+
+def _writable_paths_overlap(first: str, second: str) -> bool:
+    first_path, first_directory = parse_writable_path(first)
+    second_path, second_directory = parse_writable_path(second)
+    if first_path == second_path:
+        return True
+    return (first_directory and _is_within(second_path, first_path)) or (
+        second_directory and _is_within(first_path, second_path)
+    )
+
+
+def _is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True

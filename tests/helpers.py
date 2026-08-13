@@ -106,6 +106,7 @@ def create_fixture_project(
                     "variant": "high",
                     "display": "Fixture Supervisor",
                     "permission_policy": "supervisor",
+                    "mcp_tools": [],
                 }
             },
             "executors": {
@@ -114,6 +115,7 @@ def create_fixture_project(
                     "variant": "high",
                     "display": "Fixture Executor",
                     "permission_policy": "executor",
+                    "mcp_tools": [],
                 }
             },
             "reviewers": {
@@ -122,15 +124,18 @@ def create_fixture_project(
                     "variant": "high",
                     "display": "Fixture Reviewer",
                     "permission_policy": "reviewer",
+                    "mcp_tools": [],
                 },
                 "reviewer-two": {
                     "model": "fixture/reviewer-two",
                     "variant": "high",
                     "display": "Fixture Second Reviewer",
                     "permission_policy": "reviewer",
+                    "mcp_tools": [],
                 }
             },
         },
+        "mcp": {"environment_passthrough": [], "servers": {}},
         "profile": {
             "profiles_file": str(profiles_path),
             "profile_id": "balanced",
@@ -138,6 +143,16 @@ def create_fixture_project(
         "execution": {
             "mode": "mock_workflow_test",
             "protocol_version": 1,
+            "verification_backend": "darwin_seatbelt_v1",
+            "structured_git": {
+                "capability_version": 1,
+                "author_name": "Dispatcher Executor",
+                "author_email": "dispatcher-author@example.invalid",
+                "committer_name": "Dispatcher Committer",
+                "committer_email": "dispatcher-committer@example.invalid",
+                "timeout_seconds": 30,
+                "max_output_bytes": 65536,
+            },
             "scheduling": "sequential",
             "concurrency": {
                 "max_active_dispatches": 1,
@@ -202,14 +217,41 @@ def create_fixture_project(
                     "default": "deny",
                     "actions": {"inspect": "allow", "modify": "allow", "verify": "allow"},
                 },
-                "supervisor-class": {"default": "deny", "actions": {"inspect": "allow"}},
+                "supervisor-class": {
+                    "default": "deny",
+                    "actions": {
+                        "inspect": "allow",
+                        "modify": "deny",
+                        "verify": "deny",
+                        "commit": "deny",
+                        "push": "deny",
+                        "force_push": "deny",
+                        "create_branch": "deny",
+                    },
+                },
                 "executor-class": {
                     "default": "deny",
-                    "actions": {"inspect": "allow", "modify": "allow", "verify": "allow"},
+                    "actions": {
+                        "inspect": "allow",
+                        "modify": "allow",
+                        "verify": "allow",
+                        "commit": "deny",
+                        "push": "deny",
+                        "force_push": "deny",
+                        "create_branch": "deny",
+                    },
                 },
                 "reviewer-class": {
                     "default": "deny",
-                    "actions": {"inspect": "allow", "modify": "deny", "verify": "allow"},
+                    "actions": {
+                        "inspect": "allow",
+                        "modify": "deny",
+                        "verify": "deny",
+                        "commit": "deny",
+                        "push": "deny",
+                        "force_push": "deny",
+                        "create_branch": "deny",
+                    },
                 },
                 "supervisor": {"default": "deny", "actions": {}},
                 "executor": {"default": "deny", "actions": {}},
@@ -265,7 +307,7 @@ def config_values(project: FixtureProject) -> dict[str, Any]:
 def valid_plan_values(project: FixtureProject) -> dict[str, Any]:
     source_hash = hashlib.sha256((project.plans / "plan.md").read_bytes()).hexdigest()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "plan_id": "fixture-plan",
         "sources": [
             {
@@ -295,10 +337,22 @@ def valid_plan_values(project: FixtureProject) -> dict[str, Any]:
                 "risk_tags": [],
                 "authorization": {
                     "authorized_actions": ["inspect"],
+                    "writable_paths": [],
                     "requires_operator_approval": False,
                 },
                 "acceptance_criteria": [
-                    {"criterion_id": "fixture-check", "description": "Fixture check passes"}
+                    {
+                        "criterion_id": "fixture-check",
+                        "description": "Fixture check passes",
+                        "check": {
+                            "argv": ["python", "-c", "print('fixture check')"],
+                            "working_directory": "repository",
+                            "timeout_seconds": 30,
+                            "max_output_bytes": 65536,
+                            "expected_exit_codes": [0],
+                            "network_policy": "deny",
+                        },
+                    }
                 ],
                 "evidence_requirements": [
                     {

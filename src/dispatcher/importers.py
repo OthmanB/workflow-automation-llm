@@ -7,34 +7,14 @@ import re
 from pathlib import Path
 from typing import Mapping
 
-import yaml
 from pydantic import Field
 
 from .config import Config, ContractModel, Identifier
 from .plan import NormalizedPlan, PlanError, load_normalized_plan
+from .yaml_io import load_unique_yaml
 
 _TIER2_STEP_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|.*\|$")
 _BACKTICK_VALUE = re.compile(r"`([^`]+)`")
-
-
-class _UniqueKeyLoader(yaml.SafeLoader):
-    """Reject duplicate keys in the small project-local ownership document."""
-
-
-def _construct_unique_mapping(loader: yaml.Loader, node: yaml.MappingNode, deep: bool = False) -> dict[object, object]:
-    mapping: dict[object, object] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
-            raise ValueError(f"duplicate ownership-map key: {key}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _construct_unique_mapping,
-)
 
 
 class OwnershipMap(ContractModel):
@@ -51,9 +31,9 @@ def load_ownership_map(path: str | Path, config: Config) -> OwnershipMap:
     if not ownership_path.is_file():
         raise PlanError(f"ownership map not found: {ownership_path}")
     try:
-        raw = yaml.load(ownership_path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
+        raw = load_unique_yaml(ownership_path)
         ownership = OwnershipMap.model_validate(raw)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError) as exc:
         raise PlanError(f"invalid ownership map: {exc}") from exc
     if ownership.project_id != config.project_id:
         raise PlanError("ownership map project_id does not match configured project")

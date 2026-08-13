@@ -27,6 +27,17 @@ reviews, and completion.
 ### Current Baseline
 {baseline}
 
+## Observation Capabilities
+
+{observation_tools}
+
+Use native `read`, `glob`, and `grep` to inspect file contents and locate files.
+Use only the exact diagnostic shell commands above for current directory,
+branch, revision, status, and diff metadata. Do not add shell arguments,
+redirection, chaining, pipes, substitutions, or other shell syntax. Do not run
+tests. Do not create, edit, stage, commit, delete, or otherwise modify target
+repository files or Git state. Report required remediation for an executor.
+
 ## Protocol
 
 Reply with exactly one schema-v1 JSON command object. Do not include prose,

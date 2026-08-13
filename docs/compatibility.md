@@ -7,6 +7,21 @@
 - The pinned decoder contract is represented by sanitized fixtures under
   `tests/fixtures/opencode/1.18.11` and tested by
   `tests/contract/test_opencode_compatibility.py`.
+- OpenCode JSONL events reject duplicate object keys before any session,
+  text, usage, cost, or error field is interpreted.
+- Normalized execution plans use schema version 2. Schema-v1 normalized plans
+  are intentionally rejected because no real operation shipped before the
+  dispatcher-owned structured verification migration.
+- macOS local checks require `/usr/bin/sandbox-exec` for `darwin_seatbelt_v1`.
+  The dispatcher fails closed if the configured backend is unavailable.
+- Step 21 adds a deterministic local MCP fixture server under
+  `tests/fixtures/mcp/` that speaks plain stdio JSON-RPC. Dispatcher
+  compilation emits pinned OpenCode inline MCP server definitions and exact
+  per-tool permission keys (`<server>_<method>` after name sanitization).
+  Live tool-name capture against the real pinned binary remains gated behind
+  the same live environment gates as other real-operation proofs; the project
+  supports only the observed 1.18.11 inline MCP configuration shape and will
+  not add a multi-version MCP adapter.
 
 Install the development environment with:
 

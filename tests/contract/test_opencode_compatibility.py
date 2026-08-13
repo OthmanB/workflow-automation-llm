@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from dispatcher.results import parse_executor_result
 from dispatcher.sessions import (
     OpenCodeJsonlDecoder,
     OpenCodeProcessError,
@@ -153,6 +154,31 @@ def test_current_decoder_supports_opencode_1_18_11_success_stream() -> None:
     }
 
 
+def test_decoder_uses_only_final_text_from_narration_then_result_fixture() -> None:
+    stdout = (_fixture_dir() / "run-narration-then-result.jsonl").read_text(encoding="utf-8")
+    expected = (
+        '{"result_version":1,"response_contract":"dispatcher.executor_result.v1",'
+        '"dispatch_id":"dispatch_fixture","attempt":1,"step_id":"prepare_fixture",'
+        '"repository":{"repo_id":"fixture_repo","base_revision":"base_fixture",'
+        '"result_revision":"result_fixture","patch_sha256":null},"evidence":[],"'
+        'verification":[{"check_id":"fixture_check","status":"passed",'
+        '"summary":"Synthetic fixture verified."}],"summary":"Synthetic fixture completed.",'
+        '"transcript_ref":null,"outcome":"completed"}'
+    )
+
+    raw, chat, _usage, session_id = _parse_json_output(stdout)
+
+    assert session_id == "ses_fixture_narration_result"
+    assert chat == expected
+    assert json.loads(chat)["response_contract"] == "dispatcher.executor_result.v1"
+    assert parse_executor_result(json.loads(chat)).outcome == "completed"
+    assert [event["part"]["id"] for event in raw if event["type"] == "text"] == [
+        "prt_fixture_narration_one",
+        "prt_fixture_narration_two",
+        "prt_fixture_final_result",
+    ]
+
+
 @pytest.mark.parametrize(
     ("fixture_name", "require_response", "expected_session"),
     [
@@ -190,6 +216,11 @@ def test_decoder_rejects_error_and_malformed_fixture_events() -> None:
     malformed_line = (_fixture_dir() / "run-malformed.jsonl").read_text(encoding="utf-8").splitlines()[0]
     with pytest.raises(OpenCodeProtocolError, match="malformed"):
         malformed_decoder.consume_line(malformed_line, line_number=1)
+
+    duplicate_decoder = OpenCodeJsonlDecoder(max_output_bytes=4096)
+    duplicate_line = (_fixture_dir() / "run-duplicate-key.jsonl").read_text(encoding="utf-8")
+    with pytest.raises(OpenCodeProtocolError, match="duplicate JSON key"):
+        duplicate_decoder.consume_line(duplicate_line, line_number=1)
 
 
 @pytest.mark.parametrize(

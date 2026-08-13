@@ -1,17 +1,19 @@
-"""Normalized schema-v1 plans and explicit YAML-sidecar import."""
+"""Normalized schema-v2 plans and explicit YAML-sidecar import."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
 import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from .config import Config, ConfigError, ContractModel, Identifier
+from .yaml_io import DuplicateYamlKeyError, load_unique_yaml
 
 
 class PlanError(ValueError):
@@ -59,10 +61,11 @@ class StepAuthorization(ContractModel):
     """Structured authorization request constrained by repository policy."""
 
     authorized_actions: tuple[Identifier, ...]
+    writable_paths: tuple[RelativePath, ...]
 
-    @field_validator("authorized_actions", mode="before")
+    @field_validator("authorized_actions", "writable_paths", mode="before")
     @classmethod
-    def freeze_actions(cls, value: object) -> object:
+    def freeze_authorization_collections(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
     requires_operator_approval: bool
 
@@ -75,12 +78,66 @@ class StepAuthorization(ContractModel):
             raise ValueError("authorized_actions must not contain duplicates")
         return values
 
+    @field_validator("writable_paths")
+    @classmethod
+    def valid_writable_paths(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[tuple[PurePosixPath, bool]] = []
+        for value in values:
+            path, directory = parse_writable_path(value)
+            for existing_path, existing_directory in normalized:
+                if path == existing_path:
+                    raise ValueError("writable_paths must not contain duplicate paths")
+                if existing_directory and _pure_path_is_within(path, existing_path):
+                    raise ValueError("writable_paths must not contain overlapping paths")
+                if directory and _pure_path_is_within(existing_path, path):
+                    raise ValueError("writable_paths must not contain overlapping paths")
+            normalized.append((path, directory))
+        return values
+
+    @model_validator(mode="after")
+    def validate_action_scope(self) -> Self:
+        actions = set(self.authorized_actions)
+        if "modify" in actions and not self.writable_paths:
+            raise ValueError("modify authorization requires nonempty writable_paths")
+        if "commit" in actions and "modify" not in actions:
+            raise ValueError("commit authorization requires modify authorization")
+        if "modify" not in actions and self.writable_paths:
+            raise ValueError("writable_paths require modify authorization")
+        return self
+
+
+class VerificationCheck(ContractModel):
+    """Dispatcher-owned argv check executed without a shell."""
+
+    argv: tuple[Annotated[str, Field(min_length=1, max_length=1000)], ...]
+    working_directory: Literal["repository"]
+    timeout_seconds: Annotated[int, Field(ge=1, le=3600)]
+    max_output_bytes: Annotated[int, Field(ge=1024, le=10_000_000)]
+    expected_exit_codes: tuple[Annotated[int, Field(ge=0, le=255)], ...]
+    network_policy: Literal["deny"]
+
+    @field_validator("argv", "expected_exit_codes", mode="before")
+    @classmethod
+    def freeze_check_collections(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_check(self) -> Self:
+        if not self.argv:
+            raise ValueError("verification check argv must not be empty")
+        if not self.expected_exit_codes:
+            raise ValueError("verification check expected_exit_codes must not be empty")
+        if len(self.expected_exit_codes) != len(set(self.expected_exit_codes)):
+            raise ValueError("verification check expected_exit_codes must be unique")
+        return self
+
 
 class AcceptanceCriterion(ContractModel):
     """A check that must pass before a step can be accepted."""
 
     criterion_id: Identifier
     description: Annotated[str, Field(min_length=1, max_length=2000)]
+    check: VerificationCheck
 
 
 class EvidenceRequirement(ContractModel):
@@ -217,7 +274,7 @@ class PlanStep(ContractModel):
 class NormalizedPlan(ContractModel):
     """Immutable execution plan, with semantic digest independent of source format."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     plan_id: Identifier
     sources: tuple[PlanSource, ...]
     steps: tuple[PlanStep, ...]
@@ -360,8 +417,8 @@ def load_normalized_plan(path: str | Path, config: Config) -> NormalizedPlan:
     if not plan_path.is_file():
         raise PlanError(f"normalized plan sidecar not found: {plan_path}")
     try:
-        raw = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        raw = load_unique_yaml(plan_path)
+    except (DuplicateYamlKeyError, yaml.YAMLError) as exc:
         raise PlanError(f"invalid normalized plan YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise PlanError("normalized plan sidecar must be a YAML mapping")
@@ -393,6 +450,41 @@ def validate_plan_for_config(plan: NormalizedPlan, config: Config) -> None:
                 f"step {step.step_id} authorization exceeds repository policy: "
                 f"{sorted(unauthorized)}"
             )
+        actions = set(step.authorization.authorized_actions)
+        if "commit" in actions and repository.commit_policy != "required":
+            raise PlanError(
+                f"step {step.step_id} commit authorization requires repository commit_policy required"
+            )
+        if repository.commit_policy == "required" and "modify" in actions and "commit" not in actions:
+            raise PlanError(
+                f"step {step.step_id} modifies a required-commit repository without commit authorization"
+            )
+        for writable_path in step.authorization.writable_paths:
+            logical_path, _directory = parse_writable_path(writable_path)
+            if not any(
+                _pure_path_is_within(logical_path, PurePosixPath(root))
+                for root in repository.writable_roots
+            ):
+                raise PlanError(
+                    f"step {step.step_id} writable path is outside repository writable_roots: "
+                    f"{writable_path}"
+                )
+        if "modify" in actions:
+            for requirement in step.evidence_requirements:
+                candidates = [
+                    PurePosixPath(root) / PurePosixPath(requirement.relative_path)
+                    for root in repository.evidence_roots
+                ]
+                authorized = [
+                    candidate
+                    for candidate in candidates
+                    if writable_path_allows(step.authorization.writable_paths, candidate.as_posix())
+                ]
+                if len(authorized) != 1:
+                    raise PlanError(
+                        f"step {step.step_id} evidence {requirement.artifact_id} must resolve "
+                        "inside exactly one writable_paths scope"
+                    )
         for reviewer_role_key in step.review.reviewer_role_keys:
             if config.role_kind(reviewer_role_key) != "reviewer":
                 raise PlanError(
@@ -427,6 +519,43 @@ def _ancestor_steps(step_id: str, step_map: dict[str, PlanStep]) -> set[str]:
         ancestors.add(dependency)
         ancestors.update(_ancestor_steps(dependency, step_map))
     return ancestors
+
+
+def parse_writable_path(value: str) -> tuple[PurePosixPath, bool]:
+    """Parse one canonical repository-relative file or trailing-slash directory scope."""
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError("writable path must not contain control characters")
+    if "\\" in value:
+        raise ValueError("writable path must use POSIX separators")
+    directory = value.endswith("/")
+    logical = value[:-1] if directory else value
+    if not logical or logical.startswith("/") or "//" in logical:
+        raise ValueError("writable path must be a non-root repository-relative path")
+    parts = logical.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("writable path must not contain empty, '.', or '..' segments")
+    if ".git" in parts:
+        raise ValueError("writable path must not include .git")
+    return PurePosixPath(*parts), directory
+
+
+def writable_path_allows(scopes: tuple[str, ...], value: str) -> bool:
+    """Return whether one canonical repository path is authorized by exact scopes."""
+    path = PurePosixPath(value)
+    return any(
+        path == scope_path or (directory and _pure_path_is_within(path, scope_path))
+        for scope_path, directory in (parse_writable_path(scope) for scope in scopes)
+    )
+
+
+def _pure_path_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    if root == PurePosixPath("."):
+        return True
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _format_plan_validation_error(exc: ValidationError) -> str:

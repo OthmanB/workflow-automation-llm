@@ -39,11 +39,11 @@ class FaultFixture:
 
 
 @pytest.mark.parametrize(
-    ("fault", "error_type"),
+    ("fault", "error_type", "expected_category"),
     [
-        ("nonzero", OpenCodeProcessError),
-        ("malformed_jsonl", OpenCodeProtocolError),
-        ("timeout", OpenCodeTimeoutError),
+        ("nonzero", OpenCodeProcessError, "unknown"),
+        ("malformed_jsonl", OpenCodeProtocolError, "protocol"),
+        ("timeout", OpenCodeTimeoutError, "timeout"),
     ],
 )
 def test_worker_process_failures_never_advance_the_step(
@@ -51,6 +51,7 @@ def test_worker_process_failures_never_advance_the_step(
     monkeypatch: pytest.MonkeyPatch,
     fault: str,
     error_type: type[Exception],
+    expected_category: str,
 ) -> None:
     fixture = _create_fault_fixture(tmp_path, monkeypatch, timeout_seconds=1)
     prepared = _prepare_executor(fixture)
@@ -66,17 +67,19 @@ def test_worker_process_failures_never_advance_the_step(
     assert failed.operator_request.context_ref == dispatch.dispatch_id
     assert failed.steps["prepare-fixture"].state.value == "BLOCKED"
     assert dispatch.state.value == "FAILED"
+    assert dispatch.failure_category == expected_category
+    assert dispatch.failure_detail
     assert _git(fixture.project.repository, "rev-list", "--count", "HEAD") == "1"
     fixture.coordinator.release_run()
 
 
-def test_repository_commit_followed_by_nonzero_exit_requires_reconciliation(
+def test_repository_write_followed_by_nonzero_exit_requires_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _create_fault_fixture(tmp_path, monkeypatch)
     prepared = _prepare_executor(fixture)
-    _inject_fault(fixture.fake_opencode, "commit_nonzero")
+    _inject_fault(fixture.fake_opencode, "write_nonzero")
 
     with pytest.raises(OpenCodeProcessError):
         fixture.coordinator.execute_worker(prepared)
@@ -84,8 +87,8 @@ def test_repository_commit_followed_by_nonzero_exit_requires_reconciliation(
     failed, _generation = fixture.store.load_run(fixture.record.run_id)
     assert failed.state is RunStatus.WAITING_OPERATOR
     assert failed.steps["prepare-fixture"].state.value == "BLOCKED"
-    assert _git(fixture.project.repository, "rev-list", "--count", "HEAD") == "2"
-    assert _git(fixture.project.repository, "status", "--porcelain") == ""
+    assert _git(fixture.project.repository, "rev-list", "--count", "HEAD") == "1"
+    assert _git(fixture.project.repository, "status", "--porcelain") != ""
     fixture.coordinator.release_run()
 
 
@@ -111,6 +114,17 @@ def test_timeout_uses_one_bounded_cooldown_retry_then_completes(
     assert outcome.record.steps["prepare-fixture"].state.value == "ACCEPTED"
     assert outcome.record.steps["prepare-fixture"].stalls == 1
     assert sleeps == [3]
+    first_attempt = outcome.record.dispatches[prepared.dispatch.dispatch_id]
+    assert first_attempt.state.value == "FAILED"
+    assert first_attempt.failure_category == "timeout"
+    assert first_attempt.failure_detail
+    assert len(
+        [
+            dispatch
+            for dispatch in outcome.record.dispatches.values()
+            if dispatch.failure_category is not None
+        ]
+    ) == 1
     fixture.coordinator.release_run()
 
 
@@ -166,7 +180,15 @@ def _create_fault_fixture(
     _commit_initial_fixture(project.repository)
     plan_values = valid_plan_values(project)
     step = plan_values["steps"][0]
-    step["authorization"]["authorized_actions"] = ["inspect", "modify", "verify"]
+    step["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "verify", "commit"],
+        "writable_paths": ["evidence/", "src/value.txt"],
+        "requires_operator_approval": False,
+    }
+    values = config_values(project)
+    values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
+    project = replace(project, config=write_config(project, values))
     if max_executor_attempts is not None:
         step["retry"]["max_executor_attempts"] = max_executor_attempts
     if review_required:

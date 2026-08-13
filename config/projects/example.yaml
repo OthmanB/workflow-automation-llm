@@ -42,23 +42,35 @@ roles:
       variant: standard
       display: Example Supervisor
       permission_policy: supervisor
+      mcp_tools:
+        - context7_resolve-library-id
+        - context7_query-docs
   executors:
     executor:
       model: example/executor-model
       variant: standard
       display: Example Executor
       permission_policy: executor
+      mcp_tools:
+        - context7_resolve-library-id
+        - context7_query-docs
   reviewers:
     reviewer:
       model: example/reviewer-model
       variant: standard
       display: Example Reviewer
       permission_policy: reviewer
+      mcp_tools:
+        - context7_resolve-library-id
+        - context7_query-docs
     reviewer-two:
       model: example/reviewer-model
       variant: standard
       display: Example Second Reviewer
       permission_policy: reviewer
+      mcp_tools:
+        - context7_resolve-library-id
+        - context7_query-docs
 
 profile:
   profiles_file: ../profiles.yaml
@@ -67,6 +79,15 @@ profile:
 execution:
   mode: mock_workflow_test
   protocol_version: 1
+  verification_backend: darwin_seatbelt_v1
+  structured_git:
+    capability_version: 1
+    author_name: Dispatcher Executor
+    author_email: dispatcher-author@example.invalid
+    committer_name: Dispatcher Committer
+    committer_email: dispatcher-committer@example.invalid
+    timeout_seconds: 30
+    max_output_bytes: 65536
   scheduling: sequential
   concurrency:
     max_active_dispatches: 1
@@ -144,18 +165,32 @@ permission_policies:
       default: deny
       actions:
         inspect: allow
+        modify: deny
+        verify: deny
+        commit: deny
+        push: deny
+        force_push: deny
+        create_branch: deny
     executor-class:
       default: deny
       actions:
         inspect: allow
         modify: allow
         verify: allow
+        commit: deny
+        push: deny
+        force_push: deny
+        create_branch: deny
     reviewer-class:
       default: deny
       actions:
         inspect: allow
         modify: deny
-        verify: allow
+        verify: deny
+        commit: deny
+        push: deny
+        force_push: deny
+        create_branch: deny
     supervisor:
       default: deny
       actions: {}
@@ -179,3 +214,27 @@ preflight:
   credentials: []
   require_git_remote: true
   disk_space_min_mb: 500
+
+mcp:
+  environment_passthrough: []
+  servers:
+    context7:
+      type: remote
+      enabled: true
+      url: https://mcp.context7.com/mcp
+      headers: {}
+    # Replace the placeholder commands below with the executables from your
+    # installed Repomix and Semble MCP servers, then set enabled to true and
+    # add their exact tools to each role's mcp_tools list.
+    repomix:
+      type: local
+      enabled: false
+      command:
+        - /usr/local/bin/repomix-mcp
+      environment: {}
+    semble:
+      type: local
+      enabled: false
+      command:
+        - /usr/local/bin/semble-mcp
+      environment: {}

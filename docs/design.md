@@ -89,6 +89,19 @@ The two non-trivial pieces are:
    verified *before* the first dispatch so the loop never blocks on a missing
    permission or crashes on a missing credential (Section 10).
 
+### 2.1 Current operating principle
+
+The project is operated by one trusted user for experimental and research work.
+Its success criterion is completing useful supervisor → executor → reviewer
+workflows with less manual forwarding. Existing typed contracts, repository
+validation, and dispatcher-owned checks/commits are retained, but future work
+should not add schema versions, durable states, recovery protocols, approval
+layers, or test matrices unless a demonstrated workflow failure requires them.
+
+Prefer the smallest change that makes the next real workflow succeed. After a
+capability is implemented, exercise it on useful work before planning another
+infrastructure step.
+
 ---
 
 ## 3. Architecture
@@ -130,33 +143,22 @@ Roles from the sanitized reference workflow:
 | Reviewer high-risk | Claude Sonnet 5 | Fresh; second independent opinion on flagged steps |
 | Planner (optional) | default: supervisor, or a cheap model | Pre-flight only; produces an actionable plan breakdown |
 
-### 3.1 The agents' MCP toolset (opaque capabilities)
+### 3.1 Research MCP tools
 
-Your `opencode` ships with: **context7** (docs), **github** (repo API, needs
-`GITHUB_PERSONAL_ACCESS_TOKEN`), **playwright** (browser), **repomix** (repo
-packing), **semble** (semantic memory), plus a simple-memory plugin and
-auto-compaction.
+Step 21-lite introduces a small managed MCP catalog because isolated worker
+HOME/XDG directories do not reliably inherit the operator's normal OpenCode
+configuration. Its schema-v2 project configuration defines local or remote
+servers, and each role lists the exact research methods it receives.
 
-Design stance: the dispatcher is **inner-working agnostic** — it never assumes
-which tools an agent has; it forwards prompts and the agent uses whatever MCP
-it has. The toolset matters in exactly two places:
+The planned initial catalog provides Context7 for current library documentation,
+selected Repomix read/pack/query methods for repository context, and Semble for
+semantic code search. The selected servers and exact tool allows are included in
+the generated child OpenCode configuration and listed in worker prompts.
 
-1. **Per-role tool guardrails.** The config declares per-role allowed/denied
-   tools (e.g. reviewer: deny `webfetch`/`bash`/`github`; executor: `github`
-   only where authorized). These are (a) injected as a mandatory footer in
-   every dispatch and (b) compiled into `opencode` permission rules (Section
-   10). This makes a rule like the reviewer's "DO NOT CONTACT THE CLUSTER OR
-   NETWORK" mechanical, not just prose.
-2. **Pre-flight credential checks.** For MCP tools the plan will need, the
-   pre-flight verifies the env var / server is present (e.g.
-   `GITHUB_PERSONAL_ACCESS_TOKEN` for the github MCP, `CONTEXT7_API_KEY` for
-   context7). A needed-but-misconfigured tool stops the run with a clear
-   message instead of a mid-run crash.
-
-Memory/context (semble, repomix, simple-memory) is the agents' own concern; the
-dispatcher does not duplicate it. The supervisor bootstrap may *instruct* the
-supervisor to use repomix to build a repo context bundle before planning — an
-instruction, not a dependency.
+MCP remains an optional model capability rather than workflow authority. The
+dispatcher does not interpret MCP output as acceptance evidence or duplicate
+the tools' code-understanding functions. GitHub, Playwright, and writing Repomix
+methods are deferred until there is an actual workflow need.
 
 ---
 

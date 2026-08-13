@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,80 @@ from dispatcher.sessions import SessionResult
 @pytest.fixture
 def project(tmp_path: Path) -> FixtureProject:
     return create_fixture_project(tmp_path)
+
+
+def _mcp_project(tmp_path: Path, *, command: list[str] | None = None, passthrough: list[str] | None = None):
+    from helpers import write_config
+
+    project = create_fixture_project(tmp_path)
+    values = config_values(project)
+    values["mcp"] = {
+        "environment_passthrough": passthrough if passthrough is not None else [],
+        "servers": {
+            "fixture": {
+                "type": "local",
+                "enabled": True,
+                "command": command or ["/usr/bin/fixture-mcp"],
+                "environment": {},
+            }
+        },
+    }
+    for pool in values["roles"].values():
+        for role_key in pool:
+            pool[role_key]["mcp_tools"] = ["fixture_echo"]
+    return write_config(project, values)
+
+
+def test_preflight_mcp_passes_when_servers_resolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_non_model_checks(monkeypatch)
+    import sys
+
+    config = _mcp_project(tmp_path, command=[sys.executable, "-V"])
+    results = preflight.run_preflight(config, config.state_dir, skip_smoke=True)
+    assert results["mcp"]["status"] == "passed"
+    assert "1 enabled MCP server" in results["mcp"]["detail"]
+
+
+def test_preflight_mcp_resolves_path_commands_via_PATH(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_non_model_checks(monkeypatch)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fixture-mcp-bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bin_dir / "fixture-mcp-bin").chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    config = _mcp_project(tmp_path, command=["fixture-mcp-bin"])
+
+    results = preflight.run_preflight(config, config.state_dir, skip_smoke=True)
+    assert results["mcp"]["status"] == "passed"
+
+
+def test_preflight_mcp_fails_on_missing_passthrough_variable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_non_model_checks(monkeypatch)
+    monkeypatch.delenv("FIXTURE_MCP_TOKEN", raising=False)
+    config = _mcp_project(tmp_path, passthrough=["FIXTURE_MCP_TOKEN"])
+
+    with pytest.raises(PreflightError, match="mcp: .*passthrough environment variable"):
+        preflight.run_preflight(config, config.state_dir, skip_smoke=True)
+
+
+def test_preflight_mcp_fails_on_missing_local_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_non_model_checks(monkeypatch)
+    config = _mcp_project(tmp_path, command=["/definitely/missing/fixture-mcp"])
+
+    with pytest.raises(PreflightError, match="mcp: .*does not exist"):
+        preflight.run_preflight(config, config.state_dir, skip_smoke=True)
 
 
 def _patch_non_model_checks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,6 +140,26 @@ def test_enabled_preflight_uses_injected_smoke_runner(
     )
     assert audit_event["passed"] is True
     assert audit_event["checks"] == results
+
+
+@pytest.mark.parametrize("response", ["NOT OK", "OK\nextra", "OK but more", ""])
+def test_model_smoke_rejects_non_exact_ok_responses(
+    project: FixtureProject,
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+) -> None:
+    _patch_non_model_checks(monkeypatch)
+
+    def runner(**_kwargs: Any) -> SessionResult:
+        return SessionResult(
+            session_id="ses_fixture",
+            exit_code=0,
+            chat_response=response,
+            evidence_written=[],
+        )
+
+    with pytest.raises(PreflightError, match="exact 'OK' response"):
+        preflight.run_preflight(project.config, project.config.state_dir, run_session=runner)
 
 
 def test_absent_preflight_is_audited(tmp_path: Path) -> None:

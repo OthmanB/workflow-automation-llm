@@ -27,7 +27,11 @@ def test_two_repository_plan_routes_each_worker_to_its_normalized_repository(
     config = _configure_two_repositories(project, sibling)
     plan_values = valid_plan_values(project)
     first = plan_values["steps"][0]
-    first["authorization"]["authorized_actions"] = ["inspect", "modify", "verify"]
+    first["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "verify", "commit"],
+        "writable_paths": ["evidence/", "src/value.txt"],
+        "requires_operator_approval": False,
+    }
     second = json.loads(json.dumps(first))
     second.update(
         {
@@ -170,13 +174,15 @@ def _prepare(
 
 def _configure_two_repositories(project, sibling: Path):
     values = config_values(project)
+    values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
     values["permission_policies"]["policies"]["repository-b"] = {
         "default": "deny",
         "actions": {
             "inspect": "allow",
             "modify": "allow",
             "verify": "allow",
-            "commit": "deny",
+            "commit": "allow",
         },
     }
     values["repositories"]["sibling-repo"] = {

@@ -49,8 +49,30 @@ Every dispatch has a durable intent with prompt hash, policy digest, repository
 coordinate, result kind, and idempotency key. Phase 3 persists those rows in
 the private SQLite authority at `state.directory/dispatcher.sqlite3`; the
 legacy `run-record.json` checkpoint and Markdown/JSONL artifacts are derived
-exports only. A `RUNNING` dispatch always requires operator reconciliation
-after process loss and is never retried implicitly.
+exports only. A `RUNNING` dispatch is never retried implicitly. The only
+automatic process-loss recovery is exact adoption of a dispatcher-created
+commit whose durable structured Git record remains `STAGED`; every fingerprint
+mismatch requires operator reconciliation.
+
+## Structured Git states
+
+Required-commit executor work has a separate SQLite lifecycle because Git and
+SQLite cannot commit atomically:
+
+| State | Meaning |
+|---|---|
+| `PROPOSAL_RECEIVED` | The immutable executor proposal is durable. |
+| `CHECKED` | Dispatcher checks and repository/evidence observations are durable; no commit is required. |
+| `COMMIT_INTENT_PERSISTED` | The exact base, worktree, path set, candidate tree, identity digest, and message are durable before real-index staging. |
+| `STAGED` | Exact real-index staging was observed before commit creation. |
+| `COMMITTED` | Commit fingerprint, authoritative result, verification, and post-snapshot were atomically persisted. |
+| `NO_COMMIT_FINALIZED` | A non-committing outcome was finalized. |
+| `RECONCILIATION_REQUIRED` | An interrupted or mismatched external side effect cannot be adopted safely. |
+
+Recovery never runs `git reset`, `git clean`, staging, commit, or verification.
+It may inspect and adopt an exact `STAGED` commit only after the worker is known
+to have exited and parent, tree, path set, identity, subject, worktree, clean
+post-state, and durable evidence all match.
 
 ## Batch states
 

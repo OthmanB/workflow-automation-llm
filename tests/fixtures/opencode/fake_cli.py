@@ -17,6 +17,33 @@ STATE_PATH = ROOT / "fake-state.json"
 CALLS_PATH = ROOT / "calls.jsonl"
 FAULT_PATH = ROOT / "fault.json"
 
+_DIAGNOSTIC_COMMANDS = (
+    "pwd",
+    "ls",
+    "git status --porcelain=v1",
+    "git branch --show-current",
+    "git rev-parse HEAD",
+    "git diff --no-ext-diff --no-textconv",
+)
+_NATIVE_OBSERVATION_TOOLS = ("read", "glob", "grep")
+
+_EXPECTED_REVIEWER_BASH = {
+    "*": "deny",
+    **{command: "allow" for command in _DIAGNOSTIC_COMMANDS},
+}
+
+_DENIED_REVIEWER_COMMANDS = (
+    "ls /dev/null > marker.txt",
+    "pytest -q test_real_output.py",
+    "python -m pytest -q test_real_output.py",
+    "ruff check",
+    "mypy .",
+    "git add marker.txt",
+    'git commit -m "reviewer mutation"',
+    "git branch reviewer-mutation",
+    "git push origin HEAD",
+)
+
 
 def main() -> int:
     if sys.argv[1:] == ["--version"]:
@@ -50,6 +77,10 @@ def _run() -> int:
         "argv": args,
         "session_id": session_id,
         "requested_session": requested_session,
+        "child_environment": {
+            key: os.environ[key]
+            for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
+        },
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "policy": policy,
         "fault": fault,
@@ -93,11 +124,11 @@ def _run() -> int:
     elif role == "executor":
         assert isinstance(payload, dict)
         response = _executor_response(payload, policy, workdir)
-        if fault == "commit_nonzero":
+        if fault == "write_nonzero":
             call["head_after"] = _git_head(workdir)
             _append_call(call)
             _save_state(state)
-            print("injected exit after repository commit", file=sys.stderr, flush=True)
+            print("injected exit after repository write", file=sys.stderr, flush=True)
             return 79
     else:
         assert isinstance(payload, dict)
@@ -106,6 +137,36 @@ def _run() -> int:
     call["head_after"] = _git_head(workdir)
     _append_call(call)
     _save_state(state)
+    _emit_narrated_response(session_id, response)
+
+    return 0
+
+
+def _emit_narrated_response(session_id: str, response: dict[str, Any]) -> None:
+    _event("text", session_id, {"type": "text", "text": "I will inspect the fixture first."})
+    _event("tool_use", session_id, {"type": "tool", "tool": "read"})
+    _event(
+        "step_finish",
+        session_id,
+        {
+            "type": "step-finish",
+            "cost": 0.001,
+            "tokens": {"total": 10, "input": 6, "output": 4, "reasoning": 0},
+        },
+    )
+    _event("step_start", session_id, {"type": "step-start"})
+    _event("text", session_id, {"type": "text", "text": "The fixture worktree is clean."})
+    _event("tool_use", session_id, {"type": "tool", "tool": "status"})
+    _event(
+        "step_finish",
+        session_id,
+        {
+            "type": "step-finish",
+            "cost": 0.001,
+            "tokens": {"total": 10, "input": 6, "output": 4, "reasoning": 0},
+        },
+    )
+    _event("step_start", session_id, {"type": "step-start"})
     _event("text", session_id, {"type": "text", "text": json.dumps(response, sort_keys=True)})
     _event(
         "step_finish",
@@ -116,7 +177,6 @@ def _run() -> int:
             "tokens": {"total": 10, "input": 6, "output": 4, "reasoning": 0},
         },
     )
-    return 0
 
 
 def _supervisor_response(state: dict[str, Any]) -> dict[str, Any]:
@@ -166,35 +226,32 @@ def _executor_response(
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     value_path.write_text(f"value={attempt}\n", encoding="utf-8")
     evidence_path.write_text(f"fixture evidence attempt {attempt}\n", encoding="utf-8")
-    _git(workdir, "add", "src/value.txt", "evidence/fixture.md")
-    _git(workdir, "commit", "-m", f"fixture executor attempt {attempt}")
-    revision = _git_head(workdir)
     return {
-        "result_version": 1,
-        "response_contract": "dispatcher.executor_result.v1",
+        "proposal_version": 2,
+        "response_contract": "dispatcher.executor_proposal.v2",
         "dispatch_id": payload["dispatch_id"],
         "attempt": attempt,
         "step_id": payload["step_id"],
         "repository": {
             "repo_id": payload["repo_id"],
             "base_revision": payload["base_revision"],
-            "result_revision": revision,
-            "patch_sha256": None,
         },
         "evidence": [
             {
                 "artifact_id": "fixture-evidence",
                 "relative_path": "fixture.md",
-                "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
                 "media_type": "text/markdown",
-                "size_bytes": evidence_path.stat().st_size,
             }
         ],
-        "verification": [
-            {"check_id": "fixture-check", "status": "passed", "summary": "fixture verified"}
+        "criterion_self_reports": [
+            {
+                "check_id": criterion["criterion_id"],
+                "status": "not_run",
+                "summary": "dispatcher owns this check",
+            }
+            for criterion in payload["acceptance_criteria"]
         ],
         "summary": f"executor attempt {attempt} completed",
-        "transcript_ref": None,
         "outcome": "completed",
     }
 
@@ -207,6 +264,27 @@ def _reviewer_response(
     permission = policy["permission"]
     if permission.get("edit") != "deny" or permission.get("write") != "deny":
         raise RuntimeError("reviewer mutation permission was not denied")
+    bash = permission.get("bash")
+    if not isinstance(bash, dict):
+        raise RuntimeError("reviewer Bash permission map is missing")
+    if bash.get("*") != "deny":
+        raise RuntimeError("reviewer Bash wildcard permission was not denied")
+    if next(iter(bash)) != "*":
+        raise RuntimeError("reviewer Bash wildcard denial is not the first rule")
+    if bash != _EXPECTED_REVIEWER_BASH:
+        raise RuntimeError("reviewer Bash permission is not the exact diagnostic allowlist")
+    allowed = {pattern for pattern, decision in bash.items() if decision == "allow"}
+    if any(command in allowed for command in _DENIED_REVIEWER_COMMANDS):
+        raise RuntimeError("reviewer Bash permission allowed a mutation or test command")
+    observation_tools = payload.get("observation_tools")
+    if observation_tools != {
+        "native": list(_NATIVE_OBSERVATION_TOOLS),
+        "diagnostic_commands": list(_DIAGNOSTIC_COMMANDS),
+        "mcp": [],
+    }:
+        raise RuntimeError("reviewer prompt observation tools drifted from permission policy")
+    if any(permission.get(tool) != "allow" for tool in _NATIVE_OBSERVATION_TOOLS):
+        raise RuntimeError("reviewer native observation permission was not allowed")
     target = payload["review_target"]
     if target["result_revision"] != _git_head(workdir):
         raise RuntimeError("review target does not match current Git revision")
@@ -223,7 +301,12 @@ def _reviewer_response(
         "review_target": target,
         "findings": [],
         "verification": [
-            {"check_id": "review-check", "status": "passed", "summary": "revision reviewed"}
+            {
+                "check_id": criterion["criterion_id"],
+                "status": "passed",
+                "summary": "revision reviewed",
+            }
+            for criterion in payload["acceptance_criteria"]
         ],
         "required_remediation": remediation,
         "summary": f"review attempt {attempt}: {verdict}",

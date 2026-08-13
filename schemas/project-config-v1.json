@@ -198,6 +198,9 @@
         "stall_policy": {
           "$ref": "#/$defs/StallPolicyDefinition"
         },
+        "structured_git": {
+          "$ref": "#/$defs/StructuredGitDefinition"
+        },
         "termination_grace_seconds": {
           "maximum": 3600,
           "minimum": 1,
@@ -217,11 +220,21 @@
           ],
           "title": "Underspec Mode",
           "type": "string"
+        },
+        "verification_backend": {
+          "enum": [
+            "darwin_seatbelt_v1",
+            "linux_bwrap_v1"
+          ],
+          "title": "Verification Backend",
+          "type": "string"
         }
       },
       "required": [
         "mode",
         "protocol_version",
+        "verification_backend",
+        "structured_git",
         "scheduling",
         "concurrency",
         "default_repo_id",
@@ -235,6 +248,123 @@
         "response_template"
       ],
       "title": "ExecutionDefinition",
+      "type": "object"
+    },
+    "MCPLocalServer": {
+      "additionalProperties": false,
+      "description": "One local stdio MCP server definition with an exact argv list.",
+      "properties": {
+        "command": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Environment",
+          "type": "object"
+        },
+        "type": {
+          "const": "local",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "enabled",
+        "command"
+      ],
+      "title": "MCPLocalServer",
+      "type": "object"
+    },
+    "MCPRegistry": {
+      "additionalProperties": false,
+      "description": "Explicit project MCP server registry and passthrough environment names.",
+      "properties": {
+        "environment_passthrough": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Environment Passthrough",
+          "type": "array"
+        },
+        "servers": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "discriminator": {
+                "mapping": {
+                  "local": "#/$defs/MCPLocalServer",
+                  "remote": "#/$defs/MCPRemoteServer"
+                },
+                "propertyName": "type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/MCPLocalServer"
+                },
+                {
+                  "$ref": "#/$defs/MCPRemoteServer"
+                }
+              ]
+            }
+          },
+          "title": "Servers",
+          "type": "object"
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "title": "MCPRegistry",
+      "type": "object"
+    },
+    "MCPRemoteServer": {
+      "additionalProperties": false,
+      "description": "One remote HTTP MCP server definition.",
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Headers",
+          "type": "object"
+        },
+        "type": {
+          "const": "remote",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "enabled",
+        "url"
+      ],
+      "title": "MCPRemoteServer",
       "type": "object"
     },
     "ObservabilityDefinition": {
@@ -309,15 +439,24 @@
       "description": "Named semantic permission rules compiled to exact OpenCode patterns.",
       "properties": {
         "actions": {
-          "patternProperties": {
-            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
-              "enum": [
-                "allow",
-                "ask",
-                "deny"
-              ],
-              "type": "string"
-            }
+          "additionalProperties": {
+            "enum": [
+              "allow",
+              "ask",
+              "deny"
+            ],
+            "type": "string"
+          },
+          "propertyNames": {
+            "enum": [
+              "inspect",
+              "modify",
+              "verify",
+              "commit",
+              "push",
+              "force_push",
+              "create_branch"
+            ]
           },
           "title": "Actions",
           "type": "object"
@@ -659,6 +798,14 @@
           "title": "Display",
           "type": "string"
         },
+        "mcp_tools": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9_-]*$",
+            "type": "string"
+          },
+          "title": "Mcp Tools",
+          "type": "array"
+        },
         "model": {
           "pattern": "^[^/\\s]+/[^/\\s]+$",
           "title": "Model",
@@ -680,7 +827,8 @@
         "model",
         "variant",
         "display",
-        "permission_policy"
+        "permission_policy",
+        "mcp_tools"
       ],
       "title": "RoleDefinition",
       "type": "object"
@@ -782,7 +930,8 @@
         "on_exhausted": {
           "enum": [
             "ask",
-            "halt"
+            "halt",
+            "fail"
           ],
           "title": "On Exhausted",
           "type": "string"
@@ -824,6 +973,64 @@
       ],
       "title": "StateDefinition",
       "type": "object"
+    },
+    "StructuredGitDefinition": {
+      "additionalProperties": false,
+      "description": "Explicit dispatcher-owned Git commit identity and process bounds.",
+      "properties": {
+        "author_email": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Author Email",
+          "type": "string"
+        },
+        "author_name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Author Name",
+          "type": "string"
+        },
+        "capability_version": {
+          "const": 1,
+          "title": "Capability Version",
+          "type": "integer"
+        },
+        "committer_email": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Committer Email",
+          "type": "string"
+        },
+        "committer_name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Committer Name",
+          "type": "string"
+        },
+        "max_output_bytes": {
+          "maximum": 10000000,
+          "minimum": 1024,
+          "title": "Max Output Bytes",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "maximum": 300,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capability_version",
+        "author_name",
+        "author_email",
+        "committer_name",
+        "committer_email",
+        "timeout_seconds",
+        "max_output_bytes"
+      ],
+      "title": "StructuredGitDefinition",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -837,6 +1044,9 @@
     },
     "execution": {
       "$ref": "#/$defs/ExecutionDefinition"
+    },
+    "mcp": {
+      "$ref": "#/$defs/MCPRegistry"
     },
     "observability": {
       "$ref": "#/$defs/ObservabilityDefinition"
@@ -901,7 +1111,8 @@
     "budget",
     "observability",
     "permission_policies",
-    "evidence"
+    "evidence",
+    "mcp"
   ],
   "title": "ProjectConfigModel",
   "type": "object"

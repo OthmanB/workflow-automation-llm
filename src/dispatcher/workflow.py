@@ -250,6 +250,7 @@ class DispatchRecord(ContractModel):
     process_id: Annotated[int, Field(ge=1)] | None = None
     process_host: Identifier | None = None
     process_started_at: datetime | None = None
+    process_create_time: Annotated[float, Field(ge=0)] | None = None
     cancel_requested: bool = False
     cancel_requested_at: datetime | None = None
     failure_category: Identifier | None = None
@@ -649,10 +650,13 @@ def transition_dispatch(
     failure_detail: str | None = None,
     process_host: str | None = None,
     process_started_at: datetime | None = None,
+    process_create_time: float | None = None,
     process_id: int | None = None,
 ) -> DispatchRecord:
     """Apply a dispatch state transition with its required durable transition data."""
     _validate_transition("dispatch", record.state, target, DISPATCH_TRANSITIONS)
+    if target is DispatchStatus.RUNNING and process_create_time is None:
+        raise TransitionError("RUNNING dispatch requires an OS process creation time")
     updates: dict[str, object] = {"state": target, "last_event": event}
     if runtime_session_id is not None:
         updates["runtime_session_id"] = runtime_session_id
@@ -668,6 +672,8 @@ def transition_dispatch(
         updates["process_host"] = process_host
     if process_started_at is not None:
         updates["process_started_at"] = process_started_at
+    if process_create_time is not None:
+        updates["process_create_time"] = process_create_time
     if process_id is not None:
         updates["process_id"] = process_id
     try:

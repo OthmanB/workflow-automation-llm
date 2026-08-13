@@ -7,8 +7,10 @@ import pytest
 from dispatcher.results import (
     ResultError,
     ResultExpectation,
+    parse_executor_proposal,
     parse_executor_result,
     parse_reviewer_result,
+    validate_executor_proposal_context,
     validate_executor_result_context,
     validate_reviewer_result_context,
 )
@@ -51,6 +53,39 @@ def _executor_result(outcome: str = "completed") -> dict[str, Any]:
     if outcome == "failed":
         result["failure_code"] = "fixture-failure"
     return result
+
+
+def _executor_proposal(outcome: str = "completed") -> dict[str, Any]:
+    proposal: dict[str, Any] = {
+        "proposal_version": 2,
+        "response_contract": "dispatcher.executor_proposal.v2",
+        "dispatch_id": "dispatch-one",
+        "attempt": 1,
+        "step_id": "prepare-fixture",
+        "repository": {"repo_id": "fixture-repo", "base_revision": "base-sha"},
+        "evidence": [
+            {
+                "artifact_id": "fixture-evidence",
+                "relative_path": "fixture.md",
+                "media_type": "text/markdown",
+            }
+        ],
+        "criterion_self_reports": [
+            {
+                "check_id": "fixture-check",
+                "status": "not_run",
+                "summary": "dispatcher owns this check",
+            }
+        ],
+        "summary": "fixture proposal",
+        "transcript_ref": "transcript-one",
+        "outcome": outcome,
+    }
+    if outcome == "blocked":
+        proposal["blockers"] = ["fixture blocker"]
+    if outcome == "failed":
+        proposal["failure_code"] = "fixture-failure"
+    return proposal
 
 
 def _review_target() -> dict[str, Any]:
@@ -107,6 +142,55 @@ def test_executor_outcome_union_and_context_validation() -> None:
         validate_executor_result_context(result, _executor_expectation())
 
 
+def test_executor_proposal_union_and_context_validation() -> None:
+    for outcome in ("completed", "blocked", "failed"):
+        proposal = parse_executor_proposal(_executor_proposal(outcome))
+
+        validate_executor_proposal_context(proposal, _executor_expectation())
+
+
+def test_executor_proposal_cannot_claim_authoritative_metadata() -> None:
+    for field, value in (
+        ("result_revision", "result-sha"),
+        ("patch_sha256", _PATCH),
+        ("commit_message", "model message"),
+    ):
+        proposal = _executor_proposal()
+        proposal[field] = value
+        with pytest.raises(ResultError, match="Extra inputs are not permitted"):
+            parse_executor_proposal(proposal)
+
+    evidence = _executor_proposal()
+    evidence["evidence"][0]["sha256"] = _SHA
+    with pytest.raises(ResultError, match="Extra inputs are not permitted"):
+        parse_executor_proposal(evidence)
+
+
+def test_executor_proposal_requires_not_run_self_reports() -> None:
+    proposal = _executor_proposal()
+    proposal["criterion_self_reports"][0]["status"] = "passed"
+
+    with pytest.raises(ResultError, match="not_run"):
+        parse_executor_proposal(proposal)
+
+
+def test_blocked_executor_proposal_requires_blockers() -> None:
+    proposal = _executor_proposal("blocked")
+    proposal["blockers"] = []
+
+    with pytest.raises(ResultError, match="blocked executor proposal requires blockers"):
+        parse_executor_proposal(proposal)
+
+
+def test_executor_result_omitting_optional_transcript_ref_canonicalizes_to_none() -> None:
+    values = _executor_result()
+    values.pop("transcript_ref")
+
+    canonical = parse_executor_result(values).model_dump(mode="json")
+
+    assert canonical["transcript_ref"] is None
+
+
 def test_blocked_executor_result_requires_blockers() -> None:
     values = _executor_result("blocked")
     values["blockers"] = []
@@ -143,6 +227,15 @@ def test_reviewer_verdict_union_and_immutable_target_validation() -> None:
         validate_reviewer_result_context(result, expectation)
 
 
+def test_reviewer_result_omitting_optional_transcript_ref_canonicalizes_to_none() -> None:
+    values = _review_result()
+    values.pop("transcript_ref")
+
+    canonical = parse_reviewer_result(values).model_dump(mode="json")
+
+    assert canonical["transcript_ref"] is None
+
+
 def test_reviewer_cannot_accept_blocking_findings_or_remediation() -> None:
     values = _review_result("accepted")
     values["findings"] = [
@@ -151,6 +244,25 @@ def test_reviewer_cannot_accept_blocking_findings_or_remediation() -> None:
 
     with pytest.raises(ResultError, match="accepted review cannot contain blocking findings"):
         parse_reviewer_result(values)
+
+
+def test_reviewer_rejects_live_invalid_finding_shape() -> None:
+    values = _review_result("changes_requested")
+    values["findings"] = [
+        {
+            "severity": "medium",
+            "summary": "Synthetic reproduction of the live invalid finding.",
+            "detail": "This field is not part of ReviewFinding.",
+        }
+    ]
+
+    with pytest.raises(ResultError) as captured:
+        parse_reviewer_result(values)
+
+    message = str(captured.value)
+    assert "changes_requested.findings.0.finding_id: Field required" in message
+    assert "changes_requested.findings.0.severity: Input should be 'info', 'warning' or 'blocking'" in message
+    assert "changes_requested.findings.0.detail: Extra inputs are not permitted" in message
 
 
 def test_reviewer_result_rejects_wrong_immutable_target() -> None:

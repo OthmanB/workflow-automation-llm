@@ -1,8 +1,8 @@
-"""Typed schema-v1 executor and reviewer result protocols."""
+"""Typed executor proposal and authoritative worker result protocols."""
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Literal, TypeAlias, get_args
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
@@ -15,6 +15,7 @@ class ResultError(ValueError):
 
 
 EXECUTOR_RESPONSE_CONTRACT = "dispatcher.executor_result.v1"
+EXECUTOR_PROPOSAL_CONTRACT = "dispatcher.executor_proposal.v2"
 REVIEWER_RESPONSE_CONTRACT = "dispatcher.reviewer_result.v1"
 
 
@@ -36,6 +37,77 @@ class VerificationResult(ContractModel):
     summary: Annotated[str, Field(min_length=1, max_length=5000)]
 
 
+class ProposalEvidence(ContractModel):
+    """Evidence location declared by a model without authoritative metadata."""
+
+    artifact_id: Identifier
+    relative_path: Annotated[str, Field(min_length=1, max_length=500)]
+    media_type: Literal["text/markdown", "application/json", "text/plain"]
+
+
+class ProposalCriterionSelfReport(ContractModel):
+    """Explicit record that the executor did not run a dispatcher-owned check."""
+
+    check_id: Identifier
+    status: Literal["not_run"]
+    summary: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
+class ProposalRepositoryCoordinate(ContractModel):
+    """Base repository identity a proposal must repeat without claiming a result."""
+
+    repo_id: Identifier
+    base_revision: Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class ExecutorProposalBase(ContractModel):
+    """Common model-facing fields for every executor proposal outcome."""
+
+    proposal_version: Literal[2]
+    response_contract: Literal["dispatcher.executor_proposal.v2"]
+    dispatch_id: Identifier
+    attempt: Annotated[int, Field(ge=1, le=100)]
+    step_id: Identifier
+    repository: ProposalRepositoryCoordinate
+    evidence: list[ProposalEvidence]
+    criterion_self_reports: list[ProposalCriterionSelfReport]
+    summary: Annotated[str, Field(min_length=1, max_length=10_000)]
+    transcript_ref: Identifier | None = None
+
+
+class ExecutorCompletedProposal(ExecutorProposalBase):
+    """Executor claims authorized writes are ready for dispatcher inspection."""
+
+    outcome: Literal["completed"]
+
+
+class ExecutorBlockedProposal(ExecutorProposalBase):
+    """Executor cannot continue and identifies concrete blockers."""
+
+    outcome: Literal["blocked"]
+    blockers: list[Annotated[str, Field(min_length=1, max_length=5000)]]
+
+    @model_validator(mode="after")
+    def requires_blockers(self) -> "ExecutorBlockedProposal":
+        if not self.blockers:
+            raise ValueError("blocked executor proposal requires blockers")
+        return self
+
+
+class ExecutorFailedProposal(ExecutorProposalBase):
+    """Executor failed with a stable classification code."""
+
+    outcome: Literal["failed"]
+    failure_code: Identifier
+
+
+ExecutorProposal: TypeAlias = Annotated[
+    ExecutorCompletedProposal | ExecutorBlockedProposal | ExecutorFailedProposal,
+    Field(discriminator="outcome"),
+]
+_EXECUTOR_PROPOSAL_ADAPTER: TypeAdapter[ExecutorProposal] = TypeAdapter(ExecutorProposal)
+
+
 class RepositoryCoordinate(ContractModel):
     """Executor work coordinates pinned before and after a dispatch."""
 
@@ -52,7 +124,7 @@ class RepositoryCoordinate(ContractModel):
 
 
 class ExecutorResultBase(ContractModel):
-    """Common fields for every executor result outcome."""
+    """Common dispatcher-authoritative fields for every executor outcome."""
 
     result_version: Literal[1]
     response_contract: Literal["dispatcher.executor_result.v1"]
@@ -198,6 +270,29 @@ ReviewerResult: TypeAlias = Annotated[
 _REVIEWER_RESULT_ADAPTER: TypeAdapter[ReviewerResult] = TypeAdapter(ReviewerResult)
 
 
+def _discriminator_options(result_union: object, field_name: str) -> tuple[str, ...]:
+    """Return the ordered Literal values accepted by a discriminated result union."""
+    union_args = get_args(result_union)
+    variants = get_args(union_args[0]) if union_args else ()
+    options: list[str] = []
+    for variant in variants:
+        if not isinstance(variant, type) or not issubclass(variant, ContractModel):
+            raise RuntimeError(f"invalid result union variant for {field_name}")
+        field = variant.model_fields.get(field_name)
+        values = get_args(field.annotation) if field is not None else ()
+        if not values or not all(isinstance(value, str) for value in values):
+            raise RuntimeError(f"result union variant is missing Literal {field_name}")
+        options.extend(values)
+    if not options or len(options) != len(set(options)):
+        raise RuntimeError(f"result union has invalid {field_name} options")
+    return tuple(options)
+
+
+EXECUTOR_OUTCOME_OPTIONS = _discriminator_options(ExecutorResult, "outcome")
+EXECUTOR_PROPOSAL_OUTCOME_OPTIONS = _discriminator_options(ExecutorProposal, "outcome")
+REVIEWER_VERDICT_OPTIONS = _discriminator_options(ReviewerResult, "verdict")
+
+
 class ResultExpectation(ContractModel):
     """Dispatcher-owned identity used before a result can change workflow state."""
 
@@ -209,11 +304,19 @@ class ResultExpectation(ContractModel):
 
 
 def parse_executor_result(payload: object) -> ExecutorResult:
-    """Validate an executor result object against the schema-v1 union."""
+    """Validate a dispatcher-authoritative executor result against schema v1."""
     try:
         return _EXECUTOR_RESULT_ADAPTER.validate_python(payload)
     except ValidationError as exc:
         raise ResultError(_format_validation_error("executor", exc)) from exc
+
+
+def parse_executor_proposal(payload: object) -> ExecutorProposal:
+    """Validate a model-facing executor proposal against the exact schema-v2 union."""
+    try:
+        return _EXECUTOR_PROPOSAL_ADAPTER.validate_python(payload)
+    except ValidationError as exc:
+        raise ResultError(_format_validation_error("executor proposal", exc)) from exc
 
 
 def parse_reviewer_result(payload: object) -> ReviewerResult:
@@ -230,6 +333,20 @@ def validate_executor_result_context(
 ) -> None:
     """Reject stale, wrong-step, wrong-attempt, or wrong-repository executor results."""
     _validate_result_identity(result.dispatch_id, result.attempt, result.step_id, result.repository.repo_id, expected)
+
+
+def validate_executor_proposal_context(
+    proposal: ExecutorProposal,
+    expected: ResultExpectation,
+) -> None:
+    """Reject a proposal not bound to the active dispatch and base repository."""
+    _validate_result_identity(
+        proposal.dispatch_id,
+        proposal.attempt,
+        proposal.step_id,
+        proposal.repository.repo_id,
+        expected,
+    )
 
 
 def validate_reviewer_result_context(

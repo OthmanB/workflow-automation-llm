@@ -161,5 +161,5 @@ step_repositories:
         encoding="utf-8",
     )
 
-    with pytest.raises(PlanError, match="duplicate ownership-map key"):
+    with pytest.raises(PlanError, match="duplicate YAML key"):
         load_ownership_map(ownership_path, project.config)

@@ -12,6 +12,7 @@ from typing import Any
 
 from . import audit
 from .config import Config, PreflightDefinition
+from .mcp import compile_role_mcp_servers
 from .sessions import SessionResult
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ def run_preflight(
     _run("git_auth", lambda: _check_git(config))
     _run("disk_space", lambda: _check_disk(config, preflight_cfg))
     _run("credentials", lambda: _check_credentials(preflight_cfg.credentials))
+    _run("mcp", lambda: _check_mcp(config))
 
     if not skip_smoke and preflight_cfg.models_smoke_test:
         if run_session is None:
@@ -107,6 +109,40 @@ def run_preflight(
 # ---------------------------------------------------------------------------
 # Individual checks
 # ---------------------------------------------------------------------------
+
+def _check_mcp(config: Config) -> str:
+    """Verify MCP passthrough variables and local server commands before dispatch."""
+    import json as _json
+
+    problems: list[str] = []
+    for name in config.model.mcp.environment_passthrough:
+        if name not in os.environ:
+            problems.append(f"mcp passthrough environment variable {name!r} is not present")
+    enabled = 0
+    for server_key, server in sorted(config.model.mcp.servers.items()):
+        if not server.enabled:
+            continue
+        enabled += 1
+        if server.type == "local":
+            executable = server.command[0]
+            if "/" in executable or Path(executable).is_absolute():
+                if not Path(executable).exists():
+                    problems.append(
+                        f"mcp server {server_key!r} command executable does not exist: {executable}"
+                    )
+            elif shutil.which(executable) is None:
+                problems.append(
+                    f"mcp server {server_key!r} command executable not found on PATH: {executable}"
+                )
+    for role_key in sorted(config.model.all_roles()):
+        try:
+            _json.dumps(compile_role_mcp_servers(config, role_key), sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            problems.append(f"mcp role {role_key!r} configuration is not serializable: {exc}")
+    if problems:
+        raise PreflightError("; ".join(problems))
+    return f"{enabled} enabled MCP server(s) ready"
+
 
 def _check_paths(config: Config) -> str:
     for key, path_string in (
@@ -263,8 +299,8 @@ def _check_models(
 
         if result.exit_code != 0:
             failures.append(f"{model}: exit code {result.exit_code}")
-        elif "OK" not in result.chat_response:
-            failures.append(f"{model}: did not return 'OK' marker")
+        elif result.chat_response.strip() != "OK":
+            failures.append(f"{model}: did not return the exact 'OK' response")
         else:
             logger.info("smoke-test %-30s  PASS", display)
 

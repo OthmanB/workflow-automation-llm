@@ -1,13 +1,13 @@
-# Normalized Plan Schema V1
+# Normalized Plan Schema V2
 
 The dispatcher executes an immutable `NormalizedPlan`, not a Markdown table.
-The machine-readable schema is `schemas/normalized-plan-v1.json`; the runtime
+The machine-readable schema is `schemas/normalized-plan-v2.json`; the runtime
 model is `src/dispatcher/plan.py:NormalizedPlan`.
 
 ## Required top-level fields
 
 ```yaml
-schema_version: 1
+schema_version: 2
 plan_id: example-plan
 sources:
   - source_id: plan-source
@@ -24,7 +24,7 @@ adapters producing identical semantic steps have the same plan digest.
 `source_digest` separately binds the approved source identities and content
 hashes.
 
-A `PlanApproval` is required before a schema-v1 run record can be created. It
+A `PlanApproval` is required before a schema-v2 run record can be created. It
 contains the plan digest, source digest, an operator decision reference, and an
 approval timestamp. Any semantic plan or source identity/hash change invalidates
 that approval and requires a new operator decision.
@@ -37,8 +37,11 @@ Every step explicitly declares:
 - `depends_on` and `required_inputs`;
 - `produced_outputs` and `resource_locks`;
 - `risk_tags`;
-- `authorization` with nonempty `authorized_actions` and operator-gate status;
-- nonempty `acceptance_criteria`;
+- `authorization` with nonempty `authorized_actions`, required `writable_paths`,
+  and operator-gate status;
+- nonempty `acceptance_criteria`, each with one dispatcher-owned structured
+  `check` (`argv`, repository working directory, timeout/output bounds,
+  expected exit codes, and `network_policy: deny`);
 - nonempty `evidence_requirements`;
 - a typed `review` obligation; and
 - an explicit `retry` policy.
@@ -47,6 +50,19 @@ Empty lists are valid only when a field is structurally optional for the step,
 such as `depends_on` on an initial step. Authorization, acceptance, and evidence
 cannot be omitted or inferred from prose.
 
+Verification commands are argv arrays and are never interpreted by a shell.
+The dispatcher executes them in an isolated disposable copy of the inspected
+repository. Model-supplied verification is a self-report; only the durable
+dispatcher check record advances workflow state.
+
+`writable_paths` is an exact repository-relative file or directory scope for
+executor changes. Absolute paths, `..`, `.git`, repository-root scope,
+duplicates, and overlapping entries are invalid. Every evidence location must
+resolve inside exactly one writable scope. A modifying step on a repository
+whose `commit_policy` is `required` must authorize `commit`, but that semantic
+authorization never grants the model raw Git commands: the dispatcher stages
+the exact inspected path set and creates the commit itself.
+
 ## Graph and cross-project validation
 
 Normalization rejects duplicate IDs, noncontiguous ordinals, self or unknown
@@ -54,6 +70,7 @@ dependencies, dependencies ordered after their dependents, duplicate output
 artifacts, unordered competing write locks, invalid review counts, and invalid
 retry escalation references.
 
+The YAML sidecar loader rejects duplicate mapping keys before normalization.
 `validate_plan_for_config()` additionally rejects unknown repository IDs,
 reviewer keys that are not configured reviewers, authorization actions that
 exceed the selected repository permission policy, and concurrency/retry

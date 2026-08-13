@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 from .config import ProjectConfigModel
 from .plan import NormalizedPlan
 from .protocol import SupervisorCommand
-from .results import ExecutorResult, ReviewerResult
+from .results import ExecutorProposal, ExecutorResult, ReviewerResult
 from .workflow import RunRecord
 
 
@@ -19,8 +19,9 @@ def schema_documents() -> dict[str, dict[str, Any]]:
     """Return every published schema-v1 document from its executable model."""
     return {
         "project-config-v1.json": ProjectConfigModel.model_json_schema(),
-        "normalized-plan-v1.json": NormalizedPlan.model_json_schema(),
+        "normalized-plan-v2.json": NormalizedPlan.model_json_schema(),
         "supervisor-command-v1.json": TypeAdapter(SupervisorCommand).json_schema(),
+        "executor-proposal-v2.json": TypeAdapter(ExecutorProposal).json_schema(),
         "executor-result-v1.json": TypeAdapter(ExecutorResult).json_schema(),
         "reviewer-result-v1.json": TypeAdapter(ReviewerResult).json_schema(),
         "workflow-state-v1.json": RunRecord.model_json_schema(),

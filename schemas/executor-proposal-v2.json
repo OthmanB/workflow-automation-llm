@@ -1,0 +1,385 @@
+{
+  "$defs": {
+    "ExecutorBlockedProposal": {
+      "additionalProperties": false,
+      "description": "Executor cannot continue and identifies concrete blockers.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "blockers": {
+          "items": {
+            "maxLength": 5000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Blockers",
+          "type": "array"
+        },
+        "criterion_self_reports": {
+          "items": {
+            "$ref": "#/$defs/ProposalCriterionSelfReport"
+          },
+          "title": "Criterion Self Reports",
+          "type": "array"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ProposalEvidence"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "outcome": {
+          "const": "blocked",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "proposal_version": {
+          "const": 2,
+          "title": "Proposal Version",
+          "type": "integer"
+        },
+        "repository": {
+          "$ref": "#/$defs/ProposalRepositoryCoordinate"
+        },
+        "response_contract": {
+          "const": "dispatcher.executor_proposal.v2",
+          "title": "Response Contract",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        }
+      },
+      "required": [
+        "proposal_version",
+        "response_contract",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "criterion_self_reports",
+        "summary",
+        "outcome",
+        "blockers"
+      ],
+      "title": "ExecutorBlockedProposal",
+      "type": "object"
+    },
+    "ExecutorCompletedProposal": {
+      "additionalProperties": false,
+      "description": "Executor claims authorized writes are ready for dispatcher inspection.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "criterion_self_reports": {
+          "items": {
+            "$ref": "#/$defs/ProposalCriterionSelfReport"
+          },
+          "title": "Criterion Self Reports",
+          "type": "array"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ProposalEvidence"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "outcome": {
+          "const": "completed",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "proposal_version": {
+          "const": 2,
+          "title": "Proposal Version",
+          "type": "integer"
+        },
+        "repository": {
+          "$ref": "#/$defs/ProposalRepositoryCoordinate"
+        },
+        "response_contract": {
+          "const": "dispatcher.executor_proposal.v2",
+          "title": "Response Contract",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        }
+      },
+      "required": [
+        "proposal_version",
+        "response_contract",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "criterion_self_reports",
+        "summary",
+        "outcome"
+      ],
+      "title": "ExecutorCompletedProposal",
+      "type": "object"
+    },
+    "ExecutorFailedProposal": {
+      "additionalProperties": false,
+      "description": "Executor failed with a stable classification code.",
+      "properties": {
+        "attempt": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "criterion_self_reports": {
+          "items": {
+            "$ref": "#/$defs/ProposalCriterionSelfReport"
+          },
+          "title": "Criterion Self Reports",
+          "type": "array"
+        },
+        "dispatch_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Dispatch Id",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/ProposalEvidence"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "failure_code": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Failure Code",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "failed",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "proposal_version": {
+          "const": 2,
+          "title": "Proposal Version",
+          "type": "integer"
+        },
+        "repository": {
+          "$ref": "#/$defs/ProposalRepositoryCoordinate"
+        },
+        "response_contract": {
+          "const": "dispatcher.executor_proposal.v2",
+          "title": "Response Contract",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 10000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "transcript_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transcript Ref"
+        }
+      },
+      "required": [
+        "proposal_version",
+        "response_contract",
+        "dispatch_id",
+        "attempt",
+        "step_id",
+        "repository",
+        "evidence",
+        "criterion_self_reports",
+        "summary",
+        "outcome",
+        "failure_code"
+      ],
+      "title": "ExecutorFailedProposal",
+      "type": "object"
+    },
+    "ProposalCriterionSelfReport": {
+      "additionalProperties": false,
+      "description": "Explicit record that the executor did not run a dispatcher-owned check.",
+      "properties": {
+        "check_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Check Id",
+          "type": "string"
+        },
+        "status": {
+          "const": "not_run",
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "status",
+        "summary"
+      ],
+      "title": "ProposalCriterionSelfReport",
+      "type": "object"
+    },
+    "ProposalEvidence": {
+      "additionalProperties": false,
+      "description": "Evidence location declared by a model without authoritative metadata.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "text/markdown",
+            "application/json",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relative_path",
+        "media_type"
+      ],
+      "title": "ProposalEvidence",
+      "type": "object"
+    },
+    "ProposalRepositoryCoordinate": {
+      "additionalProperties": false,
+      "description": "Base repository identity a proposal must repeat without claiming a result.",
+      "properties": {
+        "base_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Base Revision",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "base_revision"
+      ],
+      "title": "ProposalRepositoryCoordinate",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "blocked": "#/$defs/ExecutorBlockedProposal",
+      "completed": "#/$defs/ExecutorCompletedProposal",
+      "failed": "#/$defs/ExecutorFailedProposal"
+    },
+    "propertyName": "outcome"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ExecutorCompletedProposal"
+    },
+    {
+      "$ref": "#/$defs/ExecutorBlockedProposal"
+    },
+    {
+      "$ref": "#/$defs/ExecutorFailedProposal"
+    }
+  ]
+}

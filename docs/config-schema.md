@@ -3,7 +3,7 @@
 `src/dispatcher/config.py:ProjectConfigModel` is the runtime authority. The
 generated schema at `schemas/project-config-v1.json` is the machine-readable
 contract. Every field below is required unless marked optional; unknown fields
-and type coercion fail closed.
+duplicate YAML keys, and type coercion fail closed.
 
 ```yaml
 schema_version: 2
@@ -30,15 +30,24 @@ repositories:
     allow_shared_writable_roots: false
 roles:
   supervisor:
-    supervisor-role: {model: provider/supervisor, variant: standard, display: Supervisor, permission_policy: supervisor}
+    supervisor-role: {model: provider/supervisor, variant: standard, display: Supervisor, permission_policy: supervisor, mcp_tools: [context7_resolve-library-id, context7_query-docs]}
   executors:
-    executor-role: {model: provider/executor, variant: standard, display: Executor, permission_policy: executor}
+    executor-role: {model: provider/executor, variant: standard, display: Executor, permission_policy: executor, mcp_tools: [context7_query-docs]}
   reviewers:
-    reviewer-role: {model: provider/reviewer, variant: standard, display: Reviewer, permission_policy: reviewer}
+    reviewer-role: {model: provider/reviewer, variant: standard, display: Reviewer, permission_policy: reviewer, mcp_tools: [context7_query-docs]}
 profile: {profiles_file: ./profiles.yaml, profile_id: balanced}
 execution:
   mode: mock_workflow_test
   protocol_version: 1
+  verification_backend: darwin_seatbelt_v1
+  structured_git:
+    capability_version: 1
+    author_name: Dispatcher Executor
+    author_email: dispatcher-author@example.invalid
+    committer_name: Dispatcher Committer
+    committer_email: dispatcher-committer@example.invalid
+    timeout_seconds: 30
+    max_output_bytes: 65536
   scheduling: sequential
   concurrency:
     max_active_dispatches: 1
@@ -86,9 +95,9 @@ permission_policies:
     global: {default: deny, actions: {}}
     project: {default: deny, actions: {}}
     repository: {default: deny, actions: {inspect: allow, modify: allow, verify: allow}}
-    supervisor-class: {default: deny, actions: {inspect: allow}}
-    executor-class: {default: deny, actions: {inspect: allow, modify: allow, verify: allow}}
-    reviewer-class: {default: deny, actions: {inspect: allow, modify: deny, verify: allow}}
+    supervisor-class: {default: deny, actions: {inspect: allow, modify: deny, verify: deny, commit: deny, push: deny, force_push: deny, create_branch: deny}}
+    executor-class: {default: deny, actions: {inspect: allow, modify: allow, verify: allow, commit: deny, push: deny, force_push: deny, create_branch: deny}}
+    reviewer-class: {default: deny, actions: {inspect: allow, modify: deny, verify: deny, commit: deny, push: deny, force_push: deny, create_branch: deny}}
     supervisor: {default: deny, actions: {}}
     executor: {default: deny, actions: {}}
     reviewer: {default: deny, actions: {}}
@@ -105,7 +114,24 @@ preflight:
   credentials: []
   require_git_remote: true
   disk_space_min_mb: 500
+mcp:
+  environment_passthrough: []
+  servers:
+    context7:
+      type: remote
+      enabled: true
+      url: https://mcp.context7.com/mcp
+      headers: {}
 ```
+
+The schema-version-2 contract requires a top-level `mcp` section
+(`environment_passthrough` plus a `servers` registry) and an `mcp_tools` list
+on every role definition; both are included in the examples above and in the
+public example project. See the MCP Servers and Role Tools section below.
+
+When `models_smoke_test` is enabled, the configured prompt must cause every
+tested model to return the exact marker `OK` after surrounding whitespace is
+trimmed. The preflight check does not accept a substring match.
 
 ## Key Rules
 
@@ -133,15 +159,39 @@ preflight:
   after timeouts, interruptions, temporary connection/rate-limit failures, or
   incomplete provider output. Provider quota, billing, authentication, and
   unknown errors do not retry automatically.
-- Permission layers compile in global, project, repository, role-class,
-  concrete-role, then dispatch-authorization order. Undeclared actions deny.
-  `ask` prevents `--auto`.
+- The canonical semantic action vocabulary is `inspect`, `modify`, `verify`,
+  `commit`, `push`, `force_push`, and `create_branch`. Every role-class policy
+  must explicitly decide all seven; omission is a configuration error. Other
+  policy layers may be sparse.
+- Configured permission layers use ordered override precedence: global,
+  project, repository, role-class, then concrete-role. Dispatch authorization
+  subsequently denies undeclared actions.
+  `ask` prevents `--auto`. Before compilation, executors retain ordered step
+  actions, reviewers are narrowed to `inspect` only when the step authorizes
+  it, supervisors are inspect-only, and executor `verify` is removed because
+  structured checks are dispatcher-owned. After compilation, reviewer and
+  supervisor `edit`/`write` are forced to `deny` and their complete Bash map is
+  replaced by a hardcoded `"*": deny` fallback plus exact allows for `pwd`,
+  `ls`, `git status --porcelain=v1`, `git branch --show-current`, `git rev-parse
+  HEAD`, and `git diff --no-ext-diff --no-textconv`; configuration cannot
+  override that ceiling. No diagnostic allow pattern has wildcard arguments.
 - Observability retention only touches derived artifacts. It never deletes
   SQLite state, active-run artifacts, or unresolved dispatch data.
 - Schema v2 defines `mock_workflow_test` and `real_operation`. The public example
   and ordinary development configurations must use `mock_workflow_test`.
   `real_operation` is accepted only by the separately guarded `dispatcher
   execute` command.
+- `execution.verification_backend` is explicit. `darwin_seatbelt_v1` is the
+  supported local macOS backend for dispatcher-owned checks; it denies network
+  and write access outside the disposable verification workspace.
+  `linux_bwrap_v1` is an optional future Linux backend with an unshared network
+  namespace.
+- `execution.structured_git` is explicit and has no runtime identity fallback.
+  Its bounded dispatcher-owned capability calculates a candidate tree with an
+  isolated temporary index, stages only the validated sorted path set in the
+  real index, disables system/global config, hooks, signing, prompting, editors,
+  and pagers, and creates the deterministic message `dispatcher: <step_id>
+  attempt <n>`. Dangerous local Git configuration is rejected.
 
 ## Permission Examples
 
@@ -159,14 +209,18 @@ The dispatcher compiles this to the supported OpenCode permission payload for
 the exact repository, role, and dispatch authorization. `ask` disables auto
 approval. A `deny` remains denied even if another applicable rule permits
 `--auto`; the fake-child integration suite verifies allow, ask, and deny.
+Reviewer and supervisor hard ceilings are then applied after these configurable
+layers. These OpenCode permissions are UX controls rather than OS filesystem or
+network isolation. The finite exact diagnostic allowlist does not make arbitrary
+Bash safe and does not establish a no-network guarantee for executors.
 
 ## Evidence, Review, and Parallelism
 
-Executor evidence must exactly satisfy declared IDs, relative paths, media
-types, hashes, and sizes. Reviews bind to the immutable executor result and its
-artifact hashes. Bounded batches require independent ready steps and fresh
-sessions; a repository lock serializes same-repository work until a durable
-worktree/merge lifecycle is designed.
+Executor proposals declare only evidence IDs, relative paths, and media types.
+The dispatcher derives hashes and sizes from repository inspection. Reviews
+bind to the immutable dispatcher-generated executor result and artifact hashes.
+Bounded batches require independent ready steps and fresh sessions;
+`worktree_barrier` additionally requires non-overlapping step writable scopes.
 
 ## Profiles Document
 
@@ -185,3 +239,46 @@ default: balanced
 
 `multi_review: off` requires exactly one acceptance. Other multi-review modes
 require at least two and cannot name duplicate reviewer roles.
+
+## MCP Servers and Role Tools
+
+The schema-v2 project configuration carries a required top-level `mcp` section
+(an `environment_passthrough` list of environment variable names plus a
+`servers` registry) and a required `mcp_tools` list on every role. Each server
+is a strict discriminated union: `type: local` requires a non-empty argv
+`command` (never a shell string) plus optional `environment`; `type: remote`
+requires an http/https `url` plus optional `headers`. Both carry `enabled`.
+
+```yaml
+mcp:
+  environment_passthrough: [CONTEXT7_TOKEN]
+  servers:
+    context7:
+      type: remote
+      enabled: true
+      url: https://mcp.context7.com/mcp
+      headers:
+        Authorization: "Bearer {env:CONTEXT7_TOKEN}"
+    repomix:
+      type: local
+      enabled: true
+      command: [repomix-mcp]
+      environment: {}
+```
+
+`environment_passthrough` names are copied from the parent process into the
+isolated child environment (a missing name fails before OpenCode launch) and
+are never written into prompts or persisted configuration. Server header and
+environment values may use OpenCode `{env:NAME}` placeholders; only names
+listed in `environment_passthrough` are resolvable in the child.
+
+Every role tool must appear in the dispatcher's explicit tool catalog, which
+currently contains the Context7 resolve/query methods, the Repomix pack/read/
+search methods (excluding `repomix_generate_skill`), and the Semble
+search/related methods. Validation rejects duplicate role tools, unknown
+tools, tools whose catalog server is missing or disabled, empty local
+commands, invalid remote URLs, and duplicate passthrough names. A role's
+`mcp_tools` list compiles into exact OpenCode permission allow entries and
+only the role's selected server definitions are emitted; unlisted methods keep
+the global deny (roles with MCP tools require a deny-default permission
+policy).

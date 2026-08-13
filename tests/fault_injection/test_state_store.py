@@ -21,13 +21,21 @@ from dispatcher.state_store import (
     StateStoreMigrationError,
 )
 from dispatcher.workflow import (
+    BatchRecord,
+    BatchStatus,
+    CompiledReviewObligation,
     DispatchIntent,
     DispatchRecord,
     DispatchStatus,
     OperatorRequest,
     RepositoryCoordinate,
+    RunPolicy,
     RunStatus,
+    StepStatus,
     TransitionEvent,
+    WorkspaceChild,
+    WorkspaceGroup,
+    WorkspaceGroupStatus,
     new_run_record,
     transition_dispatch,
     transition_run,
@@ -67,7 +75,51 @@ def _event(sequence: int, actor: str = "dispatcher") -> TransitionEvent:
 
 
 def _record(project: FixtureProject):
-    plan = NormalizedPlan.model_validate(valid_plan_values(project))
+    return _record_with_steps(project, "prepare-fixture")
+
+
+def _record_with_steps(
+    project: FixtureProject,
+    *step_ids: str,
+    escalation_role_key: str | None = None,
+):
+    if not step_ids or step_ids[0] != "prepare-fixture":
+        raise ValueError("fixture plans must begin with prepare-fixture")
+    values = valid_plan_values(project)
+    first = values["steps"][0]
+    for ordinal, step_id in enumerate(step_ids[1:], start=2):
+        step = json.loads(json.dumps(first))
+        step.update(
+            {
+                "ordinal": ordinal,
+                "step_id": step_id,
+                "title": step_id.replace("-", " ").title(),
+                "produced_outputs": [
+                    {
+                        "artifact_id": f"{step_id}-output",
+                        "producer_step_id": None,
+                        "description": f"Output for {step_id}",
+                    }
+                ],
+                "resource_locks": [{"resource_id": f"{step_id}-resource", "mode": "write"}],
+                "evidence_requirements": [
+                    {
+                        "artifact_id": f"{step_id}-evidence",
+                        "relative_path": f"{step_id}.md",
+                        "media_type": "text/markdown",
+                    }
+                ],
+            }
+        )
+        values["steps"].append(step)
+    if escalation_role_key is not None:
+        values["steps"][0]["retry"].update(
+            {
+                "on_changes_requested": "escalate",
+                "escalation_role_key": escalation_role_key,
+            }
+        )
+    plan = NormalizedPlan.model_validate(values)
     return new_run_record(
         run_id="fixture-run",
         project_id=project.config.project_id,
@@ -108,6 +160,154 @@ def _dispatch(prompt: str, policy: dict[str, object]) -> DispatchRecord:
         ),
         result_digest=None,
         forwarding_digest=None,
+        last_event=_event(1),
+    )
+
+
+def _request(
+    *,
+    kind: str,
+    allowed_answers: list[str],
+    context_ref: str = "fixture-context",
+    step_id: str | None = None,
+    resume_to: RunStatus = RunStatus.READY,
+    reassignment_role_key: str | None = None,
+) -> OperatorRequest:
+    return OperatorRequest(
+        request_id=f"request-{kind}",
+        question=f"Resolve {kind}",
+        allowed_answers=allowed_answers,
+        context_ref=context_ref,
+        resume_to=resume_to,
+        expires_at=None,
+        required_role=None,
+        kind=kind,  # type: ignore[arg-type]
+        step_id=step_id,
+        reassignment_role_key=reassignment_role_key,
+    )
+
+
+def _waiting(record, request: OperatorRequest):
+    return transition_run(
+        record,
+        RunStatus.WAITING_OPERATOR,
+        _event(record.sequence + 1),
+        operator_request=request,
+    )
+
+
+def _persist_waiting(project: FixtureProject, record, request: OperatorRequest):
+    store = _store(project)
+    waiting = _waiting(record, request)
+    assert store.create_run(waiting) == 1
+    return store, waiting
+
+
+def _answer(store: StateStore, waiting, answer: str):
+    updated, generation = store.answer_operator_request(
+        run_id=waiting.run_id,
+        expected_generation=1,
+        request_id=waiting.operator_request.request_id,
+        answer=answer,
+        actor_id="operator-fixture",
+    )
+    assert generation == 2
+    assert updated.operator_request is None
+    assert _operator_decision_count(store) == 1
+    return updated
+
+
+def _operator_decision_count(store: StateStore) -> int:
+    with sqlite3.connect(store.database_path) as connection:
+        return int(connection.execute("SELECT COUNT(*) FROM operator_decisions").fetchone()[0])
+
+
+def _step_in_state(record, step_id: str, state: StepStatus):
+    steps = dict(record.steps)
+    steps[step_id] = steps[step_id].model_copy(update={"state": state, "last_event": _event(record.sequence)})
+    return record.model_copy(update={"steps": steps})
+
+
+def _dispatch_in_state(
+    *,
+    dispatch_id: str,
+    step_id: str,
+    state: DispatchStatus,
+    batch_id: str | None = None,
+) -> DispatchRecord:
+    dispatch = _dispatch("fixture prompt", {"permission": {"*": "deny"}})
+    updates: dict[str, object] = {
+        "dispatch_id": dispatch_id,
+        "step_id": step_id,
+        "state": state,
+        "batch_id": batch_id,
+        "intent": dispatch.intent.model_copy(update={"idempotency_key": f"idempotency-{dispatch_id}"}),
+    }
+    if state in {DispatchStatus.COMPLETED, DispatchStatus.FORWARDED, DispatchStatus.ACKNOWLEDGED}:
+        updates.update({"runtime_session_id": f"session-{dispatch_id}", "result_digest": _DIGEST})
+    if state in {DispatchStatus.FORWARDED, DispatchStatus.ACKNOWLEDGED}:
+        updates["forwarding_digest"] = _DIGEST
+    return dispatch.model_copy(update=updates)
+
+
+def _batch(
+    dispatch_ids: tuple[str, ...],
+    failed_dispatch_ids: tuple[str, ...],
+    *,
+    state: BatchStatus = BatchStatus.FAILED,
+) -> BatchRecord:
+    return BatchRecord(
+        batch_id="batch-one",
+        dispatch_ids=dispatch_ids,
+        state=state,
+        failure_mode="wait_for_started",
+        failed_dispatch_ids=failed_dispatch_ids,
+        last_event=_event(1),
+    )
+
+
+def _waivable_policy(record) -> RunPolicy:
+    obligations = {
+        step_id: CompiledReviewObligation(
+            step_id=step_id,
+            required=True,
+            reviewer_role_keys=("reviewer",),
+            required_acceptances=1,
+            independence="fresh_session",
+            waivable=True,
+            source_policy_digest=_DIGEST,
+        )
+        for step_id in record.steps
+    }
+    return RunPolicy(
+        profile_id="fixture-profile",
+        profile_digest=_DIGEST,
+        review_obligations=obligations,
+        underspec_mode="ask",
+        policy_digest=_DIGEST,
+    )
+
+
+def _workspace_group(project: FixtureProject, *, state: WorkspaceGroupStatus) -> WorkspaceGroup:
+    root = project.root / "workspaces" / "workspace-one"
+    return WorkspaceGroup(
+        workspace_group_id="workspace-one",
+        repo_id="fixture-repo",
+        base_revision="base-sha",
+        base_branch="main",
+        integration_branch="dispatcher/workspace/workspace-one/integration",
+        integration_worktree_path=str(root / "integration"),
+        worktree_root=str(root),
+        lease_owner_id="workspace-workspace-one",
+        children=(
+            WorkspaceChild(
+                step_id="prepare-fixture",
+                branch="dispatcher/workspace/workspace-one/prepare-fixture",
+                worktree_path=str(root / "prepare-fixture"),
+                base_revision="base-sha",
+            ),
+        ),
+        state=state,
         last_event=_event(1),
     )
 
@@ -165,21 +365,26 @@ def test_cancellation_intent_is_persisted_before_process_signal(project: Fixture
         process_id=4242,
         process_host="fixture-host",
         process_started_at=datetime.now(UTC),
+        process_create_time=1234.5,
     )
     running_record = prepared_record.model_copy(update={"dispatches": {dispatch.dispatch_id: running}})
     generation = store.save_run(running_record, expected_generation=generation)
 
-    cancelled, next_generation, process_id, process_host = store.request_dispatch_cancellation(
-        run_id=record.run_id,
-        expected_generation=generation,
-        dispatch_id=dispatch.dispatch_id,
-        actor_id="operator",
+    cancelled, next_generation, process_id, process_host, process_create_time = (
+        store.request_dispatch_cancellation(
+            run_id=record.run_id,
+            expected_generation=generation,
+            dispatch_id=dispatch.dispatch_id,
+            actor_id="operator",
+        )
     )
 
     assert next_generation == generation + 1
     assert process_id == 4242
     assert process_host == "fixture-host"
+    assert process_create_time == 1234.5
     assert cancelled.dispatches[dispatch.dispatch_id].cancel_requested is True
+    assert store.load_run(record.run_id)[0].dispatches[dispatch.dispatch_id].process_create_time == 1234.5
     with sqlite3.connect(store.database_path) as connection:
         kind = connection.execute(
             "SELECT kind FROM audit_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
@@ -257,8 +462,10 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
     with sqlite3.connect(store.database_path) as connection:
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_before_json")
         connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN repository_after_json")
+        connection.execute("ALTER TABLE dispatch_payloads DROP COLUMN authoritative_verification_json")
         connection.execute("DROP TABLE workspace_groups")
         connection.execute("DROP TABLE baseline_approvals")
+        connection.execute("DROP TABLE structured_git_commits")
         connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
 
     migrated = _store(project)
@@ -276,11 +483,71 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'baseline_approvals'"
         ).fetchone()
 
-    assert version == 5
+    assert version == 7
     assert table == ("baselines",)
-    assert columns >= {"repository_before_json", "repository_after_json"}
+    assert columns >= {
+        "repository_before_json",
+        "repository_after_json",
+        "authoritative_verification_json",
+    }
     assert workspace_table == ("workspace_groups",)
     assert approval_table == ("baseline_approvals",)
+
+
+def test_structured_git_lifecycle_is_durable_and_rejects_duplicate_side_effects(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    prompt = "perform fixture task"
+    policy: dict[str, object] = {"permission": {"*": "deny"}}
+    dispatch = _dispatch(prompt, policy)
+    prepared_record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store.create_run(prepared_record)
+    store.prepare_dispatch(
+        prepared_record,
+        expected_generation=1,
+        dispatch=dispatch,
+        prompt=prompt,
+        policy=policy,
+        repository_before={"repo_id": "fixture-repo"},
+    )
+    proposal = {
+        "proposal_version": 2,
+        "response_contract": "dispatcher.executor_proposal.v2",
+        "dispatch_id": dispatch.dispatch_id,
+    }
+
+    received = store.record_executor_proposal(
+        run_id=record.run_id,
+        dispatch_id=dispatch.dispatch_id,
+        proposal=proposal,
+    )
+    checked = store.record_structured_git_checked(
+        run_id=record.run_id,
+        dispatch_id=dispatch.dispatch_id,
+        checked={"verification": []},
+        intent={"candidate_tree": "a" * 40},
+    )
+    staged = store.record_structured_git_staged(
+        run_id=record.run_id,
+        dispatch_id=dispatch.dispatch_id,
+        stage={"transcript_sha256": "b" * 64},
+    )
+
+    assert received.state == "PROPOSAL_RECEIVED"
+    assert checked.state == "COMMIT_INTENT_PERSISTED"
+    assert staged.state == "STAGED"
+    store.close()
+    restored = _store(project).load_structured_git_record(record.run_id, dispatch.dispatch_id)
+    assert restored.proposal == proposal
+    assert restored.intent == {"candidate_tree": "a" * 40}
+    with pytest.raises(StateStoreConflictError, match="cannot move from STAGED"):
+        _store(project).record_structured_git_staged(
+            run_id=record.run_id,
+            dispatch_id=dispatch.dispatch_id,
+            stage={"transcript_sha256": "c" * 64},
+        )
 
 
 def test_leases_are_single_writer_atomic_and_require_approved_stale_recovery(
@@ -381,6 +648,7 @@ def test_prepared_running_completed_and_forwarded_recovery_is_deterministic(
         DispatchStatus.RUNNING,
         _event(2),
         runtime_session_id="ses-fixture",
+        process_create_time=1234.5,
     )
     running_record = prepared_record.model_copy(update={"dispatches": {running.dispatch_id: running}})
     generation = store.save_run(running_record, expected_generation=generation)
@@ -421,7 +689,7 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
     request = OperatorRequest(
         request_id="request-one",
         question="Choose a safe option",
-        allowed_answers=["approve", "halt"],
+        allowed_answers=["answer", "halt"],
         context_ref="context-one",
         resume_to=RunStatus.READY,
         expires_at=None,
@@ -436,7 +704,7 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
         run_id=waiting.run_id,
         expected_generation=1,
         request_id=request.request_id,
-        answer="approve",
+        answer="answer",
         actor_id="operator-fixture",
     )
     first = store.write_transcript(
@@ -455,7 +723,7 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
     )
 
     assert generation == 2
-    assert answered.state is RunStatus.READY
+    assert answered.state is RunStatus.RUNNING
     assert first != second
     assert "secret-token" not in first.read_text(encoding="utf-8")
     assert store.export_run_report(waiting.run_id).is_file()
@@ -464,7 +732,7 @@ def test_operator_answer_and_transcripts_are_durable_and_collision_free(project:
             run_id=waiting.run_id,
             expected_generation=generation,
             request_id=request.request_id,
-            answer="approve",
+            answer="answer",
             actor_id="operator-fixture",
         )
 
@@ -531,6 +799,816 @@ def test_operator_answer_rejects_expired_or_unauthorized_requests(
         )
 
 
+def test_risk_gate_approve_resolves_step_gate_and_resumes_running(project: FixtureProject) -> None:
+    record = _record(project)
+    step = record.steps["prepare-fixture"].model_copy(update={"operator_gate_resolved": False})
+    record = record.model_copy(update={"steps": {"prepare-fixture": step}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="risk_gate",
+            allowed_answers=["approve", "deny"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "approve")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].operator_gate_resolved is True
+
+
+def test_risk_gate_deny_halts_the_run(project: FixtureProject) -> None:
+    record = _record(project)
+    step = record.steps["prepare-fixture"].model_copy(update={"operator_gate_resolved": False})
+    record = record.model_copy(update={"steps": {"prepare-fixture": step}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="risk_gate",
+            allowed_answers=["approve", "deny"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "deny")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].operator_gate_resolved is False
+
+
+def test_escalation_reassign_requires_blocked_step_and_resumes_ready(project: FixtureProject) -> None:
+    record = _step_in_state(
+        _record_with_steps(project, "prepare-fixture", escalation_role_key="terra"),
+        "prepare-fixture",
+        StepStatus.BLOCKED,
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="escalation",
+            allowed_answers=["reassign", "halt"],
+            step_id="prepare-fixture",
+            reassignment_role_key="terra",
+        ),
+    )
+
+    updated = _answer(store, waiting, "reassign")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.READY
+    assert updated.steps["prepare-fixture"].reassignment_role_key == "terra"
+
+
+def test_escalation_halt_preserves_blocked_step_and_halts(project: FixtureProject) -> None:
+    record = _step_in_state(
+        _record_with_steps(project, "prepare-fixture", escalation_role_key="terra"),
+        "prepare-fixture",
+        StepStatus.BLOCKED,
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="escalation",
+            allowed_answers=["reassign", "halt"],
+            step_id="prepare-fixture",
+            reassignment_role_key="terra",
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].state is StepStatus.BLOCKED
+
+
+def test_review_waiver_waive_accepts_step_and_records_decision_reference(
+    project: FixtureProject,
+) -> None:
+    record = _record(project)
+    record = record.model_copy(update={"policy": _waivable_policy(record)})
+    record = _step_in_state(record, "prepare-fixture", StepStatus.REVIEW_REQUIRED)
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="review_waiver",
+            allowed_answers=["waive", "halt"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "waive")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.ACCEPTED
+    assert updated.steps["prepare-fixture"].review_waiver_decision_ref is not None
+
+
+def test_review_waiver_halt_preserves_review_required_step(project: FixtureProject) -> None:
+    record = _record(project)
+    record = record.model_copy(update={"policy": _waivable_policy(record)})
+    record = _step_in_state(record, "prepare-fixture", StepStatus.REVIEW_REQUIRED)
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="review_waiver",
+            allowed_answers=["waive", "halt"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+
+
+def test_stall_recovery_retry_moves_blocked_step_to_ready(project: FixtureProject) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="stall_recovery",
+            allowed_answers=["retry", "halt"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "retry")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.READY
+
+
+def test_stall_recovery_retry_preserves_review_required_and_refreshes_event(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.REVIEW_REQUIRED)
+    previous_event = record.steps["prepare-fixture"].last_event
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="stall_recovery",
+            allowed_answers=["retry", "halt"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "retry")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert updated.steps["prepare-fixture"].last_event != previous_event
+
+
+def test_stall_recovery_halt_preserves_step_and_halts(project: FixtureProject) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="stall_recovery",
+            allowed_answers=["retry", "halt"],
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].state is StepStatus.BLOCKED
+
+
+def test_underspecification_answer_acknowledges_and_resumes_running(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(kind="underspecification", allowed_answers=["answer", "halt"]),
+    )
+
+    updated = _answer(store, waiting, "answer")
+
+    assert updated.state is RunStatus.RUNNING
+
+
+def test_underspecification_halt_halts_the_run(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(kind="underspecification", allowed_answers=["answer", "halt"]),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+
+
+def test_budget_halt_explicitly_halts_despite_nonhalting_resume_target(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(
+            kind="budget",
+            allowed_answers=["halt"],
+            step_id="prepare-fixture",
+            resume_to=RunStatus.RUNNING,
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+
+
+def test_reconciliation_reconcile_moves_blocked_step_to_ready(project: FixtureProject) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+    )
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=dispatch.dispatch_id,
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "reconcile")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.READY
+    assert updated.dispatches[dispatch.dispatch_id].state is DispatchStatus.FAILED
+
+
+def test_reconciliation_reconcile_preserves_review_required_and_refreshes_event(
+    project: FixtureProject,
+) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-review-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.ABANDONED,
+    )
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.REVIEW_REQUIRED)
+    previous_event = record.steps["prepare-fixture"].last_event
+    record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=dispatch.dispatch_id,
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "reconcile")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert updated.steps["prepare-fixture"].last_event != previous_event
+
+
+def test_reconciliation_halt_preserves_failed_step_and_halts(project: FixtureProject) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+    )
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=dispatch.dispatch_id,
+            step_id="prepare-fixture",
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].state is StepStatus.BLOCKED
+
+
+def test_reconciliation_rejects_unknown_dispatch_without_decision(project: FixtureProject) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref="dispatch-missing",
+            step_id="prepare-fixture",
+        ),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="known dispatch"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+    assert store.load_run(waiting.run_id)[0].state is RunStatus.WAITING_OPERATOR
+
+
+def test_reconciliation_rejects_dispatch_for_another_step_without_decision(
+    project: FixtureProject,
+) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-mismatched",
+        step_id="other-step",
+        state=DispatchStatus.FAILED,
+    )
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=dispatch.dispatch_id,
+            step_id="prepare-fixture",
+        ),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="does not belong"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_reconciliation_rejects_nonterminal_dispatch_without_decision(project: FixtureProject) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-prepared",
+        step_id="prepare-fixture",
+        state=DispatchStatus.PREPARED,
+    )
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    record = record.model_copy(update={"dispatches": {dispatch.dispatch_id: dispatch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=dispatch.dispatch_id,
+            step_id="prepare-fixture",
+        ),
+    )
+
+    with pytest.raises(StateStoreError, match="failed or abandoned"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_requeues_unique_failed_steps_and_preserves_accepted_sibling(
+    project: FixtureProject,
+) -> None:
+    record = _record_with_steps(
+        project,
+        "prepare-fixture",
+        "prepare-second",
+        "accepted-sibling",
+    )
+    record = _step_in_state(record, "prepare-fixture", StepStatus.BLOCKED)
+    record = _step_in_state(record, "prepare-second", StepStatus.BLOCKED)
+    record = _step_in_state(record, "accepted-sibling", StepStatus.ACCEPTED)
+    failed_one = _dispatch_in_state(
+        dispatch_id="dispatch-failed-one",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    failed_two = _dispatch_in_state(
+        dispatch_id="dispatch-failed-two",
+        step_id="prepare-second",
+        state=DispatchStatus.ABANDONED,
+        batch_id="batch-one",
+    )
+    sibling = _dispatch_in_state(
+        dispatch_id="dispatch-sibling",
+        step_id="accepted-sibling",
+        state=DispatchStatus.FORWARDED,
+        batch_id="batch-one",
+    )
+    dispatches = {item.dispatch_id: item for item in (failed_one, failed_two, sibling)}
+    batch = _batch(tuple(dispatches), (failed_one.dispatch_id, failed_two.dispatch_id))
+    record = record.model_copy(update={"dispatches": dispatches, "batches": {batch.batch_id: batch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    updated = _answer(store, waiting, "reconcile")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.READY
+    assert updated.steps["prepare-second"].state is StepStatus.READY
+    assert updated.steps["accepted-sibling"].state is StepStatus.ACCEPTED
+    assert updated.dispatches[sibling.dispatch_id].state is DispatchStatus.FORWARDED
+    assert updated.batches[batch.batch_id] == batch
+
+
+def test_batch_reconciliation_deduplicates_two_failed_dispatches_for_one_step(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    dispatches = {
+        dispatch_id: _dispatch_in_state(
+            dispatch_id=dispatch_id,
+            step_id="prepare-fixture",
+            state=DispatchStatus.FAILED,
+            batch_id="batch-one",
+        )
+        for dispatch_id in ("dispatch-failed-one", "dispatch-failed-two")
+    }
+    batch = _batch(tuple(dispatches), tuple(dispatches))
+    record = record.model_copy(update={"dispatches": dispatches, "batches": {batch.batch_id: batch}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    updated = _answer(store, waiting, "reconcile")
+
+    assert updated.steps["prepare-fixture"].state is StepStatus.READY
+    assert updated.steps["prepare-fixture"].last_event.sequence == updated.sequence
+
+
+def test_batch_reconciliation_preserves_review_required_failed_child(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.REVIEW_REQUIRED)
+    previous_event = record.steps["prepare-fixture"].last_event
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-review-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    batch = _batch((dispatch.dispatch_id,), (dispatch.dispatch_id,))
+    record = record.model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    updated = _answer(store, waiting, "reconcile")
+
+    assert updated.state is RunStatus.RUNNING
+    assert updated.steps["prepare-fixture"].state is StepStatus.REVIEW_REQUIRED
+    assert updated.steps["prepare-fixture"].last_event != previous_event
+
+
+def test_batch_reconciliation_halt_preserves_children_and_failed_batch(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    batch = _batch((dispatch.dispatch_id,), (dispatch.dispatch_id,))
+    record = record.model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    updated = _answer(store, waiting, "halt")
+
+    assert updated.state is RunStatus.HALTED
+    assert updated.steps["prepare-fixture"].state is StepStatus.BLOCKED
+    assert updated.batches[batch.batch_id] == batch
+
+
+def test_batch_reconciliation_rejects_unknown_batch_without_decision(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref="batch-missing",
+        ),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="known batch"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_nonfailed_batch_without_decision(
+    project: FixtureProject,
+) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    batch = _batch(
+        (dispatch.dispatch_id,),
+        (dispatch.dispatch_id,),
+        state=BatchStatus.PREPARED,
+    )
+    record = _record(project).model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreError, match="failed batch"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_empty_failed_list_without_decision(
+    project: FixtureProject,
+) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    batch = _batch((dispatch.dispatch_id,), ())
+    record = _record(project).model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="failed dispatch IDs"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_foreign_dispatch_without_decision(
+    project: FixtureProject,
+) -> None:
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-foreign",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-other",
+    )
+    batch = _batch((dispatch.dispatch_id,), (dispatch.dispatch_id,))
+    record = _record(project).model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="does not belong"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_unknown_failed_dispatch_without_decision(
+    project: FixtureProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(
+        kind="batch_reconciliation",
+        allowed_answers=["reconcile", "halt"],
+        context_ref="batch-one",
+    )
+    store, waiting = _persist_waiting(project, _record(project), request)
+    corrupt_batch = BatchRecord.model_construct(
+        batch_id="batch-one",
+        dispatch_ids=("dispatch-missing",),
+        state=BatchStatus.FAILED,
+        failure_mode="wait_for_started",
+        failed_dispatch_ids=("dispatch-missing",),
+        last_event=_event(1),
+    )
+    corrupt_record = waiting.model_copy(update={"batches": {corrupt_batch.batch_id: corrupt_batch}})
+    monkeypatch.setattr(store, "load_run", lambda _run_id: (corrupt_record, 1))
+
+    with pytest.raises(StateStoreCorruptionError, match="unknown dispatch"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_nonterminal_failed_dispatch_without_decision(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.BLOCKED)
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-prepared",
+        step_id="prepare-fixture",
+        state=DispatchStatus.PREPARED,
+        batch_id="batch-one",
+    )
+    batch = _batch((dispatch.dispatch_id,), (dispatch.dispatch_id,))
+    record = record.model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreError, match="not failed or abandoned"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_batch_reconciliation_rejects_incompatible_step_state_without_decision(
+    project: FixtureProject,
+) -> None:
+    record = _step_in_state(_record(project), "prepare-fixture", StepStatus.READY)
+    dispatch = _dispatch_in_state(
+        dispatch_id="dispatch-failed",
+        step_id="prepare-fixture",
+        state=DispatchStatus.FAILED,
+        batch_id="batch-one",
+    )
+    batch = _batch((dispatch.dispatch_id,), (dispatch.dispatch_id,))
+    record = record.model_copy(
+        update={"dispatches": {dispatch.dispatch_id: dispatch}, "batches": {batch.batch_id: batch}}
+    )
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="batch_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=batch.batch_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreError, match="incompatible state READY"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_workspace_reconciliation_direct_answer_rejects_group_before_cleaned(
+    project: FixtureProject,
+) -> None:
+    group = _workspace_group(project, state=WorkspaceGroupStatus.FAILED)
+    record = _record(project).model_copy(update={"workspace_groups": {group.workspace_group_id: group}})
+    store, waiting = _persist_waiting(
+        project,
+        record,
+        _request(
+            kind="workspace_reconciliation",
+            allowed_answers=["reconcile", "halt"],
+            context_ref=group.workspace_group_id,
+        ),
+    )
+
+    with pytest.raises(StateStoreError, match="reach CLEANED"):
+        _answer(store, waiting, "reconcile")
+
+    assert _operator_decision_count(store) == 0
+    loaded, generation = store.load_run(waiting.run_id)
+    assert generation == 1
+    assert loaded.state is RunStatus.WAITING_OPERATOR
+    assert loaded.operator_request == waiting.operator_request
+
+
+def test_operator_answer_rejects_stale_generation_without_decision(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(kind="underspecification", allowed_answers=["answer", "halt"]),
+    )
+
+    with pytest.raises(StateStoreConflictError, match="generation conflict"):
+        store.answer_operator_request(
+            run_id=waiting.run_id,
+            expected_generation=0,
+            request_id=waiting.operator_request.request_id,
+            answer="answer",
+            actor_id="operator-fixture",
+        )
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_operator_answer_rejects_wrong_request_id_without_decision(project: FixtureProject) -> None:
+    store, waiting = _persist_waiting(
+        project,
+        _record(project),
+        _request(kind="underspecification", allowed_answers=["answer", "halt"]),
+    )
+
+    with pytest.raises(StateStoreError, match="request ID"):
+        store.answer_operator_request(
+            run_id=waiting.run_id,
+            expected_generation=1,
+            request_id="request-other",
+            answer="answer",
+            actor_id="operator-fixture",
+        )
+
+    assert _operator_decision_count(store) == 0
+
+
+def test_unhandled_operator_request_kind_fails_loudly_without_decision(
+    project: FixtureProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(kind="underspecification", allowed_answers=["answer", "halt"])
+    store, waiting = _persist_waiting(project, _record(project), request)
+    corrupt_request = request.model_copy(
+        update={"kind": "future_request", "allowed_answers": ["continue"]}
+    )
+    corrupt_record = waiting.model_copy(update={"operator_request": corrupt_request})
+    monkeypatch.setattr(store, "load_run", lambda _run_id: (corrupt_record, 1))
+
+    with pytest.raises(StateStoreCorruptionError, match="no answer handling.*future_request"):
+        store.answer_operator_request(
+            run_id=waiting.run_id,
+            expected_generation=1,
+            request_id=request.request_id,
+            answer="continue",
+            actor_id="operator-fixture",
+        )
+
+    assert _operator_decision_count(store) == 0
+
+
 def test_running_dispatch_never_allows_automatic_retry(project: FixtureProject) -> None:
     store = _store(project)
     record = _record(project)
@@ -542,6 +1620,7 @@ def test_running_dispatch_never_allows_automatic_retry(project: FixtureProject) 
         DispatchStatus.RUNNING,
         _event(2),
         runtime_session_id="ses-fixture",
+        process_create_time=1234.5,
     )
     record = record.model_copy(update={"dispatches": {running.dispatch_id: running}})
     store.create_run(record)

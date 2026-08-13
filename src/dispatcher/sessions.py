@@ -14,10 +14,12 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+import psutil
 
 from .security import ensure_private_directory, open_private_text, redact_text, redact_value
 
@@ -79,6 +81,10 @@ class OpenCodeProcessError(OpenCodeAdapterError):
     """OpenCode returned a nonzero exit or a structured error event."""
 
 
+class OpenCodeProcessIdentityError(OpenCodeProcessError):
+    """A process ID no longer identifies the process the dispatcher started."""
+
+
 class OpenCodeTimeoutError(OpenCodeAdapterError):
     """The OpenCode process group did not complete by its configured deadline."""
 
@@ -104,7 +110,7 @@ class SessionDescriptor:
 class SessionLifecycleCallbacks:
     """Synchronous durable-state hooks around the external process lifecycle."""
 
-    on_process_started: Callable[[int], None]
+    on_process_started: Callable[[int, float], None]
     on_session_identified: Callable[[str], None]
 
 
@@ -152,7 +158,7 @@ class OpenCodeJsonlDecoder:
     def consume_line(self, line: str, *, line_number: int) -> None:
         """Decode one complete JSONL line and retain only bounded safe metadata."""
         try:
-            event = json.loads(line)
+            event = json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
         except json.JSONDecodeError as exc:
             raise OpenCodeProtocolError(f"malformed OpenCode JSONL at line {line_number}") from exc
         if not isinstance(event, dict):
@@ -209,7 +215,7 @@ class OpenCodeJsonlDecoder:
             raise OpenCodeProtocolError("OpenCode output did not include step_finish")
         return (
             self._raw,
-            "\n".join(self._chat_parts),
+            self._chat_parts[-1] if self._chat_parts else "",
             self._usage,
             self._session_id,
             self._cost,
@@ -325,6 +331,7 @@ def run_session(
     state_dir: str | Path,
     credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None = None,
+    environment_passthrough: Iterable[str] = (),
     require_response: bool = True,
     snapshot_dirs: list[str] | None = None,
     lifecycle: SessionLifecycleCallbacks | None = None,
@@ -358,6 +365,7 @@ def run_session(
         state_dir=state_dir,
         credential_state_dir=credential_state_dir,
         permission_config=permission_config,
+        environment_passthrough=environment_passthrough,
     )
 
     logger.info("opencode run model=%s variant=%s session_mode=%s", model, variant, mode)
@@ -452,6 +460,16 @@ def classify_provider_failure(name: str, message: str) -> FailureCategory:
     return "unknown"
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject ambiguous duplicate fields in an external OpenCode JSONL event."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise OpenCodeProtocolError(f"duplicate JSON key in OpenCode event: {key}")
+        result[key] = value
+    return result
+
+
 def list_sessions(*, limit: int = 1000) -> list[SessionDescriptor]:
     """Return an exact, structured session list from the pinned OpenCode CLI."""
     if limit < 1:
@@ -525,8 +543,14 @@ def build_child_environment(
     state_dir: str | Path,
     credential_state_dir: str | Path | None = None,
     permission_config: Mapping[str, Any] | None,
+    environment_passthrough: Iterable[str] = (),
 ) -> dict[str, str]:
     """Build an isolated environment without inherited credentials or OpenCode state."""
+    missing_required = [name for name in environment_passthrough if name not in parent_environment]
+    if missing_required:
+        raise OpenCodeSessionError(
+            "required MCP environment variable missing: " + ", ".join(sorted(missing_required))
+        )
     runtime_dir = ensure_private_directory(Path(state_dir) / "opencode-child")
     home = ensure_private_directory(runtime_dir / "home")
     config_home = ensure_private_directory(home / ".config")
@@ -557,6 +581,13 @@ def build_child_environment(
     }
     environment.update(
         {
+            name: parent_environment[name]
+            for name in environment_passthrough
+            if name in parent_environment
+        }
+    )
+    environment.update(
+        {
             "HOME": str(home),
             "XDG_CONFIG_HOME": str(config_home),
             "XDG_CACHE_HOME": str(cache_home),
@@ -566,7 +597,7 @@ def build_child_environment(
     )
     if permission_config is not None:
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-            redact_value(dict(permission_config)),
+            dict(permission_config),
             separators=(",", ":"),
         )
     return environment
@@ -606,7 +637,7 @@ def _run_streaming_process(
     max_output_bytes: int,
     stdout_log: Path,
     stderr_log: Path,
-    on_process_started: Callable[[int], None] | None,
+    on_process_started: Callable[[int, float], None] | None,
     on_session_identified: Callable[[str], None] | None,
 ) -> tuple[int, OpenCodeJsonlDecoder, str]:
     """Stream stdout/stderr without retaining unbounded process output in memory."""
@@ -622,12 +653,20 @@ def _run_streaming_process(
     except OSError as exc:
         raise OpenCodeProcessError(f"could not start OpenCode: {exc}") from exc
 
+    try:
+        process_create_time = psutil.Process(process.pid).create_time()
+    except psutil.Error as exc:
+        _terminate_process_group(process, termination_grace_seconds)
+        raise OpenCodeProcessError(
+            "could not capture the OS process creation time for the started OpenCode worker"
+        ) from exc
+
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
     if on_process_started is not None:
         try:
-            on_process_started(process.pid)
+            on_process_started(process.pid, process_create_time)
         except Exception:
             _terminate_process_group(process, termination_grace_seconds)
             process.stdin.close()
@@ -781,16 +820,34 @@ def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: in
     process.wait(timeout=grace_seconds)
 
 
-def cancel_process_group(process_id: int, expected_host: str, grace_seconds: int) -> bool:
+def _process_identity_matches(process_id: int, expected_create_time: float) -> bool:
+    """Return whether the PID is gone or still identifies the recorded process."""
+    try:
+        current_create_time = psutil.Process(process_id).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied as exc:
+        raise OpenCodeProcessError("refusing cancellation without process ownership") from exc
+    except psutil.Error as exc:
+        raise OpenCodeProcessError("could not verify process identity before cancellation") from exc
+    if abs(current_create_time - expected_create_time) > 1:
+        raise OpenCodeProcessIdentityError(
+            "process identity does not match the recorded start time; cancellation is refused"
+        )
+    return True
+
+
+def cancel_process_group(
+    process_id: int,
+    expected_host: str,
+    grace_seconds: int,
+    expected_create_time: float,
+) -> bool:
     """Interrupt one dispatcher-owned process group after host/identity checks."""
     if expected_host != socket.gethostname():
         raise OpenCodeProcessError("refusing cancellation for a process on another host")
-    try:
-        os.kill(process_id, 0)
-    except ProcessLookupError:
+    if not _process_identity_matches(process_id, expected_create_time):
         return False
-    except PermissionError as exc:
-        raise OpenCodeProcessError("refusing cancellation without process ownership") from exc
     try:
         os.killpg(process_id, signal.SIGINT)
     except ProcessLookupError:
@@ -802,6 +859,8 @@ def cancel_process_group(process_id: int, expected_host: str, grace_seconds: int
         except ProcessLookupError:
             return True
         time.sleep(0.05)
+    if not _process_identity_matches(process_id, expected_create_time):
+        return True
     try:
         os.killpg(process_id, signal.SIGTERM)
     except ProcessLookupError:
@@ -811,11 +870,20 @@ def cancel_process_group(process_id: int, expected_host: str, grace_seconds: int
         os.kill(process_id, 0)
     except ProcessLookupError:
         return True
+    if not _process_identity_matches(process_id, expected_create_time):
+        return True
     try:
         os.killpg(process_id, signal.SIGKILL)
     except ProcessLookupError:
         return True
-    return True
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _split_complete_lines(buffer: bytes) -> tuple[bytes, list[bytes]]:
