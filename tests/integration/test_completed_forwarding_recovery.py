@@ -31,7 +31,7 @@ from dispatcher.repository import (
     authoritative_evidence,
     inspect_repository,
 )
-from dispatcher.results import parse_executor_proposal, parse_executor_result
+from dispatcher.results import parse_executor_proposal, parse_executor_result, parse_reviewer_result
 from dispatcher.sequential import (
     PreparedDispatch,
     SequentialWorkflow,
@@ -362,6 +362,106 @@ def test_recover_completed_reviewer_dispatch_persists_review_and_acceptance_once
 
     with pytest.raises(SequentialWorkflowError, match="requires a COMPLETED dispatch"):
         workflow.recover_completed_dispatch("completed-recovery-run", reviewer.dispatch.dispatch_id)
+
+
+def test_adopt_failed_reviewer_result_retains_attempt_and_completes_step(
+    tmp_path: Path,
+) -> None:
+    store, workflow, _record, _generation, executor = _activate_and_prepare(
+        tmp_path,
+        review_required=True,
+    )
+    record, generation, _forwarding = workflow.apply_executor_result(
+        executor,
+        parse_executor_result(_executor_result(executor)),
+    )
+    record, generation = workflow.acknowledge_forwarding(
+        record.run_id,
+        expected_generation=generation,
+        dispatch_id=executor.dispatch.dispatch_id,
+    )
+    reviewer = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(reviewer, PreparedDispatch)
+    reviewer = workflow.mark_running(reviewer, process_id=999_999_997, process_create_time=1.0)
+    reviewer = workflow.record_session_id(reviewer, runtime_session_id="session-failed-review")
+    workflow.fail_dispatch(
+        reviewer,
+        reason="worker response was not strict JSON",
+        failure_category="result_validation",
+        failure_detail="worker response was not strict JSON",
+    )
+    failed, _generation = store.load_run(reviewer.run_id)
+    assert failed.state is RunStatus.WAITING_OPERATOR
+
+    adopted, generation = workflow.adopt_failed_reviewer_result(
+        reviewer.run_id,
+        reviewer.dispatch.dispatch_id,
+        parse_reviewer_result(_reviewer_result(reviewer)),
+        runtime_session_id="session-failed-review",
+        authoritative_verification=(
+            AuthoritativeVerification(
+                check_id="fixture-check",
+                status="passed",
+                argv=("python", "-c", "print('fixture check')"),
+                exit_code=0,
+                timed_out=False,
+                output_truncated=False,
+                stdout_sha256="a" * 64,
+                stderr_sha256="b" * 64,
+                transcript_sha256="c" * 64,
+                duration_ms=1,
+                backend="fixture-recovery",
+                summary="fixture authoritative check passed",
+            ),
+        ),
+        usage=None,
+        actor_id="fixture-recovery",
+    )
+
+    assert adopted.state is RunStatus.RUNNING
+    assert adopted.steps[reviewer.dispatch.step_id].state is StepStatus.ACCEPTED
+    assert adopted.steps[reviewer.dispatch.step_id].reviewer_attempts == 1
+    assert adopted.dispatches[reviewer.dispatch.dispatch_id].state is DispatchStatus.FAILED
+    assert store.review_for_dispatch(reviewer.run_id, reviewer.dispatch.dispatch_id)
+    assert store.load_dispatch_payload(reviewer.run_id, reviewer.dispatch.dispatch_id).result is not None
+    completion = workflow.evaluate_completion(adopted, generation)
+    assert completion.accepted
+
+    recovered, generation = workflow.record_adopted_failed_review_usage(
+        reviewer.run_id,
+        reviewer.dispatch.dispatch_id,
+        parse_reviewer_result(_reviewer_result(reviewer)),
+        runtime_session_id="session-failed-review",
+        usage={
+            "cost_usd": 0.25,
+            "tokens_total": 100,
+            "tokens_input": 70,
+            "tokens_output": 20,
+            "tokens_reasoning": 10,
+        },
+    )
+
+    assert recovered.state is RunStatus.SUCCEEDED
+    assert recovered.usage.by_role["reviewer"].tokens_total == 100
+    assert store.load_run(reviewer.run_id)[1] == generation
+    with pytest.raises(SequentialWorkflowError, match="already recorded"):
+        workflow.record_adopted_failed_review_usage(
+            reviewer.run_id,
+            reviewer.dispatch.dispatch_id,
+            parse_reviewer_result(_reviewer_result(reviewer)),
+            runtime_session_id="session-failed-review",
+            usage={
+                "cost_usd": 0.25,
+                "tokens_total": 100,
+                "tokens_input": 70,
+                "tokens_output": 20,
+                "tokens_reasoning": 10,
+            },
+        )
 
 
 def test_legacy_completed_structured_commit_is_forwarded_without_a_new_commit(

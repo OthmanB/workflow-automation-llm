@@ -14,6 +14,7 @@ from dispatcher.execution import (
     SequentialExecutionCoordinator,
     SupervisorOutcome,
     _worker_failure,
+    _worker_json_object,
     worker_opencode_state_dir,
 )
 from dispatcher.plan import NormalizedPlan, approve_plan
@@ -44,6 +45,37 @@ from dispatcher.workflow import (
 )
 
 _DIGEST = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        'Review complete.\n\n{"verdict":"accepted"}',
+        'Review complete.\n\n```json\n{"verdict":"accepted"}\n```',
+    ],
+)
+def test_worker_response_extracts_one_final_json_object(response: str) -> None:
+    assert _worker_json_object(response) == {"verdict": "accepted"}
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ('{"first":1}\n{"second":2}', "another JSON object"),
+        ('{"value":1} trailing', "exactly one final JSON object"),
+        ('Review\n```json\n{"value":1}\n``` trailing', "malformed or non-final"),
+        ('Review\n```\n{"value":1}\n```', "at most one final JSON Markdown fence"),
+        ('Review\n```json\n{"value":1}\n```\n```', "at most one final JSON Markdown fence"),
+        ('Review\n{"value":NaN}', "exactly one final JSON object"),
+        ('Review\n{"value":1,"value":2}', "exactly one final JSON object"),
+    ],
+)
+def test_worker_response_rejects_ambiguous_or_malformed_json(
+    response: str,
+    message: str,
+) -> None:
+    with pytest.raises(ExecutionCoordinatorError, match=message):
+        _worker_json_object(response)
 
 
 def _dispatch(

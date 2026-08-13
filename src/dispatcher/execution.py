@@ -260,7 +260,7 @@ class SequentialExecutionCoordinator:
                 raise ExecutionCoordinatorError(
                     "adapter result session does not match the durable running dispatch"
                 )
-            payload = _strict_json_object(result.chat_response)
+            payload = _worker_json_object(result.chat_response)
             usage = _session_usage(result)
             if current.dispatch.role_kind == "executor":
                 proposal = parse_executor_proposal(payload)
@@ -623,6 +623,65 @@ def _strict_json_object(
         ) from exc
     if not isinstance(value, dict):
         raise ExecutionCoordinatorError(f"{description} must be a JSON object")
+    return value
+
+
+def _worker_json_object(
+    text: str,
+    *,
+    description: str = "worker response",
+) -> dict[str, Any]:
+    """Extract one final JSON object from a live worker's final text event."""
+    stripped = text.strip()
+    if not stripped:
+        raise ExecutionCoordinatorError(f"{description} does not contain a final JSON object")
+    if stripped.endswith("```"):
+        if stripped.count("```") != 2:
+            raise ExecutionCoordinatorError(
+                f"{description} must contain at most one final JSON Markdown fence"
+            )
+        opening = stripped.rfind("```json", 0, -3)
+        if opening < 0:
+            raise ExecutionCoordinatorError(
+                f"{description} must contain at most one final JSON Markdown fence"
+            )
+        fenced = stripped[opening + len("```json") : -3].strip()
+        return _strict_json_object(fenced, description=description)
+    if "```" in stripped:
+        raise ExecutionCoordinatorError(
+            f"{description} has a malformed or non-final JSON Markdown fence"
+        )
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_non_finite_constant,
+    )
+    decoded: list[tuple[int, int, Any]] = []
+    for start, character in enumerate(stripped):
+        if character != "{":
+            continue
+        try:
+            value, length = decoder.raw_decode(stripped[start:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        decoded.append((start, start + length, value))
+
+    final = [item for item in decoded if not stripped[item[1] :].strip()]
+    if len(final) != 1:
+        raise ExecutionCoordinatorError(
+            f"{description} does not contain exactly one final JSON object"
+        )
+    start, end, value = final[0]
+    if not isinstance(value, dict):
+        raise ExecutionCoordinatorError(f"{description} final JSON value must be an object")
+    if any(
+        other_start < start or other_end > end
+        for other_start, other_end, _other_value in decoded
+        if (other_start, other_end) != (start, end)
+    ):
+        raise ExecutionCoordinatorError(
+            f"{description} contains prose with another JSON object"
+        )
     return value
 
 

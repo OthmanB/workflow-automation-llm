@@ -1638,6 +1638,228 @@ class SequentialWorkflow:
         return record, generation, forwarding
 
     @_serialized_transition
+    def adopt_failed_reviewer_result(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        result: ReviewerResult,
+        *,
+        runtime_session_id: str,
+        authoritative_verification: tuple[AuthoritativeVerification, ...],
+        usage: Mapping[str, object] | None,
+        actor_id: str,
+    ) -> tuple[RunRecord, int]:
+        """Adopt a typed result from an immutable failed reviewer response."""
+        record, generation = self.store.load_run(run_id)
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown recovery dispatch: {dispatch_id}") from exc
+        request = record.operator_request
+        if (
+            record.state is not RunStatus.WAITING_OPERATOR
+            or request is None
+            or request.kind != "reconciliation"
+            or request.context_ref != dispatch_id
+            or request.step_id != dispatch.step_id
+        ):
+            raise SequentialWorkflowError(
+                "failed review adoption requires the matching reconciliation request"
+            )
+        if (
+            dispatch.role_kind != "reviewer"
+            or dispatch.state is not DispatchStatus.FAILED
+            or dispatch.failure_category != "result_validation"
+        ):
+            raise SequentialWorkflowError(
+                "failed review adoption requires a result-validation FAILED reviewer dispatch"
+            )
+        if dispatch.runtime_session_id != runtime_session_id:
+            raise SequentialWorkflowError(
+                "failed review response session does not match the durable dispatch session"
+            )
+        step = _plan_step(record, dispatch.step_id)
+        step_record = record.steps[dispatch.step_id]
+        if step_record.state is not StepStatus.REVIEW_REQUIRED:
+            raise SequentialWorkflowError(
+                "failed review adoption requires a REVIEW_REQUIRED step"
+            )
+        payload = self.store.load_dispatch_payload(run_id, dispatch_id)
+        if payload.result is not None or self.store.review_for_dispatch(run_id, dispatch_id):
+            raise SequentialWorkflowError("failed reviewer result was already adopted")
+        if payload.repository_before is None:
+            raise SequentialWorkflowError("failed reviewer dispatch has no durable repository snapshot")
+        metadata = payload.session_metadata or {}
+        raw_target = metadata.get("review_target")
+        if not isinstance(raw_target, dict):
+            raise SequentialWorkflowError("failed reviewer dispatch has no durable review target")
+        try:
+            review_target = ReviewTarget.model_validate_json(json.dumps(raw_target))
+            repository_before = RepositorySnapshot.model_validate_json(
+                json.dumps(payload.repository_before)
+            )
+        except ValueError as exc:
+            raise SequentialWorkflowError(
+                "failed reviewer dispatch recovery metadata is malformed"
+            ) from exc
+        current_target = self._review_target(record, step)
+        if review_target != current_target:
+            raise SequentialWorkflowError(
+                "failed reviewer dispatch target no longer matches the immutable work product"
+            )
+        expectation = ResultExpectation(
+            dispatch_id=dispatch.dispatch_id,
+            attempt=dispatch.attempt,
+            step_id=dispatch.step_id,
+            repo_id=dispatch.intent.repository.repo_id,
+            expected_review_target=review_target,
+        )
+        try:
+            validate_reviewer_result_context(result, expectation)
+        except ResultError as exc:
+            raise WorkerResultValidationError(str(exc)) from exc
+        if (
+            isinstance(result, ReviewerAcceptedResult)
+            and dispatch.role_key in step_record.accepted_reviewer_role_keys
+        ):
+            raise WorkerResultValidationError(
+                "reviewer role already accepted this immutable artifact"
+            )
+        _validate_result_verification(step, result, authoritative_verification)
+        repository_after = self._inspect_dispatch_repository(record, dispatch, require_clean=False)
+        try:
+            validate_review_snapshot(
+                self.config,
+                coordinate=dispatch.intent.repository,
+                before=repository_before,
+                after=repository_after,
+                review_target=result.review_target,
+            )
+        except RepositoryValidationError as exc:
+            raise SequentialWorkflowError(str(exc)) from exc
+        record, _unused_generation = self._record_usage(
+            record,
+            generation,
+            dispatch,
+            usage,
+            persist=False,
+        )
+        reconcile_event = self._event(
+            record,
+            "operator",
+            f"operator answered request {request.request_id}",
+            dispatch_id,
+        )
+        steps = dict(record.steps)
+        steps[dispatch.step_id] = step_record.model_copy(update={"last_event": reconcile_event})
+        reconciled = transition_run(
+            record.model_copy(
+                update={
+                    "steps": steps,
+                    "sequence": reconcile_event.sequence,
+                    "updated_at": reconcile_event.occurred_at,
+                }
+            ),
+            RunStatus.RUNNING,
+            reconcile_event,
+        )
+        reviewing_event = self._event(
+            reconciled,
+            "dispatcher",
+            "adopting typed result from failed reviewer response",
+            dispatch_id,
+        )
+        reviewing_step = transition_step(
+            reconciled.steps[dispatch.step_id],
+            StepStatus.REVIEWING,
+            reviewing_event,
+            active_dispatch_id=dispatch_id,
+        )
+        reviewing = self._step_replacement_record(reconciled, reviewing_step)
+        verdict_event = self._event(
+            reviewing,
+            "dispatcher",
+            f"adopted failed review verdict {result.verdict}",
+            dispatch_id,
+        )
+        updated_step, escalation_required = self._reviewer_step_outcome(
+            reviewing,
+            step,
+            reviewing_step,
+            dispatch,
+            result,
+            verdict_event,
+        )
+        if escalation_required:
+            raise SequentialWorkflowError(
+                "failed review adoption cannot create a new escalation request"
+            )
+        updated = self._step_replacement_record(reviewing, updated_step)
+        return self.store.persist_adopted_failed_review(
+            updated,
+            expected_generation=generation,
+            dispatch_id=dispatch_id,
+            result=result.model_dump(mode="json"),
+            authoritative_verification=[
+                item.model_dump(mode="json") for item in authoritative_verification
+            ],
+            repository_after=repository_after.model_dump(mode="json"),
+            review_id=f"review-{uuid.uuid4().hex}",
+            request_id=request.request_id,
+            actor_id=actor_id,
+        )
+
+    @_serialized_transition
+    def record_adopted_failed_review_usage(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        result: ReviewerResult,
+        *,
+        runtime_session_id: str,
+        usage: Mapping[str, object],
+    ) -> tuple[RunRecord, int]:
+        """Recover measured usage omitted from an already adopted failed review."""
+        record, generation = self.store.load_run(run_id)
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise SequentialWorkflowError(f"unknown recovery dispatch: {dispatch_id}") from exc
+        if (
+            record.state is not RunStatus.SUCCEEDED
+            or dispatch.role_kind != "reviewer"
+            or dispatch.state is not DispatchStatus.FAILED
+            or dispatch.failure_category != "result_validation"
+            or dispatch.runtime_session_id != runtime_session_id
+        ):
+            raise SequentialWorkflowError(
+                "adopted review usage recovery does not match a terminal failed reviewer attempt"
+            )
+        payload = self.store.load_dispatch_payload(run_id, dispatch_id)
+        if payload.result != result.model_dump(mode="json"):
+            raise SequentialWorkflowError(
+                "adopted review usage recovery result differs from the durable review"
+            )
+        if not self.store.review_for_dispatch(run_id, dispatch_id):
+            raise SequentialWorkflowError("adopted review usage recovery has no durable review")
+        if runtime_session_id in record.usage.by_session:
+            raise SequentialWorkflowError("adopted review session usage was already recorded")
+        updated, _unused_generation = self._record_usage(
+            record,
+            generation,
+            dispatch,
+            usage,
+            persist=False,
+        )
+        next_generation = self.store.save_run(updated, expected_generation=generation)
+        self.store.export_run_report(
+            run_id,
+            record_override=updated,
+            generation_override=next_generation,
+        )
+        return updated, next_generation
+
+    @_serialized_transition
     def apply_reviewer_result(
         self,
         prepared: PreparedDispatch,

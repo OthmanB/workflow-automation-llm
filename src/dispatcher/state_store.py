@@ -902,6 +902,94 @@ class StateStore:
         )
         return record, generation
 
+    def persist_adopted_failed_review(
+        self,
+        record: RunRecord,
+        *,
+        expected_generation: int,
+        dispatch_id: str,
+        result: Mapping[str, Any],
+        authoritative_verification: list[Mapping[str, Any]],
+        repository_after: Mapping[str, Any],
+        review_id: str,
+        request_id: str,
+        actor_id: str,
+    ) -> tuple[RunRecord, int]:
+        """Atomically retain a failed attempt while adopting its validated review."""
+        try:
+            dispatch = record.dispatches[dispatch_id]
+        except KeyError as exc:
+            raise StateStoreError(f"run record does not contain dispatch: {dispatch_id}") from exc
+        if dispatch.state is not DispatchStatus.FAILED:
+            raise StateStoreError("failed review adoption requires a FAILED dispatch record")
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            row = connection.execute(
+                "SELECT generation, state FROM dispatches WHERE run_id = ? AND dispatch_id = ?",
+                (record.run_id, dispatch_id),
+            ).fetchone()
+            if row is None or row["state"] != "FAILED":
+                raise StateStoreConflictError("durable dispatch is not the failed review attempt")
+            generation_row = connection.execute(
+                "SELECT generation, state FROM runs WHERE run_id = ?", (record.run_id,)
+            ).fetchone()
+            if generation_row is None or generation_row["generation"] != expected_generation:
+                raise StateStoreConflictError(
+                    f"run {record.run_id} generation conflict: expected {expected_generation}, "
+                    f"found {generation_row['generation'] if generation_row else None}"
+                )
+            if generation_row["state"] != "WAITING_OPERATOR":
+                raise StateStoreConflictError(
+                    "durable run is not waiting on the failed review reconciliation"
+                )
+            if connection.execute(
+                "SELECT 1 FROM reviews WHERE run_id = ? AND dispatch_id = ?",
+                (record.run_id, dispatch_id),
+            ).fetchone() is not None:
+                raise StateStoreConflictError("failed dispatch review was already adopted")
+            existing = self.load_dispatch_payload(record.run_id, dispatch_id)
+            replacement = DispatchPayload(
+                prompt=existing.prompt,
+                policy=existing.policy,
+                result=result,
+                authoritative_verification=tuple(authoritative_verification),
+                forwarding_payload=existing.forwarding_payload,
+                process_id=existing.process_id,
+                session_metadata=existing.session_metadata,
+                repository_before=existing.repository_before,
+                repository_after=repository_after,
+            )
+            generation = expected_generation + 1
+            self._write_snapshot(
+                connection,
+                record,
+                generation=generation,
+                sessions=self.sessions_for_run(record.run_id),
+            )
+            self._write_dispatch_payload(connection, record.run_id, dispatch_id, replacement)
+            connection.execute(
+                """
+                INSERT INTO reviews(review_id, run_id, dispatch_id, review_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (review_id, record.run_id, dispatch_id, _json_text(result), _utc_now()),
+            )
+            connection.execute(
+                """
+                INSERT INTO operator_decisions(decision_id, run_id, request_id, actor_id, answer, created_at)
+                VALUES (?, ?, ?, ?, 'reconcile', ?)
+                """,
+                (
+                    f"decision-{uuid.uuid4().hex}",
+                    record.run_id,
+                    request_id,
+                    actor_id,
+                    _utc_now(),
+                ),
+            )
+        self._secure_database_files()
+        return record, generation
+
     def review_for_dispatch(self, run_id: str, dispatch_id: str) -> bool:
         """Return whether a durable review row already exists for a dispatch."""
         row = self._ready_connection().execute(

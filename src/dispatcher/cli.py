@@ -182,6 +182,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     recover_parser.add_argument("--config", required=True)
     recover_parser.add_argument("--run-id", required=True)
+    recover_parser.add_argument("--adopt-failed-review")
+    recover_parser.add_argument("--response-log")
     recover_parser.add_argument(
         "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -599,8 +601,12 @@ def _print_status_text(snapshot: dict[str, object]) -> None:
 def _cmd_recover(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
+    from .execution import ExecutionCoordinatorError, _worker_json_object
+    from .results import ResultError, parse_reviewer_result
     from .sequential import SequentialWorkflow, SequentialWorkflowError
+    from .sessions import OpenCodeAdapterError, OpenCodeJsonlDecoder
     from .state_store import StateStoreError
+    from .verification import AuthoritativeVerification
 
     cfg = load_config(args.config)
     _setup_logging(args.log_level or cfg.observability.log_level)
@@ -609,13 +615,18 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         items = store.classify_recovery(args.run_id)
         workflow = SequentialWorkflow(cfg, store, owner_id=f"recovery-{os.getpid()}")
         adopted: list[str] = []
+        adopted_reviews: list[str] = []
         recovered_forwardings: list[str] = []
         recovery_failures: list[str] = []
         candidates = [
             item for item in items if item.disposition == "structured_commit_adoption_required"
         ]
         completed = [item for item in items if item.disposition == "forwarding_required"]
-        if candidates or completed:
+        if bool(args.adopt_failed_review) != bool(args.response_log):
+            raise StateStoreError(
+                "--adopt-failed-review and --response-log must be provided together"
+            )
+        if candidates or completed or args.adopt_failed_review:
             recovery_owner = f"recovery-{os.getpid()}"
             store.acquire_run_lease(
                 project_id=cfg.project_id,
@@ -640,6 +651,75 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                         recovery_failures.append(f"{item.dispatch_id}: {exc}")
                         continue
                     recovered_forwardings.append(item.dispatch_id)
+                if args.adopt_failed_review:
+                    record, generation = store.load_run(args.run_id)
+                    request = record.operator_request
+                    response_path = Path(args.response_log).resolve()
+                    state_root = Path(cfg.state_dir).resolve()
+                    try:
+                        response_path.relative_to(state_root)
+                    except ValueError as exc:
+                        raise StateStoreError(
+                            "failed review response log must be inside the configured state directory"
+                        ) from exc
+                    decoder = OpenCodeJsonlDecoder(
+                        max_output_bytes=cfg.execution.max_output_bytes
+                    )
+                    with response_path.open(encoding="utf-8") as stream:
+                        for line_number, line in enumerate(stream, start=1):
+                            decoder.consume_line(line, line_number=line_number)
+                    _raw, response, raw_usage, session_id, cost = decoder.finish(
+                        require_response=True
+                    )
+                    parsed = parse_reviewer_result(_worker_json_object(response))
+                    executor_payload = store.load_dispatch_payload(
+                        args.run_id,
+                        parsed.review_target.executor_dispatch_id,
+                    )
+                    authoritative = tuple(
+                        AuthoritativeVerification.model_validate_json(json.dumps(item))
+                        for item in executor_payload.authoritative_verification or ()
+                    )
+                    usage = {
+                        "cost_usd": cost,
+                        "tokens_total": raw_usage.get("total"),
+                        "tokens_input": raw_usage.get("input"),
+                        "tokens_output": raw_usage.get("output"),
+                        "tokens_reasoning": raw_usage.get("reasoning"),
+                    }
+                    if (
+                        request is not None
+                        and request.kind == "reconciliation"
+                        and request.context_ref == args.adopt_failed_review
+                    ):
+                        record, generation = workflow.adopt_failed_reviewer_result(
+                            args.run_id,
+                            args.adopt_failed_review,
+                            parsed,
+                            runtime_session_id=session_id,
+                            authoritative_verification=authoritative,
+                            usage=usage,
+                            actor_id="recover-command",
+                        )
+                        completion = workflow.evaluate_completion(record, generation)
+                        if not completion.accepted:
+                            raise StateStoreError(
+                                "adopted review did not satisfy completion obligations: "
+                                + "; ".join(completion.obligations)
+                            )
+                    elif record.state.value == "SUCCEEDED":
+                        workflow.record_adopted_failed_review_usage(
+                            args.run_id,
+                            args.adopt_failed_review,
+                            parsed,
+                            runtime_session_id=session_id,
+                            usage=usage,
+                        )
+                    else:
+                        raise StateStoreError(
+                            "failed review adoption must match the active reconciliation request"
+                        )
+                    adopted_reviews.append(args.adopt_failed_review)
             finally:
                 store.release_leases(
                     owner_id=recovery_owner,
@@ -647,13 +727,23 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 )
         items = store.classify_recovery(args.run_id)
         workspace_items = store.classify_workspace_recovery(args.run_id)
-    except StateStoreError as exc:
+    except (
+        ExecutionCoordinatorError,
+        OpenCodeAdapterError,
+        ResultError,
+        SequentialWorkflowError,
+        StateStoreError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"recover: FAILED - {exc}", file=sys.stderr)
         return 2
     for dispatch_id in adopted:
         print(f"{dispatch_id}: adopted exact interrupted structured Git commit")
     for dispatch_id in recovered_forwardings:
         print(f"{dispatch_id}: recovered durable forwarding from completed result")
+    for dispatch_id in adopted_reviews:
+        print(f"{dispatch_id}: adopted typed result from immutable failed review response")
     for failure in recovery_failures:
         print(f"recover: forwarding recovery failed - {failure}", file=sys.stderr)
     if not items and not workspace_items:
