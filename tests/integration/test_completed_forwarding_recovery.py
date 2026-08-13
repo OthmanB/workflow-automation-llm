@@ -564,6 +564,52 @@ def test_persist_forwarded_dispatch_is_all_or_nothing(tmp_path: Path) -> None:
     assert payload.authoritative_verification is None
 
 
+def test_persist_forwarded_dispatch_accepts_unicode_result_payload(tmp_path: Path) -> None:
+    store, _workflow, _record, _generation, running = _activate_and_prepare(tmp_path)
+    record, generation = store.load_run("completed-recovery-run")
+    dispatch = record.dispatches[running.dispatch.dispatch_id]
+    result = _executor_result(running)
+    result["summary"] = "fixture review: vérifiée"
+    completion_event = _event(record.sequence + 1)
+    completed = transition_dispatch(
+        dispatch,
+        DispatchStatus.COMPLETED,
+        completion_event,
+        result_digest=_sha256_json(result),
+    )
+    forwarding = json.dumps(
+        {"kind": "executor_result", "dispatch_id": dispatch.dispatch_id},
+        sort_keys=True,
+    )
+    forward_event = _event(record.sequence + 2)
+    forwarded = transition_dispatch(
+        completed,
+        DispatchStatus.FORWARDED,
+        forward_event,
+        forwarding_digest=_sha256_text(forwarding),
+    )
+    record = record.model_copy(
+        update={
+            "dispatches": {dispatch.dispatch_id: forwarded},
+            "sequence": forward_event.sequence,
+            "updated_at": forward_event.occurred_at,
+        }
+    )
+
+    persisted, _next_generation = store.persist_forwarded_dispatch(
+        record,
+        expected_generation=generation,
+        dispatch_id=dispatch.dispatch_id,
+        result=result,
+        authoritative_verification=[],
+        repository_after=_fake_snapshot().model_dump(mode="json"),
+        forwarding_payload=forwarding,
+    )
+
+    assert persisted.dispatches[dispatch.dispatch_id].state is DispatchStatus.FORWARDED
+    assert store.load_dispatch_payload(persisted.run_id, dispatch.dispatch_id).result == result
+
+
 def test_run_to_completion_recovers_completed_dispatch_before_supervisor_turn(
     tmp_path: Path,
 ) -> None:

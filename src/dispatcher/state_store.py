@@ -2662,4 +2662,6 @@ def _json_text(value: object) -> str:
 
 
 def _sha256_json(value: Mapping[str, Any]) -> str:
-    return hashlib.sha256(_json_text(value).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
