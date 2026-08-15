@@ -2259,6 +2259,135 @@ def test_review_rework_resume_full_loop_with_fake_runner(tmp_path: Path) -> None
     _assert_no_active_leases(handle.store)
 
 
+def test_verification_failure_resume_commit_review_full_loop_with_fake_runner(
+    tmp_path: Path,
+) -> None:
+    project = _configure_real_project(
+        _non_live_project(tmp_path, "verification-feedback"),
+        scheduling="sequential",
+        models=_fake_models(),
+    )
+    _seed_deterministic_fixture(project.repository, tests=("first",))
+    _commit_initial(project.repository)
+    plan = _plan(project, steps=1, review=True)
+    base_runner = _fake_session_runner()
+    executor_sessions: list[str] = []
+    executor_modes: list[str] = []
+    invocation_tokens: list[int] = []
+    forced_failures = 0
+
+    def failure_then_repair_runner(**kwargs):
+        nonlocal forced_failures
+        payload = json.loads(kwargs["prompt"])
+        result = base_runner(**kwargs)
+        if payload["result_kind"] == "executor":
+            executor_sessions.append(result.session_id)
+            executor_modes.append(kwargs["mode"])
+            tokens = 11 if kwargs["mode"] == "new" else 13
+            if forced_failures == 0:
+                forced_failures += 1
+                (Path(kwargs["workdir"]) / "result.txt").write_text(
+                    "FORCED_VERIFICATION_FAILURE\n",
+                    encoding="utf-8",
+                )
+        else:
+            tokens = 17
+            accepted = json.loads(result.chat_response)
+            accepted.update(
+                {
+                    "findings": [],
+                    "required_remediation": [],
+                    "summary": "immutable result and dispatcher verification accepted",
+                    "verdict": "accepted",
+                }
+            )
+            result.chat_response = json.dumps(accepted, sort_keys=True)
+        invocation_tokens.append(tokens)
+        result.usage = {
+            "total": tokens,
+            "input": tokens - 2,
+            "output": 2,
+            "reasoning": 0,
+        }
+        result.cost = tokens / 1000
+        return result
+
+    handle = _run_real_scenario(
+        project,
+        plan,
+        steps=("prepare-fixture",),
+        original_prompts={"prepare-fixture": _executor_task_prompt("prepare-fixture")},
+        reviewer_role="reviewer",
+        batch=False,
+        reviewer_prompts={"prepare-fixture": [_REVIEW_PROMPT]},
+        session_runner=failure_then_repair_runner,
+    )
+
+    if handle.worker_error is not None:
+        raise handle.worker_error
+    assert handle.completion is not None and handle.completion.accepted is True
+    record, _generation = handle.store.load_run(handle.run_id)
+    invocations = handle.store.opencode_invocations_for_run(handle.run_id)
+    step = record.steps["prepare-fixture"]
+    executor_dispatches = sorted(
+        (dispatch for dispatch in record.dispatches.values() if dispatch.role_kind == "executor"),
+        key=lambda dispatch: dispatch.attempt,
+    )
+    reviewer_dispatches = [
+        dispatch for dispatch in record.dispatches.values() if dispatch.role_kind == "reviewer"
+    ]
+    first_payload = handle.store.load_dispatch_payload(
+        handle.run_id,
+        executor_dispatches[0].dispatch_id,
+    )
+    repaired_payload = handle.store.load_dispatch_payload(
+        handle.run_id,
+        executor_dispatches[1].dispatch_id,
+    )
+    review_payload = handle.store.load_dispatch_payload(
+        handle.run_id,
+        reviewer_dispatches[0].dispatch_id,
+    )
+
+    assert record.state is RunStatus.SUCCEEDED
+    assert step.state is StepStatus.ACCEPTED
+    assert step.executor_attempts == 2
+    assert step.reviewer_attempts == 1
+    assert step.review_acceptances == 1
+    assert step.rework_rounds == 1
+    assert len(invocations) == 3
+    assert all(invocation["usage_status"] == "COMPLETE" for invocation in invocations)
+    assert all(invocation["lifecycle"] == "SUCCEEDED" for invocation in invocations)
+    assert record.usage.run.tokens_total == sum(invocation_tokens) == 41
+    assert record.usage.by_role["terra"].tokens_total == 24
+    assert record.usage.by_role["reviewer"].tokens_total == 17
+    assert record.usage.by_session[executor_sessions[0]].tokens_total == 24
+    assert forced_failures == 1
+    assert executor_modes == ["new", "resume"]
+    assert len(set(executor_sessions)) == 1
+    assert executor_dispatches[0].state is DispatchStatus.FAILED
+    assert executor_dispatches[0].failure_category == "authoritative_verification"
+    assert executor_dispatches[1].state is DispatchStatus.ACKNOWLEDGED
+    assert first_payload.authoritative_verification[0]["status"] == "failed"
+    assert repaired_payload.authoritative_verification[0]["status"] == "passed"
+    assert review_payload.authoritative_verification[0]["status"] == "passed"
+    assert {
+        first_payload.authoritative_verification[0]["backend"],
+        repaired_payload.authoritative_verification[0]["backend"],
+        review_payload.authoritative_verification[0]["backend"],
+    } <= {"darwin-seatbelt-v1", "linux-bwrap-v1"}
+    assert int(_git(project.repository, "rev-list", "--all", "--count")) == 2
+    assert handle.completion.report_path is not None
+    report = handle.completion.report_path.read_text(encoding="utf-8")
+    assert "`executor-time`" in report
+    assert "`acceptance-time`" in report
+    assert first_payload.authoritative_verification[0]["transcript_sha256"] in report
+    assert review_payload.authoritative_verification[0]["transcript_sha256"] in report
+    _assert_clean_repository(project.repository)
+    _assert_fixed_test_passes(project.repository, "test_real_output.py")
+    _assert_no_active_leases(handle.store)
+
+
 def test_controlled_reviewer_mutation_attempts_are_denied_before_execution(
     tmp_path: Path,
 ) -> None:

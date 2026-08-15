@@ -10,9 +10,13 @@ import pytest
 from helpers import create_fixture_project, valid_plan_values
 
 from dispatcher.execution import (
+    BatchOutcome,
     ExecutionCoordinatorError,
     SequentialExecutionCoordinator,
     SupervisorOutcome,
+    WorkerOutcome,
+    _adapter_error_usage,
+    _session_usage,
     _worker_failure,
     _worker_json_object,
     worker_opencode_state_dir,
@@ -21,18 +25,21 @@ from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.protocol import ProtocolError
 from dispatcher.repository import (
     EvidenceManifestEntry,
+    RepositoryChange,
     RepositorySnapshot,
     RepositoryValidationError,
 )
-from dispatcher.results import ResultError
+from dispatcher.results import ResultError, parse_executor_proposal
 from dispatcher.sequential import (
+    PreparedBatch,
     PreparedDispatch,
     SequentialWorkflow,
     SequentialWorkflowError,
     WorkerResultValidationError,
 )
 from dispatcher.sessions import OpenCodeAdapterError, SessionResult
-from dispatcher.state_store import DispatchPayload, StateStore
+from dispatcher.state_store import DispatchPayload, RecoveryRequiredError, StateStore
+from dispatcher.verification import AuthoritativeVerification
 from dispatcher.workflow import (
     DispatchIntent,
     DispatchRecord,
@@ -56,6 +63,317 @@ _DIGEST = "a" * 64
 )
 def test_worker_response_extracts_one_final_json_object(response: str) -> None:
     assert _worker_json_object(response) == {"verdict": "accepted"}
+
+
+def test_session_usage_treats_partial_token_measurement_as_missing() -> None:
+    result = SessionResult(
+        session_id="session-partial-usage",
+        exit_code=0,
+        chat_response="{}",
+        evidence_written=[],
+        usage={"total": 5},
+        cost=0.5,
+    )
+    assert _session_usage(result) is None
+
+
+def test_session_usage_accepts_complete_token_measurement() -> None:
+    result = SessionResult(
+        session_id="session-complete-usage",
+        exit_code=0,
+        chat_response="{}",
+        evidence_written=[],
+        usage={"total": 5, "input": 3, "output": 2, "reasoning": 0},
+        cost=0.5,
+    )
+    assert _session_usage(result) == {
+        "cost_usd": 0.5,
+        "tokens_total": 5,
+        "tokens_input": 3,
+        "tokens_output": 2,
+        "tokens_reasoning": 0,
+    }
+
+
+def test_adapter_error_usage_treats_partial_token_measurement_as_missing() -> None:
+    error = OpenCodeAdapterError(
+        "provider rejected the session",
+        category="authentication",
+        usage={"total": 5},
+        cost=0.5,
+    )
+    assert _adapter_error_usage(error) is None
+
+
+def _dirty_repository_snapshot(clean: RepositorySnapshot, *, marker: str) -> RepositorySnapshot:
+    return clean.model_copy(
+        update={
+            "clean": False,
+            "changes": (
+                RepositoryChange(
+                    change_type="modified",
+                    paths=("evidence/fixture.md",),
+                    index_status=" ",
+                    worktree_status="M",
+                ),
+            ),
+            "dirty_patch_sha256": marker * 64,
+            "manifest_sha256": marker * 64,
+        }
+    )
+
+
+def test_recovery_verification_retry_waiting_exports_run_report(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    project = create_fixture_project(tmp_path)
+    values = valid_plan_values(project)
+    values["steps"][0]["retry"]["max_executor_attempts"] = 2
+    values["steps"][0]["retry"]["on_changes_requested"] = "retry"
+    values["steps"][0]["authorization"]["authorized_actions"] = ["inspect", "modify", "commit"]
+    values["steps"][0]["authorization"]["writable_paths"] = ["evidence/"]
+    plan = NormalizedPlan.model_validate(values)
+    record = new_run_record(
+        run_id="verification-waiting-report-run",
+        project_id=project.config.project_id,
+        config_digest=project.config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-verification-waiting-report"),
+        event=TransitionEvent(
+            event_id="event-verification-waiting-report",
+            sequence=1,
+            actor="dispatcher",
+            reason="verification waiting report fixture",
+            correlation_id="verification-waiting-report-run",
+            occurred_at=datetime.now(UTC),
+        ),
+    )
+    store = StateStore(
+        project.state,
+        heartbeat_seconds=project.config.lease_heartbeat_seconds,
+        stale_after_seconds=project.config.lease_stale_after_seconds,
+    )
+    generation = store.create_run(record)
+    clean = _repository_snapshot()
+    current = {"snapshot": _dirty_repository_snapshot(clean, marker="f")}
+
+    def inspect(_config, _repo_id, *, require_clean):
+        return clean if require_clean else current["snapshot"]
+
+    workflow = SequentialWorkflow(
+        project.config,
+        store,
+        owner_id="verification-waiting-report-owner",
+        repository_inspector=inspect,
+    )
+    coordinator = SequentialExecutionCoordinator(
+        project.config,
+        store,
+        workflow,
+        owner_id="verification-waiting-report-owner",
+        session_runner=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verification waiting fixture unexpectedly invoked a worker")
+        ),
+    )
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=json.dumps(
+            {
+                "protocol_version": 1,
+                "action": "dispatch",
+                "step_id": "prepare-fixture",
+                "target_role": "terra",
+                "session_mode": "new",
+                "prompt": "Perform the fixture work.",
+            }
+        ),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    prepared = workflow.record_session_id(
+        workflow.mark_running(prepared, process_id=1234, process_create_time=1234.0),
+        runtime_session_id="session-verification-waiting-report",
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    verification = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="failed",
+            argv=("python", "-c", "raise SystemExit(1)"),
+            exit_code=1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            transcript_sha256="c" * 64,
+            duration_ms=5,
+            backend="fixture-isolation",
+            summary="fixture assertion failed",
+        ),
+    )
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+    assert failed.steps["prepare-fixture"].state.value == "READY"
+    current["snapshot"] = _dirty_repository_snapshot(clean, marker="d")
+
+    decision = coordinator.run_to_completion(
+        record.run_id,
+        expected_generation=generation,
+        max_turns=1,
+    )
+
+    assert decision.accepted is False
+    assert decision.report_path is not None
+    assert decision.report_path.is_file()
+    report = decision.report_path.read_text(encoding="utf-8")
+    assert "WAITING_OPERATOR" in report
+    assert "## Authoritative Verification" in report
+    assert "fixture-check" in report
+    assert "fixture-isolation" in report
+
+
+def test_in_loop_stopped_retry_worker_exports_run_report(tmp_path: Path) -> None:
+    coordinator, store, workflow, record, generation = _continuation_fixture(tmp_path, [])
+    prepared = workflow.prepare_from_supervisor(
+        record.run_id,
+        expected_generation=generation,
+        supervisor_text=json.dumps(
+            {
+                "protocol_version": 1,
+                "action": "dispatch",
+                "step_id": "prepare-fixture",
+                "target_role": "terra",
+                "session_mode": "new",
+                "prompt": "Perform the fixture work.",
+            }
+        ),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    _record, generation = store.load_run(record.run_id)
+
+    def pending_retry(_record: RunRecord, _generation: int) -> PreparedDispatch:
+        return prepared
+
+    def stopped_worker(_prepared: PreparedDispatch) -> WorkerOutcome:
+        waiting, waiting_generation = workflow.recover_interrupted_dispatch(
+            prepared.run_id,
+            prepared.dispatch.dispatch_id,
+        )
+        return WorkerOutcome(waiting, waiting_generation, prepared.dispatch.dispatch_id, "")
+
+    workflow.prepare_pending_verification_retry = pending_retry  # type: ignore[method-assign]
+    coordinator.execute_worker = stopped_worker  # type: ignore[method-assign]
+
+    decision = coordinator.run_to_completion(
+        record.run_id,
+        expected_generation=generation,
+        max_turns=1,
+    )
+
+    assert decision.accepted is False
+    assert decision.report_path is not None
+    assert decision.report_path.is_file()
+
+
+def test_supervisor_action_worker_stop_exports_run_report(tmp_path: Path) -> None:
+    coordinator, _store, workflow, record, generation = _continuation_fixture(tmp_path, [])
+
+    def supervisor_turn(_run_id: str, **kwargs: Any) -> SupervisorOutcome:
+        return SupervisorOutcome(
+            response=json.dumps(
+                {
+                    "protocol_version": 1,
+                    "action": "dispatch",
+                    "step_id": "prepare-fixture",
+                    "target_role": "terra",
+                    "session_mode": "new",
+                    "prompt": "Perform the fixture work.",
+                }
+            ),
+            session_id="session-supervisor-stop",
+            generation=kwargs["expected_generation"],
+        )
+
+    def stopped_worker(prepared: PreparedDispatch) -> WorkerOutcome:
+        waiting, waiting_generation = workflow.recover_interrupted_dispatch(
+            prepared.run_id,
+            prepared.dispatch.dispatch_id,
+        )
+        return WorkerOutcome(waiting, waiting_generation, prepared.dispatch.dispatch_id, "")
+
+    coordinator.run_supervisor_turn = supervisor_turn  # type: ignore[method-assign]
+    coordinator.execute_worker = stopped_worker  # type: ignore[method-assign]
+
+    decision = coordinator.run_to_completion(
+        record.run_id,
+        expected_generation=generation,
+        max_turns=1,
+    )
+
+    assert decision.accepted is False
+    assert decision.report_path is not None
+    assert decision.report_path.is_file()
+
+
+def test_supervisor_action_batch_stop_exports_run_report(tmp_path: Path) -> None:
+    coordinator, _store, workflow, record, generation = _continuation_fixture(tmp_path, [])
+    original_prepare = workflow.prepare_from_supervisor
+
+    def supervisor_turn(_run_id: str, **kwargs: Any) -> SupervisorOutcome:
+        return SupervisorOutcome(
+            response=json.dumps(
+                {
+                    "protocol_version": 1,
+                    "action": "dispatch",
+                    "step_id": "prepare-fixture",
+                    "target_role": "terra",
+                    "session_mode": "new",
+                    "prompt": "Perform the fixture work.",
+                }
+            ),
+            session_id="session-supervisor-batch-stop",
+            generation=kwargs["expected_generation"],
+        )
+
+    def prepare_batch_action(*args: Any, **kwargs: Any) -> PreparedBatch:
+        prepared = original_prepare(*args, **kwargs)
+        assert isinstance(prepared, PreparedDispatch)
+        return PreparedBatch(
+            run_id=prepared.run_id,
+            generation=prepared.generation,
+            batch_id="batch-report-stop",
+            dispatches=(prepared,),
+        )
+
+    def stopped_batch(batch: PreparedBatch) -> BatchOutcome:
+        prepared = batch.dispatches[0]
+        waiting, waiting_generation = workflow.recover_interrupted_dispatch(
+            prepared.run_id,
+            prepared.dispatch.dispatch_id,
+        )
+        return BatchOutcome(waiting, waiting_generation, batch.batch_id, "", ())
+
+    coordinator.run_supervisor_turn = supervisor_turn  # type: ignore[method-assign]
+    workflow.prepare_from_supervisor = prepare_batch_action  # type: ignore[method-assign]
+    coordinator.execute_batch = stopped_batch  # type: ignore[method-assign]
+
+    decision = coordinator.run_to_completion(
+        record.run_id,
+        expected_generation=generation,
+        max_turns=1,
+    )
+
+    assert decision.accepted is False
+    assert decision.report_path is not None
+    assert decision.report_path.is_file()
+
+
 
 
 @pytest.mark.parametrize(
@@ -155,6 +473,97 @@ def test_continuation_without_pending_forwardings_preserves_bootstrap(tmp_path: 
 
     assert prompt == "exact bootstrap"
     assert pending == []
+
+
+def test_supervisor_turn_accounts_incremental_invocation_usage(tmp_path: Path) -> None:
+    _unused, store, workflow, record, generation = _continuation_fixture(
+        tmp_path,
+        [],
+    )
+
+    def supervisor_result(**_kwargs: Any) -> SessionResult:
+        return SessionResult(
+            session_id="session-supervisor-usage",
+            exit_code=0,
+            chat_response='{"protocol_version":1,"action":"request_completion"}',
+            evidence_written=[],
+            usage={"total": 15, "input": 9, "output": 5, "reasoning": 1},
+            cost=0.15,
+        )
+
+    coordinator = SequentialExecutionCoordinator(
+        workflow.config,
+        store,
+        workflow,
+        owner_id="supervisor-usage-owner",
+        session_runner=supervisor_result,
+    )
+    coordinator.acquire_run(record.run_id)
+    try:
+        outcome = coordinator.run_supervisor_turn(
+            record.run_id,
+            expected_generation=generation,
+            prompt="continue",
+            session_id=None,
+        )
+    finally:
+        coordinator.release_run()
+
+    persisted, persisted_generation = store.load_run(record.run_id)
+    role_key = next(iter(workflow.config.model.roles.supervisor))
+    invocation = store.opencode_invocations_for_run(record.run_id)[0]
+    assert outcome.generation == persisted_generation
+    assert persisted.usage.run.tokens_total == 15
+    assert persisted.usage.by_role[role_key].tokens_total == 15
+    assert persisted.usage.by_session["session-supervisor-usage"].tokens_total == 15
+    assert invocation["role_kind"] == "supervisor"
+    assert invocation["usage_status"] == "COMPLETE"
+
+
+def test_supervisor_turn_does_not_reuse_an_interrupted_invocation_id(tmp_path: Path) -> None:
+    _unused, store, workflow, record, generation = _continuation_fixture(tmp_path, [])
+    role_key = next(iter(workflow.config.model.roles.supervisor))
+    store.begin_opencode_invocation(
+        invocation_id=f"supervisor:{record.run_id}:{generation}",
+        run_id=record.run_id,
+        dispatch_id=None,
+        role_kind="supervisor",
+        role_key=role_key,
+        step_id=None,
+        session_mode="new",
+        requested_session_id=None,
+    )
+
+    def supervisor_result(**_kwargs: Any) -> SessionResult:
+        return SessionResult(
+            session_id="session-supervisor-recovered",
+            exit_code=0,
+            chat_response='{"protocol_version":1,"action":"request_completion"}',
+            evidence_written=[],
+            usage={"total": 1, "input": 1, "output": 0, "reasoning": 0},
+            cost=0.01,
+        )
+
+    coordinator = SequentialExecutionCoordinator(
+        workflow.config,
+        store,
+        workflow,
+        owner_id="supervisor-interrupted-owner",
+        session_runner=supervisor_result,
+    )
+    coordinator.acquire_run(record.run_id)
+    try:
+        outcome = coordinator.run_supervisor_turn(
+            record.run_id,
+            expected_generation=generation,
+            prompt="continue",
+            session_id=None,
+        )
+    finally:
+        coordinator.release_run()
+
+    assert outcome.session_id == "session-supervisor-recovered"
+    assert len(store.opencode_invocations_for_run(record.run_id)) == 2
 
 
 def test_continuation_replays_one_authoritative_sanitized_executor_forwarding(
@@ -752,6 +1161,82 @@ def test_repository_validation_failure_persists_actionable_detail(tmp_path: Path
     assert dispatch.failure_detail in dispatch.last_event.reason
 
 
+def test_malformed_worker_result_usage_is_accounted_before_validation(
+    tmp_path: Path,
+) -> None:
+    def malformed_result(**kwargs: Any) -> SessionResult:
+        lifecycle = kwargs["lifecycle"]
+        lifecycle.on_process_started(1000, 1000.0)
+        lifecycle.on_session_identified("session-malformed-result")
+        return SessionResult(
+            session_id="session-malformed-result",
+            exit_code=0,
+            chat_response="not a result object",
+            evidence_written=[],
+            usage={"total": 12, "input": 7, "output": 4, "reasoning": 1},
+            cost=0.12,
+        )
+
+    coordinator, store, prepared = _prepared_coordinator(
+        tmp_path,
+        session_runner=malformed_result,
+    )
+
+    try:
+        with pytest.raises(ExecutionCoordinatorError, match="final JSON object"):
+            coordinator.execute_worker(prepared)
+    finally:
+        coordinator.release_run()
+
+    record, _generation = store.load_run(prepared.run_id)
+    invocations = store.opencode_invocations_for_run(prepared.run_id)
+    assert record.usage.run.cost_usd == pytest.approx(0.12)
+    assert record.usage.run.tokens_total == 12
+    assert record.usage.by_step[prepared.dispatch.step_id].tokens_total == 12
+    assert record.usage.by_role[prepared.dispatch.role_key].tokens_total == 12
+    assert record.usage.by_session["session-malformed-result"].tokens_total == 12
+    assert len(invocations) == 1
+    assert invocations[0]["lifecycle"] == "SUCCEEDED"
+    assert invocations[0]["usage_status"] == "COMPLETE"
+
+
+def test_duplicate_worker_invocation_is_not_relaunched(tmp_path: Path) -> None:
+    calls = 0
+
+    def malformed_result(**kwargs: Any) -> SessionResult:
+        nonlocal calls
+        calls += 1
+        lifecycle = kwargs["lifecycle"]
+        lifecycle.on_process_started(1000, 1000.0)
+        lifecycle.on_session_identified("session-duplicate-invocation")
+        return SessionResult(
+            session_id="session-duplicate-invocation",
+            exit_code=0,
+            chat_response="not a result object",
+            evidence_written=[],
+            usage={"total": 12, "input": 7, "output": 4, "reasoning": 1},
+            cost=0.12,
+        )
+
+    coordinator, store, prepared = _prepared_coordinator(
+        tmp_path,
+        session_runner=malformed_result,
+    )
+
+    try:
+        with pytest.raises(ExecutionCoordinatorError, match="final JSON object"):
+            coordinator.execute_worker(prepared)
+        with pytest.raises(RecoveryRequiredError, match="automatic relaunch is forbidden"):
+            coordinator.execute_worker(prepared)
+    finally:
+        coordinator.release_run()
+
+    invocations = store.opencode_invocations_for_run(prepared.run_id)
+    assert calls == 1
+    assert len(invocations) == 1
+    assert invocations[0]["usage_status"] == "COMPLETE"
+
+
 def test_non_retryable_adapter_failure_persists_provider_category_and_redacted_detail(
     tmp_path: Path,
 ) -> None:
@@ -762,6 +1247,9 @@ def test_non_retryable_adapter_failure_persists_provider_category_and_redacted_d
         raise OpenCodeAdapterError(
             "provider rejected token=top-secret",
             category="authentication",
+            usage={"total": 9, "input": 5, "output": 4, "reasoning": 0},
+            cost=0.09,
+            runtime_session_id="session-adapter-failure",
         )
 
     coordinator, store, prepared = _prepared_coordinator(
@@ -782,6 +1270,10 @@ def test_non_retryable_adapter_failure_persists_provider_category_and_redacted_d
     assert "top-secret" not in dispatch.failure_detail
     assert "top-secret" not in dispatch.last_event.reason
     assert "provider rejected token=[REDACTED]" in dispatch.last_event.reason
+    assert record.usage.run.tokens_total == 9
+    invocation = store.opencode_invocations_for_run(prepared.run_id)[0]
+    assert invocation["lifecycle"] == "FAILED"
+    assert invocation["usage_status"] == "COMPLETE"
 
 
 def test_worker_boundary_persists_failure_detail_bounded_to_5000_characters(

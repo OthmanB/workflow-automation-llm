@@ -13,6 +13,7 @@ from helpers import FixtureProject, create_fixture_project, valid_plan_values
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.state_store import (
     LeaseConflictError,
+    RecoveryRequiredError,
     StaleLeaseRecoveryRequired,
     StateStore,
     StateStoreConflictError,
@@ -466,6 +467,7 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
         connection.execute("DROP TABLE workspace_groups")
         connection.execute("DROP TABLE baseline_approvals")
         connection.execute("DROP TABLE structured_git_commits")
+        connection.execute("DROP TABLE opencode_invocations")
         connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
 
     migrated = _store(project)
@@ -483,7 +485,7 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'baseline_approvals'"
         ).fetchone()
 
-    assert version == 7
+    assert version == 8
     assert table == ("baselines",)
     assert columns >= {
         "repository_before_json",
@@ -492,6 +494,181 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
     }
     assert workspace_table == ("workspace_groups",)
     assert approval_table == ("baseline_approvals",)
+
+
+def test_opencode_invocation_usage_is_incremental_and_idempotent(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+
+    store.begin_opencode_invocation(
+        invocation_id="supervisor-first",
+        run_id=record.run_id,
+        dispatch_id=None,
+        role_kind="supervisor",
+        role_key="supervisor",
+        step_id=None,
+        session_mode="new",
+        requested_session_id=None,
+    )
+    first, first_generation = store.finish_opencode_invocation(
+        invocation_id="supervisor-first",
+        runtime_session_id="session-supervisor",
+        usage={
+            "cost_usd": 0.1,
+            "tokens_total": 10,
+            "tokens_input": 6,
+            "tokens_output": 4,
+            "tokens_reasoning": 0,
+        },
+    )
+    repeated, repeated_generation = store.finish_opencode_invocation(
+        invocation_id="supervisor-first",
+        runtime_session_id="session-supervisor",
+        usage={
+            "cost_usd": 0.1,
+            "tokens_total": 10,
+            "tokens_input": 6,
+            "tokens_output": 4,
+            "tokens_reasoning": 0,
+        },
+    )
+
+    store.begin_opencode_invocation(
+        invocation_id="supervisor-resumed",
+        run_id=record.run_id,
+        dispatch_id=None,
+        role_kind="supervisor",
+        role_key="supervisor",
+        step_id=None,
+        session_mode="resume",
+        requested_session_id="session-supervisor",
+    )
+    resumed, resumed_generation = store.finish_opencode_invocation(
+        invocation_id="supervisor-resumed",
+        runtime_session_id="session-supervisor",
+        usage={
+            "cost_usd": 0.2,
+            "tokens_total": 20,
+            "tokens_input": 12,
+            "tokens_output": 7,
+            "tokens_reasoning": 1,
+        },
+    )
+
+    assert first_generation == 2
+    assert repeated_generation == first_generation
+    assert repeated == first
+    assert resumed_generation == 3
+    assert resumed.usage.run.cost_usd == pytest.approx(0.3)
+    assert resumed.usage.run.tokens_total == 30
+    assert resumed.usage.by_role["supervisor"].tokens_total == 30
+    assert resumed.usage.by_session["session-supervisor"].tokens_total == 30
+    assert len(store.opencode_invocations_for_run(record.run_id)) == 2
+
+
+def test_opencode_invocation_missing_usage_is_reported_as_unknown(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    store.begin_opencode_invocation(
+        invocation_id="supervisor-missing",
+        run_id=record.run_id,
+        dispatch_id=None,
+        role_kind="supervisor",
+        role_key="supervisor",
+        step_id=None,
+        session_mode="new",
+        requested_session_id=None,
+    )
+    with pytest.raises(RecoveryRequiredError, match="automatic relaunch is forbidden"):
+        store.begin_opencode_invocation(
+            invocation_id="supervisor-missing",
+            run_id=record.run_id,
+            dispatch_id=None,
+            role_kind="supervisor",
+            role_key="supervisor",
+            step_id=None,
+            session_mode="new",
+            requested_session_id=None,
+        )
+    store.finish_opencode_invocation(
+        invocation_id="supervisor-missing",
+        runtime_session_id="session-supervisor",
+        usage=None,
+        failure_category="protocol",
+    )
+
+    report = store.export_run_report(record.run_id).read_text(encoding="utf-8")
+
+    assert "Missing usage records: `1`" in report
+    assert "`MISSING` | unknown | unknown" in report
+
+
+def test_recovery_finalizes_prepared_opencode_invocations_without_usage(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    store.begin_opencode_invocation(
+        invocation_id="supervisor-interrupted",
+        run_id=record.run_id,
+        dispatch_id=None,
+        role_kind="supervisor",
+        role_key="supervisor",
+        step_id=None,
+        session_mode="new",
+        requested_session_id=None,
+    )
+
+    assert [item["invocation_id"] for item in store.prepared_opencode_invocations_for_run(record.run_id)] == [
+        "supervisor-interrupted"
+    ]
+    assert store.finalize_prepared_opencode_invocations(record.run_id) == ("supervisor-interrupted",)
+    assert store.finalize_prepared_opencode_invocations(record.run_id) == ()
+
+    invocation = store.opencode_invocations_for_run(record.run_id)[0]
+    assert invocation["lifecycle"] == "FAILED"
+    assert invocation["usage_status"] == "MISSING"
+    assert invocation["failure_category"] == "interrupted"
+
+
+def test_session_inspection_report_uses_state_directory_for_supervisor_root(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    generation = store.create_run(record)
+    persisted, generation = store.load_run(record.run_id)
+    generation = store.save_run(
+        persisted,
+        expected_generation=generation,
+        sessions={
+            "supervisor": {
+                "supervisor": {
+                    "session_id": "ses-supervisor-inspection",
+                    "role_key": "supervisor",
+                    "working_directory": str(project.repository),
+                    "status": "active",
+                }
+            }
+        },
+    )
+
+    report = store.export_run_report(
+        record.run_id,
+        generation_override=generation,
+    ).read_text(encoding="utf-8")
+
+    assert (
+        f"| `supervisor:supervisor` | `ses-supervisor-inspection` | "
+        f"`{project.repository}` | `.` | `opencode-events` |"
+    ) in report
 
 
 def test_structured_git_lifecycle_is_durable_and_rejects_duplicate_side_effects(

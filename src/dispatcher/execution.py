@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
 from typing import Any
+from uuid import uuid4
 
 from .config import Config
 from .mcp import (
@@ -144,6 +145,9 @@ class SequentialExecutionCoordinator:
     ) -> SupervisorOutcome:
         """Run and persist one read-only supervisor turn."""
         self.heartbeat()
+        _record, generation_before_launch = self.store.load_run(run_id)
+        if generation_before_launch != expected_generation:
+            raise ExecutionCoordinatorError("run changed before supervisor session")
         role_key = next(iter(self.config.model.roles.supervisor))
         role = self.config.role(role_key)
         repo_id = self.config.default_repository_id
@@ -157,26 +161,60 @@ class SequentialExecutionCoordinator:
             ),
             mcp_servers=compile_role_mcp_servers(self.config, role_key),
         )
-        result = self._session_runner(
-            prompt=prompt,
-            model=role.model,
-            variant=role.variant,
-            session_id=session_id,
-            mode="resume" if session_id else "new",
-            workdir=self.config.repository_root(repo_id),
-            title=f"supervisor - {run_id}",
-            auto_approve=should_auto_approve(permission["permission"]),
-            timeout_seconds=self.config.execution.timeout_seconds,
-            termination_grace_seconds=self.config.execution.termination_grace_seconds,
-            max_output_bytes=self.config.execution.max_output_bytes,
-            state_dir=self.config.state_dir,
-            permission_config=permission,
-            environment_passthrough=collect_role_mcp_environment(self.config, role_key),
-            inherit_opencode_config=inherits_global_mcp_config(self.config),
-            snapshot_dirs=[],
+        session_mode = "resume" if session_id else "new"
+        invocation_id = f"supervisor:{run_id}:{expected_generation}:{uuid4().hex}"
+        self.store.begin_opencode_invocation(
+            invocation_id=invocation_id,
+            run_id=run_id,
+            dispatch_id=None,
+            role_kind="supervisor",
+            role_key=role_key,
+            step_id=None,
+            session_mode=session_mode,
+            requested_session_id=session_id,
         )
-        record, generation = self.store.load_run(run_id)
-        if generation != expected_generation:
+        try:
+            result = self._session_runner(
+                prompt=prompt,
+                model=role.model,
+                variant=role.variant,
+                session_id=session_id,
+                mode=session_mode,
+                workdir=self.config.repository_root(repo_id),
+                title=f"supervisor - {run_id}",
+                auto_approve=should_auto_approve(permission["permission"]),
+                timeout_seconds=self.config.execution.timeout_seconds,
+                termination_grace_seconds=self.config.execution.termination_grace_seconds,
+                max_output_bytes=self.config.execution.max_output_bytes,
+                state_dir=self.config.state_dir,
+                permission_config=permission,
+                environment_passthrough=collect_role_mcp_environment(self.config, role_key),
+                inherit_opencode_config=inherits_global_mcp_config(self.config),
+                snapshot_dirs=[],
+            )
+        except OpenCodeAdapterError as exc:
+            self.store.finish_opencode_invocation(
+                invocation_id=invocation_id,
+                runtime_session_id=exc.runtime_session_id or session_id,
+                usage=_adapter_error_usage(exc),
+                failure_category=exc.category,
+            )
+            raise
+        except Exception as exc:
+            self.store.finish_opencode_invocation(
+                invocation_id=invocation_id,
+                runtime_session_id=session_id,
+                usage=None,
+                failure_category=_worker_failure(exc)[0],
+            )
+            raise
+        _record, generation_before_accounting = self.store.load_run(run_id)
+        record, generation = self.store.finish_opencode_invocation(
+            invocation_id=invocation_id,
+            runtime_session_id=result.session_id,
+            usage=_session_usage(result),
+        )
+        if generation_before_accounting != expected_generation:
             raise ExecutionCoordinatorError("run changed during supervisor session")
         sessions = self.store.sessions_for_run(run_id)
         sessions.setdefault("supervisor", {})[role_key] = {
@@ -202,6 +240,8 @@ class SequentialExecutionCoordinator:
     def execute_worker(self, prepared: PreparedDispatch) -> WorkerOutcome:
         """Execute one prepared worker with synchronous lifecycle transactions."""
         current = prepared
+        invocation_id = f"dispatch:{prepared.run_id}:{prepared.dispatch.dispatch_id}"
+        invocation_finalized = False
 
         def process_started(process_id: int, process_create_time: float) -> None:
             nonlocal current
@@ -230,6 +270,33 @@ class SequentialExecutionCoordinator:
             run_id=prepared.run_id,
             dispatch=prepared.dispatch,
         )
+        self.store.begin_opencode_invocation(
+            invocation_id=invocation_id,
+            run_id=prepared.run_id,
+            dispatch_id=prepared.dispatch.dispatch_id,
+            role_kind=prepared.dispatch.role_kind,
+            role_key=prepared.dispatch.role_key,
+            step_id=prepared.dispatch.step_id,
+            session_mode=prepared.session_mode,
+            requested_session_id=prepared.session_id,
+        )
+
+        def finalize_invocation(
+            *,
+            runtime_session_id: str | None,
+            usage: dict[str, object] | None,
+            failure_category: str | None = None,
+        ) -> None:
+            nonlocal current, invocation_finalized
+            record, generation = self.workflow.finish_opencode_invocation(
+                invocation_id=invocation_id,
+                runtime_session_id=runtime_session_id,
+                usage=usage,
+                failure_category=failure_category,
+            )
+            current = _refresh_prepared(current, record, generation)
+            invocation_finalized = True
+
         try:
             result = self._session_runner(
                 prompt=prepared.prompt,
@@ -256,18 +323,57 @@ class SequentialExecutionCoordinator:
                 snapshot_dirs=snapshot_dirs,
                 lifecycle=SessionLifecycleCallbacks(process_started, session_identified),
             )
+            usage = _session_usage(result)
+            finalize_invocation(runtime_session_id=result.session_id, usage=usage)
             if current.dispatch.runtime_session_id != result.session_id:
                 raise ExecutionCoordinatorError(
                     "adapter result session does not match the durable running dispatch"
                 )
             payload = _worker_json_object(result.chat_response)
-            usage = _session_usage(result)
             if current.dispatch.role_kind == "executor":
                 proposal = parse_executor_proposal(payload)
                 proposal_snapshot = self.workflow.record_executor_proposal(current, proposal)
                 authoritative_verification: tuple[AuthoritativeVerification, ...] = ()
                 if proposal.outcome == "completed":
                     authoritative_verification = self._run_authoritative_verification(current)
+                    if any(item.status != "passed" for item in authoritative_verification):
+                        record, generation = self.workflow.record_executor_verification_failure(
+                            current,
+                            proposal,
+                            authoritative_verification=authoritative_verification,
+                            usage=usage,
+                            verified_snapshot=proposal_snapshot,
+                        )
+                        if record.state is not RunStatus.RUNNING:
+                            return WorkerOutcome(
+                                record,
+                                generation,
+                                current.dispatch.dispatch_id,
+                                "",
+                            )
+                        if record.steps[current.dispatch.step_id].state is StepStatus.READY:
+                            retry = self.workflow.prepare_pending_verification_retry(
+                                record,
+                                generation,
+                            )
+                            if isinstance(retry, PreparedDispatch):
+                                return self.execute_worker(retry)
+                            if isinstance(retry, tuple):
+                                waiting, waiting_generation = retry
+                                return WorkerOutcome(
+                                    waiting,
+                                    waiting_generation,
+                                    current.dispatch.dispatch_id,
+                                    "",
+                                )
+                        raise WorkerResultValidationError(
+                            "dispatcher-owned verification failed: "
+                            + ", ".join(
+                                item.check_id
+                                for item in authoritative_verification
+                                if item.status != "passed"
+                            )
+                        )
                 record, generation, forwarding = self.workflow.materialize_executor_proposal(
                     current,
                     proposal,
@@ -279,7 +385,49 @@ class SequentialExecutionCoordinator:
                 parsed_review = parse_reviewer_result(payload)
                 authoritative_verification = ()
                 if parsed_review.verdict == "accepted":
+                    review_snapshot = self.workflow.inspect_reviewer_result(
+                        current,
+                        parsed_review,
+                    )
                     authoritative_verification = self._run_authoritative_verification(current)
+                    if any(item.status != "passed" for item in authoritative_verification):
+                        record, generation = self.workflow.record_reviewer_verification_failure(
+                            current,
+                            parsed_review,
+                            authoritative_verification=authoritative_verification,
+                            usage=usage,
+                            verified_snapshot=review_snapshot,
+                        )
+                        if record.state is not RunStatus.RUNNING:
+                            return WorkerOutcome(
+                                record,
+                                generation,
+                                current.dispatch.dispatch_id,
+                                "",
+                            )
+                        if record.steps[current.dispatch.step_id].state is StepStatus.READY:
+                            retry = self.workflow.prepare_pending_verification_retry(
+                                record,
+                                generation,
+                            )
+                            if isinstance(retry, PreparedDispatch):
+                                return self.execute_worker(retry)
+                            if isinstance(retry, tuple):
+                                waiting, waiting_generation = retry
+                                return WorkerOutcome(
+                                    waiting,
+                                    waiting_generation,
+                                    current.dispatch.dispatch_id,
+                                    "",
+                                )
+                        raise WorkerResultValidationError(
+                            "fresh post-review dispatcher verification failed: "
+                            + ", ".join(
+                                item.check_id
+                                for item in authoritative_verification
+                                if item.status != "passed"
+                            )
+                        )
                 record, generation, forwarding = self.workflow.apply_reviewer_result(
                     current,
                     parsed_review,
@@ -288,6 +436,14 @@ class SequentialExecutionCoordinator:
                 )
         except OpenCodeAdapterError as exc:
             failure_category, failure_detail = _worker_failure(exc)
+            if not invocation_finalized:
+                finalize_invocation(
+                    runtime_session_id=(
+                        exc.runtime_session_id or current.dispatch.runtime_session_id
+                    ),
+                    usage=_adapter_error_usage(exc),
+                    failure_category=failure_category,
+                )
             stored, stored_generation = self.store.load_run(current.run_id)
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
@@ -317,6 +473,12 @@ class SequentialExecutionCoordinator:
             raise
         except Exception as exc:
             failure_category, failure_detail = _worker_failure(exc)
+            if not invocation_finalized:
+                finalize_invocation(
+                    runtime_session_id=current.dispatch.runtime_session_id,
+                    usage=None,
+                    failure_category=failure_category,
+                )
             stored, stored_generation = self.store.load_run(current.run_id)
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
@@ -340,17 +502,6 @@ class SequentialExecutionCoordinator:
         self.heartbeat()
         results = self._verification_runner(step, Path(prepared.workdir))
         self.heartbeat()
-        failed = [result.check_id for result in results if result.status != "passed"]
-        if failed:
-            raise WorkerResultValidationError(
-                "dispatcher-owned verification failed: "
-                + ", ".join(
-                    f"{result.check_id}(exit={result.exit_code}, timeout={result.timed_out}, "
-                    f"truncated={result.output_truncated}, summary={result.summary})"
-                    for result in results
-                    if result.status != "passed"
-                )
-            )
         return results
 
     def execute_batch(self, prepared: PreparedBatch) -> BatchOutcome:
@@ -494,10 +645,43 @@ class SequentialExecutionCoordinator:
                     dispatch_id,
                 )
             supervisor_session_id: str | None = None
-            supervisor_prompt, pending_acknowledgements = self._continuation_prompt(
-                bootstrap,
+            verification_retry = self.workflow.prepare_pending_verification_retry(
                 record,
+                generation,
             )
+            if isinstance(verification_retry, tuple):
+                waiting, waiting_generation = verification_retry
+                report_path = self.store.export_run_report(
+                    run_id,
+                    record_override=waiting,
+                    generation_override=waiting_generation,
+                )
+                return CompletionDecision(
+                    accepted=False,
+                    obligations=(f"run stopped by policy: {waiting.state.value}",),
+                    report_path=report_path,
+                )
+            if isinstance(verification_retry, PreparedDispatch):
+                worker = self.execute_worker(verification_retry)
+                record = worker.record
+                generation = worker.generation
+                if record.state is not RunStatus.RUNNING:
+                    return CompletionDecision(
+                        accepted=False,
+                        obligations=(f"run stopped by policy: {record.state.value}",),
+                        report_path=self.store.export_run_report(
+                            run_id,
+                            record_override=record,
+                            generation_override=generation,
+                        ),
+                    )
+                supervisor_prompt = worker.forwarding
+                pending_acknowledgements = [worker.dispatch_id]
+            else:
+                supervisor_prompt, pending_acknowledgements = self._continuation_prompt(
+                    bootstrap,
+                    record,
+                )
             for _turn in range(max_turns):
                 supervisor = self.run_supervisor_turn(
                     run_id,
@@ -528,7 +712,11 @@ class SequentialExecutionCoordinator:
                         return CompletionDecision(
                             accepted=False,
                             obligations=(f"run stopped by policy: {worker.record.state.value}",),
-                            report_path=None,
+                            report_path=self.store.export_run_report(
+                                run_id,
+                                record_override=worker.record,
+                                generation_override=worker.generation,
+                            ),
                         )
                     supervisor_prompt = worker.forwarding
                     pending_acknowledgements = [worker.dispatch_id]
@@ -540,7 +728,11 @@ class SequentialExecutionCoordinator:
                         return CompletionDecision(
                             accepted=False,
                             obligations=(f"run stopped by batch policy: {batch.record.state.value}",),
-                            report_path=None,
+                            report_path=self.store.export_run_report(
+                                run_id,
+                                record_override=batch.record,
+                                generation_override=batch.generation,
+                            ),
                         )
                     supervisor_prompt = batch.forwarding
                     pending_acknowledgements = list(batch.forwarded_dispatch_ids)
@@ -702,13 +894,38 @@ def _session_usage(result: SessionResult) -> dict[str, object] | None:
     if result.cost is None:
         return None
     tokens = result.usage
-    return {
+    usage = {
         "cost_usd": result.cost,
         "tokens_total": tokens.get("total"),
         "tokens_input": tokens.get("input"),
         "tokens_output": tokens.get("output"),
         "tokens_reasoning": tokens.get("reasoning"),
     }
+    return usage if _complete_usage(usage) else None
+
+
+def _adapter_error_usage(error: OpenCodeAdapterError) -> dict[str, object] | None:
+    if error.cost is None or error.usage is None:
+        return None
+    usage = {
+        "cost_usd": error.cost,
+        "tokens_total": error.usage.get("total"),
+        "tokens_input": error.usage.get("input"),
+        "tokens_output": error.usage.get("output"),
+        "tokens_reasoning": error.usage.get("reasoning"),
+    }
+    return usage if _complete_usage(usage) else None
+
+
+def _complete_usage(usage: dict[str, object]) -> bool:
+    def complete_token(key: str) -> bool:
+        value = usage[key]
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    return all(
+        complete_token(key)
+        for key in ("tokens_total", "tokens_input", "tokens_output", "tokens_reasoning")
+    )
 
 
 def _worker_failure(exc: BaseException) -> tuple[str, str]:

@@ -4,6 +4,10 @@ The SQLite database at `state.directory/dispatcher.sqlite3` is authoritative.
 Reports, audit JSONL, transcripts, and support bundles are derived artifacts.
 Never edit or delete the database manually.
 
+OpenCode worker sessions use isolated HOME/XDG state and are not visible to a
+normal `opencode -s` command. See [`session-inspection.md`](session-inspection.md)
+for safe export, TUI inspection, state-root, and credential-handling guidance.
+
 ## Preflight
 
 ```bash
@@ -170,6 +174,13 @@ contains `*` or `?`, and repository, role-class, concrete-role, and step policy
 cannot add or override a command. Reviewers inspect the immutable repository,
 fixed check source, executor result, and evidence; they report remediation for
 an executor and do not run tests.
+
+The supervisor supplies semantic routing and rework decisions while the
+dispatcher adds exact paths, checks, hashes, permissions, evidence requirements,
+session lineage, and response schemas. Straightforward runs do not inherently
+require the most expensive supervisor model, but any configured replacement
+should first prove strict command conformance and state-sensitive rework behavior
+through deterministic fixtures and a bounded smoke scenario.
 
 | Exact command | Intended diagnostic property |
 |---|---|

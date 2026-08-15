@@ -33,6 +33,8 @@ from .workflow import (
     RunStatus,
     StepStatus,
     TransitionEvent,
+    UsageAmount,
+    UsageLedger,
     WorkspaceGroup,
     WorkspaceGroupStatus,
     transition_run,
@@ -40,7 +42,7 @@ from .workflow import (
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -534,6 +536,27 @@ class StateStore:
                 connection.execute(
                     "DELETE FROM leases WHERE resource_key = ? AND owner_id = ?", (key, owner_id)
                 )
+
+    def release_interrupted_dispatch_leases(
+        self,
+        run_id: str,
+        resource_keys: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Release orphaned worker locks after recovery has acquired the run lease."""
+        keys = tuple(sorted(set(resource_keys)))
+        if not keys:
+            return ()
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            released: list[str] = []
+            for key in keys:
+                cursor = connection.execute(
+                    "DELETE FROM leases WHERE run_id = ? AND resource_key = ?",
+                    (run_id, key),
+                )
+                if cursor.rowcount:
+                    released.append(key)
+        return tuple(released)
 
     def prepare_dispatch(
         self,
@@ -1098,6 +1121,265 @@ class StateStore:
                     else None
                 ),
             )
+
+    def begin_opencode_invocation(
+        self,
+        *,
+        invocation_id: str,
+        run_id: str,
+        dispatch_id: str | None,
+        role_kind: str,
+        role_key: str,
+        step_id: str | None,
+        session_mode: str,
+        requested_session_id: str | None,
+    ) -> None:
+        """Persist one unique OpenCode invocation identity before process launch."""
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            existing = connection.execute(
+                "SELECT * FROM opencode_invocations WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            expected = (
+                run_id,
+                dispatch_id,
+                role_kind,
+                role_key,
+                step_id,
+                session_mode,
+                requested_session_id,
+            )
+            if existing is not None:
+                actual = tuple(
+                    existing[key]
+                    for key in (
+                        "run_id",
+                        "dispatch_id",
+                        "role_kind",
+                        "role_key",
+                        "step_id",
+                        "session_mode",
+                        "requested_session_id",
+                    )
+                )
+                if actual != expected:
+                    raise StateStoreConflictError(
+                        f"OpenCode invocation identity conflict: {invocation_id}"
+                    )
+                raise RecoveryRequiredError(
+                    f"OpenCode invocation {invocation_id} already exists in "
+                    f"{existing['lifecycle']} state; automatic relaunch is forbidden"
+                )
+            connection.execute(
+                """
+                INSERT INTO opencode_invocations(
+                    invocation_id, run_id, dispatch_id, role_kind, role_key, step_id,
+                    session_mode, requested_session_id, lifecycle, usage_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', 'PENDING', ?)
+                """,
+                (
+                    invocation_id,
+                    run_id,
+                    dispatch_id,
+                    role_kind,
+                    role_key,
+                    step_id,
+                    session_mode,
+                    requested_session_id,
+                    _utc_now(),
+                ),
+            )
+
+    def finish_opencode_invocation(
+        self,
+        *,
+        invocation_id: str,
+        runtime_session_id: str | None,
+        usage: Mapping[str, object] | None,
+        failure_category: str | None = None,
+    ) -> tuple[RunRecord, int]:
+        """Finalize and account one invocation exactly once before result parsing."""
+        amount = UsageAmount.model_validate(usage) if usage is not None else None
+        usage_json = amount.model_dump_json() if amount is not None else None
+        lifecycle = "FAILED" if failure_category is not None else "SUCCEEDED"
+        usage_status = "COMPLETE" if amount is not None else "MISSING"
+        sessions: Mapping[str, Mapping[str, Mapping[str, Any]]]
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            invocation = connection.execute(
+                "SELECT * FROM opencode_invocations WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if invocation is None:
+                raise StateStoreError(f"OpenCode invocation not found: {invocation_id}")
+            if invocation["lifecycle"] != "PREPARED":
+                if (
+                    invocation["lifecycle"] == lifecycle
+                    and invocation["usage_status"] == usage_status
+                    and invocation["usage_json"] == usage_json
+                    and invocation["runtime_session_id"] == runtime_session_id
+                    and invocation["failure_category"] == failure_category
+                ):
+                    row = connection.execute(
+                        "SELECT record_json, generation FROM runs WHERE run_id = ?",
+                        (invocation["run_id"],),
+                    ).fetchone()
+                    if row is None:
+                        raise StateStoreError("invocation references a missing run")
+                    return RunRecord.model_validate_json(row["record_json"]), int(
+                        row["generation"]
+                    )
+                raise StateStoreConflictError(
+                    f"OpenCode invocation was already finalized differently: {invocation_id}"
+                )
+            run_row = connection.execute(
+                "SELECT record_json, generation FROM runs WHERE run_id = ?",
+                (invocation["run_id"],),
+            ).fetchone()
+            if run_row is None:
+                raise StateStoreError("invocation references a missing run")
+            record = RunRecord.model_validate_json(run_row["record_json"])
+            generation = int(run_row["generation"])
+            if amount is not None:
+                session_key = (
+                    runtime_session_id
+                    or invocation["requested_session_id"]
+                    or invocation_id
+                )
+                ledger = record.usage
+                by_step = dict(ledger.by_step)
+                if invocation["step_id"] is not None:
+                    by_step[str(invocation["step_id"])] = _sum_usage(
+                        by_step.get(str(invocation["step_id"]), UsageAmount()),
+                        amount,
+                    )
+                by_role = dict(ledger.by_role)
+                by_role[str(invocation["role_key"])] = _sum_usage(
+                    by_role.get(str(invocation["role_key"]), UsageAmount()),
+                    amount,
+                )
+                by_session = dict(ledger.by_session)
+                by_session[str(session_key)] = _sum_usage(
+                    by_session.get(str(session_key), UsageAmount()),
+                    amount,
+                )
+                record = record.model_copy(
+                    update={
+                        "usage": UsageLedger(
+                            run=_sum_usage(ledger.run, amount),
+                            by_step=by_step,
+                            by_role=by_role,
+                            by_session=by_session,
+                        )
+                    }
+                )
+            session_rows = connection.execute(
+                "SELECT pool, role_key, session_json FROM sessions WHERE run_id = ?",
+                (record.run_id,),
+            ).fetchall()
+            mutable_sessions: dict[str, dict[str, Mapping[str, Any]]] = {}
+            for session_row in session_rows:
+                mutable_sessions.setdefault(str(session_row["pool"]), {})[
+                    str(session_row["role_key"])
+                ] = json.loads(session_row["session_json"])
+            sessions = mutable_sessions
+            generation += 1
+            self._write_snapshot(
+                connection,
+                record,
+                generation=generation,
+                sessions=sessions,
+            )
+            connection.execute(
+                """
+                UPDATE opencode_invocations
+                SET runtime_session_id = ?, lifecycle = ?, usage_status = ?, usage_json = ?,
+                    failure_category = ?, finished_at = ?
+                WHERE invocation_id = ? AND lifecycle = 'PREPARED'
+                """,
+                (
+                    runtime_session_id,
+                    lifecycle,
+                    usage_status,
+                    usage_json,
+                    failure_category,
+                    _utc_now(),
+                    invocation_id,
+                ),
+            )
+        self._secure_database_files()
+        return record, generation
+
+    def invocation_usage_for_dispatch(
+        self,
+        run_id: str,
+        dispatch_id: str,
+    ) -> tuple[UsageAmount | None, str | None]:
+        """Return exact incremental usage and coverage for one worker invocation."""
+        row = self._ready_connection().execute(
+            """
+            SELECT usage_json, usage_status FROM opencode_invocations
+            WHERE run_id = ? AND dispatch_id = ?
+            """,
+            (run_id, dispatch_id),
+        ).fetchone()
+        if row is None:
+            return None, None
+        amount = UsageAmount.model_validate_json(row["usage_json"]) if row["usage_json"] else None
+        return amount, str(row["usage_status"])
+
+    def opencode_invocations_for_run(self, run_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Return sanitized invocation accounting rows in deterministic order."""
+        rows = self._ready_connection().execute(
+            """
+            SELECT invocation_id, dispatch_id, role_kind, role_key, step_id, session_mode,
+                   runtime_session_id, lifecycle, usage_status, usage_json,
+                   failure_category, created_at, finished_at
+            FROM opencode_invocations WHERE run_id = ?
+            ORDER BY created_at, invocation_id
+            """,
+            (run_id,),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def prepared_opencode_invocations_for_run(self, run_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Return invocation records left unfinished by an interrupted owner."""
+        rows = self._ready_connection().execute(
+            """
+            SELECT invocation_id, dispatch_id, role_kind, role_key, step_id, session_mode,
+                   runtime_session_id, lifecycle, usage_status, usage_json,
+                   failure_category, created_at, finished_at
+            FROM opencode_invocations
+            WHERE run_id = ? AND lifecycle = 'PREPARED'
+            ORDER BY created_at, invocation_id
+            """,
+            (run_id,),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def finalize_prepared_opencode_invocations(
+        self,
+        run_id: str,
+        *,
+        failure_category: str = "interrupted",
+        invocation_ids: Iterable[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Close abandoned pre-launch journals without inventing usage measurements."""
+        allowed_ids = set(invocation_ids) if invocation_ids is not None else None
+        invocation_ids = tuple(
+            str(invocation["invocation_id"])
+            for invocation in self.prepared_opencode_invocations_for_run(run_id)
+            if allowed_ids is None or str(invocation["invocation_id"]) in allowed_ids
+        )
+        for invocation_id in invocation_ids:
+            self.finish_opencode_invocation(
+                invocation_id=invocation_id,
+                runtime_session_id=None,
+                usage=None,
+                failure_category=failure_category,
+            )
+        return invocation_ids
 
     def record_executor_proposal(
         self,
@@ -1939,13 +2221,66 @@ class StateStore:
                 f"| `{scope}` | {usage.cost_usd:.6f} | {usage.tokens_total} | {usage.tokens_input} | "
                 f"{usage.tokens_output} | {usage.tokens_reasoning} |"
             )
+        invocations = self.opencode_invocations_for_run(record.run_id)
+        complete_invocations = [
+            invocation for invocation in invocations if invocation["usage_status"] == "COMPLETE"
+        ]
+        invocation_total = UsageAmount()
+        for invocation in complete_invocations:
+            raw_usage = invocation["usage_json"]
+            if raw_usage:
+                invocation_total = _sum_usage(
+                    invocation_total,
+                    UsageAmount.model_validate_json(raw_usage),
+                )
+        missing_count = sum(
+            invocation["usage_status"] == "MISSING" for invocation in invocations
+        )
+        pending_count = sum(
+            invocation["usage_status"] == "PENDING" for invocation in invocations
+        )
+        lines.extend(
+            [
+                "",
+                "## Invocation Usage Coverage",
+                "",
+                "Usage is incremental per OpenCode invocation. Missing or unfinished provider usage "
+                "is unknown and is not reported as zero.",
+                "",
+                f"- Invocation records: `{len(invocations)}`",
+                f"- Complete usage records: `{len(complete_invocations)}`",
+                f"- Missing usage records: `{missing_count}`",
+                f"- Pending usage records: `{pending_count}`",
+                "- OpenCode cumulative session metadata: `unavailable` (the adapter records "
+                "incremental invocation events)",
+                f"- Ledger delta not represented by complete invocation rows: "
+                f"`{_usage_delta_text(record.usage.run, invocation_total)}`",
+                "",
+                "| Invocation | Role | Step | Dispatch | Mode | Lifecycle | Usage coverage | "
+                "Cost USD | Tokens | Session |",
+                "|---|---|---|---|---|---|---|---:|---:|---|",
+            ]
+        )
+        for invocation in invocations:
+            raw_usage = invocation["usage_json"]
+            amount = UsageAmount.model_validate_json(raw_usage) if raw_usage else None
+            cost = f"{amount.cost_usd:.6f}" if amount is not None else "unknown"
+            tokens = str(amount.tokens_total) if amount is not None else "unknown"
+            lines.append(
+                f"| `{invocation['invocation_id']}` | "
+                f"`{invocation['role_kind']}:{invocation['role_key']}` | "
+                f"`{invocation['step_id'] or ''}` | `{invocation['dispatch_id'] or ''}` | "
+                f"`{invocation['session_mode']}` | `{invocation['lifecycle']}` | "
+                f"`{invocation['usage_status']}` | {cost} | {tokens} | "
+                f"`{invocation['runtime_session_id'] or ''}` |"
+            )
         lines.extend(
             [
                 "",
                 "## Dispatches",
                 "",
-                "| Dispatch | State | Attempt | Session | Result revision |",
-                "|---|---|---:|---|---|",
+                "| Dispatch | Role | State | Attempt | Session | Result revision |",
+                "|---|---|---|---:|---|---|",
             ]
         )
         for dispatch in sorted(record.dispatches.values(), key=lambda value: value.dispatch_id):
@@ -1960,9 +2295,76 @@ class StateStore:
                 if isinstance(repository, dict):
                     revision = str(repository.get("result_revision") or repository.get("patch_sha256") or "")
             lines.append(
-                f"| `{dispatch.dispatch_id}` | `{dispatch.state.value}` | {dispatch.attempt} | "
+                f"| `{dispatch.dispatch_id}` | `{dispatch.role_kind}:{dispatch.role_key}` | "
+                f"`{dispatch.state.value}` | {dispatch.attempt} | "
                 f"`{dispatch.runtime_session_id or ''}` | `{revision}` |"
             )
+        lines.extend(
+            [
+                "",
+                "## Authoritative Verification",
+                "",
+                "Executor-time checks validate the proposed tree before commit. Acceptance-time "
+                "checks rerun after an accepted review.",
+                "",
+                "| Dispatch | Phase | Check | Status | Backend | Transcript SHA-256 | Summary |",
+                "|---|---|---|---|---|---|---|",
+            ]
+        )
+        verification_rows = self._ready_connection().execute(
+            """
+            SELECT dispatch_id, authoritative_verification_json
+            FROM dispatch_payloads
+            WHERE run_id = ? AND authoritative_verification_json IS NOT NULL
+            ORDER BY dispatch_id
+            """,
+            (record.run_id,),
+        ).fetchall()
+        for verification_row in verification_rows:
+            dispatch = record.dispatches[str(verification_row["dispatch_id"])]
+            phase = "executor-time" if dispatch.role_kind == "executor" else "acceptance-time"
+            verification_items = json.loads(
+                str(verification_row["authoritative_verification_json"])
+            )
+            for item in verification_items:
+                if not isinstance(item, dict):
+                    continue
+                summary = redact_text(str(item.get("summary", ""))).replace("|", "\\|")
+                summary = " ".join(summary.splitlines())
+                lines.append(
+                    f"| `{dispatch.dispatch_id}` | `{phase}` | `{item.get('check_id', '')}` | "
+                    f"`{item.get('status', '')}` | `{item.get('backend', '')}` | "
+                    f"`{item.get('transcript_sha256', '')}` | "
+                    f"{summary} |"
+                )
+        sessions = self.sessions_for_run(record.run_id)
+        lines.extend(
+            [
+                "",
+                "## Session Inspection",
+                "",
+                "OpenCode sessions use isolated HOME/XDG state. A normal `opencode -s` invocation "
+                "cannot find them. See `docs/session-inspection.md` for safe export and TUI commands.",
+                "",
+                "| Role | Session | Working directory | State root | Event logs |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for pool, role_entries in sorted(sessions.items()):
+            for role_key, session in sorted(role_entries.items()):
+                if pool == "supervisor":
+                    state_root = "."
+                    event_logs = "opencode-events"
+                else:
+                    state_root = str(
+                        Path("opencode-dispatches") / record.run_id / pool / role_key
+                    )
+                    event_logs = str(Path(state_root) / "opencode-events")
+                lines.append(
+                    f"| `{pool}:{session.get('role_key', role_key)}` | "
+                    f"`{session.get('session_id', '')}` | "
+                    f"`{session.get('working_directory', '')}` | `{state_root}` | `{event_logs}` |"
+                )
         lines.extend(["", "## Batches", "", "| Batch | State | Children | Failed children |", "|---|---|---|---|"])
         for batch in sorted(record.batches.values(), key=lambda value: value.batch_id):
             lines.append(
@@ -2038,9 +2440,12 @@ class StateStore:
                 continue
             result = json.loads(payload_row["result_json"])
             for evidence in result.get("evidence", []) if isinstance(result, dict) else []:
+                if not isinstance(evidence, dict):
+                    continue
                 lines.append(
-                    f"| `{payload_row['dispatch_id']}` | `{evidence['artifact_id']}` | "
-                    f"`{evidence['relative_path']}` | `{evidence['sha256']}` |"
+                    f"| `{payload_row['dispatch_id']}` | `{evidence.get('artifact_id', '')}` | "
+                    f"`{evidence.get('relative_path', '')}` | "
+                    f"`{evidence.get('sha256', 'unavailable')}` |"
                 )
         lines.extend(
             [
@@ -2158,6 +2563,9 @@ class StateStore:
             version = 6
         if version == 6:
             self._apply_v7(connection)
+            version = 7
+        if version == 7:
+            self._apply_v8(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -2403,6 +2811,37 @@ class StateStore:
             CREATE INDEX structured_git_recovery
                 ON structured_git_commits(run_id, state);
             INSERT INTO schema_migrations(version, applied_at) VALUES (7, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
+    def _apply_v8(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE opencode_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                dispatch_id TEXT,
+                role_kind TEXT NOT NULL CHECK(role_kind IN ('supervisor', 'executor', 'reviewer')),
+                role_key TEXT NOT NULL,
+                step_id TEXT,
+                session_mode TEXT NOT NULL CHECK(session_mode IN ('new', 'resume', 'fork')),
+                requested_session_id TEXT,
+                runtime_session_id TEXT,
+                lifecycle TEXT NOT NULL CHECK(lifecycle IN ('PREPARED', 'SUCCEEDED', 'FAILED')),
+                usage_status TEXT NOT NULL CHECK(usage_status IN ('PENDING', 'COMPLETE', 'MISSING')),
+                usage_json TEXT,
+                failure_category TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                UNIQUE(run_id, dispatch_id),
+                FOREIGN KEY(run_id, dispatch_id)
+                    REFERENCES dispatches(run_id, dispatch_id) ON DELETE CASCADE
+            );
+            CREATE INDEX opencode_invocations_run
+                ON opencode_invocations(run_id, created_at, invocation_id);
+            INSERT INTO schema_migrations(version, applied_at) VALUES (8, '{_utc_now()}');
             COMMIT;
             """
         )
@@ -2655,6 +3094,26 @@ class StateStore:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _sum_usage(left: UsageAmount, right: UsageAmount) -> UsageAmount:
+    return UsageAmount(
+        cost_usd=left.cost_usd + right.cost_usd,
+        tokens_total=left.tokens_total + right.tokens_total,
+        tokens_input=left.tokens_input + right.tokens_input,
+        tokens_output=left.tokens_output + right.tokens_output,
+        tokens_reasoning=left.tokens_reasoning + right.tokens_reasoning,
+    )
+
+
+def _usage_delta_text(ledger: UsageAmount, invocation_total: UsageAmount) -> str:
+    return (
+        f"cost_usd={ledger.cost_usd - invocation_total.cost_usd:.6f}, "
+        f"tokens_total={ledger.tokens_total - invocation_total.tokens_total}, "
+        f"tokens_input={ledger.tokens_input - invocation_total.tokens_input}, "
+        f"tokens_output={ledger.tokens_output - invocation_total.tokens_output}, "
+        f"tokens_reasoning={ledger.tokens_reasoning - invocation_total.tokens_reasoning}"
+    )
 
 
 def _json_text(value: object) -> str:

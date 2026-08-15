@@ -25,7 +25,7 @@ from dispatcher.permissions import (
 )
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.protocol import parse_supervisor_command
-from dispatcher.repository import EvidenceManifestEntry, RepositorySnapshot
+from dispatcher.repository import EvidenceManifestEntry, RepositoryChange, RepositorySnapshot
 from dispatcher.results import (
     EXECUTOR_OUTCOME_OPTIONS,
     EXECUTOR_PROPOSAL_OUTCOME_OPTIONS,
@@ -46,7 +46,9 @@ from dispatcher.sequential import (
     _validate_result_verification,
 )
 from dispatcher.state_store import StateStore
+from dispatcher.verification import AuthoritativeVerification
 from dispatcher.workflow import (
+    DispatchStatus,
     OperatorRequest,
     RunRecord,
     RunStatus,
@@ -193,6 +195,60 @@ def _repository_snapshot() -> RepositorySnapshot:
         git_metadata_sha256="d" * 64,
         git_refs_sha256="e" * 64,
         manifest_sha256="c" * 64,
+    )
+
+
+def _dirty_snapshot(clean: RepositorySnapshot, *, marker: str) -> RepositorySnapshot:
+    return clean.model_copy(
+        update={
+            "clean": False,
+            "changes": (
+                RepositoryChange(
+                    change_type="modified",
+                    paths=("evidence/fixture.md",),
+                    index_status=" ",
+                    worktree_status="M",
+                ),
+            ),
+            "dirty_patch_sha256": marker * 64,
+            "manifest_sha256": marker * 64,
+        }
+    )
+
+
+def _failed_authoritative_verification(
+    *,
+    summary: str = "fixture assertion failed",
+    transcript_marker: str = "c",
+) -> tuple[AuthoritativeVerification, ...]:
+    return (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="failed",
+            argv=("python", "-c", "raise SystemExit(1)"),
+            exit_code=1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            transcript_sha256=transcript_marker * 64,
+            duration_ms=5,
+            backend="fixture-isolation",
+            summary=summary,
+        ),
+    )
+
+
+def _passed_authoritative_verification() -> tuple[AuthoritativeVerification, ...]:
+    failed = _failed_authoritative_verification()[0]
+    return (
+        failed.model_copy(
+            update={
+                "status": "passed",
+                "exit_code": 0,
+                "summary": "fixture assertion passed",
+            }
+        ),
     )
 
 
@@ -402,6 +458,52 @@ def _prepare_reviewer(
     return store, workflow, reviewer
 
 
+def _prepare_verification_feedback_executor(
+    project: FixtureProject,
+    *,
+    max_executor_attempts: int,
+    authorized_actions: tuple[str, ...] = ("inspect", "modify", "commit"),
+) -> tuple[
+    StateStore,
+    SequentialWorkflow,
+    PreparedDispatch,
+    RepositorySnapshot,
+    dict[str, RepositorySnapshot],
+]:
+    store = _store(project)
+    record = _record(
+        project,
+        review_required=True,
+        max_executor_attempts=max_executor_attempts,
+        authorized_actions=authorized_actions,
+    )
+    generation = store.create_run(record)
+    clean = _repository_snapshot()
+    current = {"snapshot": _dirty_snapshot(clean, marker="f")}
+
+    def inspect(_config, _repo_id, *, require_clean):
+        return clean if require_clean else current["snapshot"]
+
+    workflow = SequentialWorkflow(
+        project.config,
+        store,
+        owner_id="verification-feedback-fixture-owner",
+        repository_inspector=inspect,
+    )
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    prepared = workflow.record_session_id(
+        workflow.mark_running(prepared, process_id=1234, process_create_time=1234.0),
+        runtime_session_id="ses-verification-feedback",
+    )
+    return store, workflow, prepared, clean, current
+
+
 def _role_scope_project(tmp_path: Path, *, scheduling: str) -> FixtureProject:
     tmp_path.mkdir(parents=True, exist_ok=True)
     project = create_fixture_project(tmp_path)
@@ -458,12 +560,18 @@ def test_bootstrap_is_self_contained_and_persisted(project: FixtureProject) -> N
     examples = re.findall(r"```json\n(.*?)\n```", bootstrap, flags=re.DOTALL)
     assert len(examples) == 2
     assert all(parse_supervisor_command(example) for example in examples)
+    dispatch = parse_supervisor_command(examples[0])
+    assert dispatch.action == "dispatch"
+    assert "dispatcher.executor_proposal.v2" in dispatch.prompt
+    assert "schema-v1 executor result" not in dispatch.prompt
     assert "## Observation Capabilities" in bootstrap
     assert all(f"`{tool}`" in bootstrap for tool in READ_ONLY_NATIVE_TOOLS)
     assert all(f"`{command}`" in bootstrap for command in READ_ONLY_DIAGNOSTIC_COMMANDS)
     assert "MCP tools: none" in bootstrap
     assert "Do not create, edit, stage, commit, delete" in bootstrap
     assert "Reply with exactly one schema-v1 JSON command object" in bootstrap
+    assert "name the exact bounded" in bootstrap
+    assert "normative source files or source IDs" in bootstrap
 
 
 def test_worker_prompt_lists_exact_schema_discriminator_options(project: FixtureProject) -> None:
@@ -713,6 +821,805 @@ def test_worker_attention_examples_are_valid_result_instances(project: FixturePr
     }
 
 
+def test_failed_authoritative_verification_resumes_same_executor_with_feedback(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(
+        project,
+        review_required=True,
+        max_executor_attempts=2,
+        authorized_actions=("inspect", "modify", "commit"),
+    )
+    generation = store.create_run(record)
+    clean = _repository_snapshot()
+    dirty = clean.model_copy(
+        update={
+            "clean": False,
+            "changes": (
+                RepositoryChange(
+                    change_type="modified",
+                    paths=("evidence/fixture.md",),
+                    index_status=" ",
+                    worktree_status="M",
+                ),
+            ),
+            "dirty_patch_sha256": "f" * 64,
+            "manifest_sha256": "1" * 64,
+        }
+    )
+
+    def inspect(_config, _repo_id, *, require_clean):
+        return clean if require_clean else dirty
+
+    workflow = SequentialWorkflow(
+        project.config,
+        store,
+        owner_id="verification-feedback-owner",
+        repository_inspector=inspect,
+    )
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    prepared = workflow.mark_running(prepared, process_id=1234, process_create_time=1234.0)
+    prepared = workflow.record_session_id(prepared, runtime_session_id="ses-verification-feedback")
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    assert proposal.outcome == "completed"
+    proposal_snapshot = workflow.record_executor_proposal(prepared, proposal)
+    verification = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="failed",
+            argv=("python", "-c", "raise SystemExit(1)"),
+            exit_code=1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            transcript_sha256="c" * 64,
+            duration_ms=5,
+            backend="fixture-isolation",
+            summary="fixture assertion failed",
+        ),
+    )
+
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=proposal_snapshot,
+    )
+
+    failed_dispatch = failed.dispatches[prepared.dispatch.dispatch_id]
+    assert failed_dispatch.state.value == "FAILED"
+    assert failed_dispatch.failure_category == "authoritative_verification"
+    assert failed.steps[prepared.dispatch.step_id].state is StepStatus.READY
+    assert store.load_dispatch_payload(
+        failed.run_id, prepared.dispatch.dispatch_id
+    ).authoritative_verification == tuple(item.model_dump(mode="json") for item in verification)
+    assert store.load_dispatch_payload(
+        failed.run_id, prepared.dispatch.dispatch_id
+    ).repository_after == dirty.model_dump(mode="json")
+    assert not store.leases_for_run(failed.run_id)
+    store.close()
+
+    recovered_store = _store(project)
+    persisted, persisted_generation = recovered_store.load_run(failed.run_id)
+    recovered_workflow = SequentialWorkflow(
+        project.config,
+        recovered_store,
+        owner_id="verification-feedback-recovery-owner",
+        repository_inspector=inspect,
+    )
+    retry = recovered_workflow.prepare_pending_verification_retry(
+        persisted,
+        persisted_generation,
+    )
+    assert retry is not None
+    retry_context = json.loads(retry.prompt)
+    assert retry.session_mode == "resume"
+    assert retry.session_id == "ses-verification-feedback"
+    assert retry.dispatch.attempt == 2
+    assert retry.repository_before == clean
+    assert retry_context["verification_feedback"] == [
+        item.model_dump(mode="json") for item in verification
+    ]
+    assert "dispatcher.executor_proposal.v2" in retry_context["task"]
+
+
+def test_batch_verification_failure_persists_authoritative_evidence_without_rework(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(
+        project,
+        max_executor_attempts=2,
+        authorized_actions=("inspect", "modify", "commit"),
+    )
+    generation = store.create_run(record)
+    clean = _repository_snapshot()
+    dirty = _dirty_snapshot(clean, marker="f")
+
+    def inspect(_config, _repo_id, *, require_clean):
+        return clean if require_clean else dirty
+
+    workflow = SequentialWorkflow(
+        project.config,
+        store,
+        owner_id="batch-verification-feedback-owner",
+        repository_inspector=inspect,
+    )
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    prepared = workflow.record_session_id(
+        workflow.mark_running(prepared, process_id=1234, process_create_time=1234.0),
+        runtime_session_id="ses-batch-verification-feedback",
+    )
+    stored, generation = store.load_run(prepared.run_id)
+    batched_dispatch = stored.dispatches[prepared.dispatch.dispatch_id].model_copy(
+        update={"batch_id": "batch-verification-feedback"}
+    )
+    stored = stored.model_copy(
+        update={"dispatches": {**stored.dispatches, batched_dispatch.dispatch_id: batched_dispatch}}
+    )
+    generation = store.save_run(stored, expected_generation=generation)
+    prepared = replace(prepared, generation=generation, dispatch=batched_dispatch)
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    assert proposal.outcome == "completed"
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    verification = _failed_authoritative_verification()
+
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+
+    dispatch = failed.dispatches[prepared.dispatch.dispatch_id]
+    payload = store.load_dispatch_payload(failed.run_id, dispatch.dispatch_id)
+    assert dispatch.failure_category == "authoritative_verification"
+    assert dispatch.failure_detail is not None
+    assert "backend=fixture-isolation" in dispatch.failure_detail
+    assert "transcript=" + "c" * 64 in dispatch.failure_detail
+    assert failed.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert failed.state is RunStatus.RUNNING
+    assert payload.result == proposal.model_dump(mode="json")
+    assert payload.repository_after == dirty.model_dump(mode="json")
+    assert payload.authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in verification
+    )
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
+def test_batch_verification_failure_reconciliation_never_enters_rework_loop(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(
+        project,
+        max_executor_attempts=2,
+        authorized_actions=("inspect", "modify", "commit"),
+    )
+    generation = store.create_run(record)
+    clean = _repository_snapshot()
+    dirty = _dirty_snapshot(clean, marker="f")
+
+    def inspect(_config, _repo_id, *, require_clean):
+        return clean if require_clean else dirty
+
+    workflow = SequentialWorkflow(
+        project.config,
+        store,
+        owner_id="batch-reconcile-feedback-owner",
+        repository_inspector=inspect,
+    )
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    prepared = workflow.prepare_from_supervisor(
+        active.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(),
+    )
+    assert isinstance(prepared, PreparedDispatch)
+    prepared = workflow.record_session_id(
+        workflow.mark_running(prepared, process_id=1234, process_create_time=1234.0),
+        runtime_session_id="ses-batch-reconcile-feedback",
+    )
+    stored, generation = store.load_run(prepared.run_id)
+    batched_dispatch = stored.dispatches[prepared.dispatch.dispatch_id].model_copy(
+        update={"batch_id": "batch-reconcile-feedback"}
+    )
+    stored = stored.model_copy(
+        update={"dispatches": {**stored.dispatches, batched_dispatch.dispatch_id: batched_dispatch}}
+    )
+    generation = store.save_run(stored, expected_generation=generation)
+    prepared = replace(prepared, generation=generation, dispatch=batched_dispatch)
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=_failed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+    dispatch = failed.dispatches[prepared.dispatch.dispatch_id]
+    assert failed.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+    reconciled_event = workflow._event(
+        failed,
+        "operator",
+        "operator reconciled the failed batch dispatch",
+        dispatch.dispatch_id,
+    )
+    reconciled_step = transition_step(
+        failed.steps[dispatch.step_id],
+        StepStatus.READY,
+        reconciled_event,
+    )
+    steps = dict(failed.steps)
+    steps[dispatch.step_id] = reconciled_step
+    reconciled = failed.model_copy(
+        update={
+            "steps": steps,
+            "sequence": reconciled_event.sequence,
+            "updated_at": reconciled_event.occurred_at,
+        }
+    )
+    generation = store.save_run(reconciled, expected_generation=generation)
+
+    assert workflow.prepare_pending_verification_retry(reconciled, generation) is None
+    persisted, _generation = store.load_run(failed.run_id)
+    assert persisted.state is RunStatus.RUNNING
+    assert persisted.operator_request is None
+    assert persisted.steps[dispatch.step_id].state is StepStatus.READY
+
+
+def test_verification_evidence_persists_even_when_usage_validation_fails(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared, clean, current = _prepare_verification_feedback_executor(
+        project,
+        max_executor_attempts=2,
+    )
+    store.begin_opencode_invocation(
+        invocation_id="dispatch-invocation-usage-mismatch",
+        run_id=prepared.run_id,
+        dispatch_id=prepared.dispatch.dispatch_id,
+        role_kind="executor",
+        role_key="terra",
+        step_id=prepared.dispatch.step_id,
+        session_mode="new",
+        requested_session_id=None,
+    )
+    _record, generation = store.finish_opencode_invocation(
+        invocation_id="dispatch-invocation-usage-mismatch",
+        runtime_session_id="ses-usage-mismatch",
+        usage={
+            "cost_usd": 0.1,
+            "tokens_total": 10,
+            "tokens_input": 6,
+            "tokens_output": 4,
+            "tokens_reasoning": 0,
+        },
+    )
+    prepared = replace(prepared, generation=generation)
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    verification = _failed_authoritative_verification()
+
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=verification,
+        usage={
+            "cost_usd": 0.2,
+            "tokens_total": 20,
+            "tokens_input": 12,
+            "tokens_output": 8,
+            "tokens_reasoning": 0,
+        },
+        verified_snapshot=snapshot,
+    )
+
+    persisted, _generation = store.load_run(prepared.run_id)
+    dispatch = persisted.dispatches[prepared.dispatch.dispatch_id]
+    payload = store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id)
+    assert dispatch.failure_category == "authoritative_verification"
+    assert payload.authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in verification
+    )
+    assert payload.result == proposal.model_dump(mode="json")
+    assert failed.state is RunStatus.WAITING_OPERATOR
+    assert failed.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert failed.operator_request is not None
+    assert failed.operator_request.kind == "reconciliation"
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
+def test_verification_retry_ignores_a_failure_from_an_older_executor_attempt(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared, _clean, _current = _prepare_verification_feedback_executor(
+        project,
+        max_executor_attempts=3,
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=_failed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+
+    step = failed.steps[prepared.dispatch.step_id].model_copy(update={"executor_attempts": 2})
+    stale = failed.model_copy(update={"steps": {**failed.steps, step.step_id: step}})
+    generation = store.save_run(stale, expected_generation=generation)
+
+    assert workflow.prepare_pending_verification_retry(stale, generation) is None
+    persisted, _generation = store.load_run(stale.run_id)
+    assert persisted.state is RunStatus.RUNNING
+    assert persisted.steps[step.step_id].state is StepStatus.READY
+
+
+def test_verification_retry_ignores_stale_failure_after_reviewer_changes_requested(
+    project: FixtureProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = config_values(project)
+    values["repositories"]["fixture-repo"]["commit_policy"] = "prohibited"
+    configured = replace(project, config=write_config(project, values))
+    store, workflow, prepared, _clean, _current = _prepare_verification_feedback_executor(
+        configured,
+        max_executor_attempts=3,
+        authorized_actions=("inspect", "modify"),
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    first_snapshot = workflow.record_executor_proposal(prepared, proposal)
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=_failed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=first_snapshot,
+    )
+    retry = workflow.prepare_pending_verification_retry(failed, generation)
+    assert isinstance(retry, PreparedDispatch)
+    retry = workflow.record_session_id(
+        workflow.mark_running(retry, process_id=1235, process_create_time=1235.0),
+        runtime_session_id="ses-verification-retry",
+    )
+    monkeypatch.setattr("dispatcher.sequential.working_patch_sha256", lambda _root: "a" * 64)
+    monkeypatch.setattr("dispatcher.repository.working_patch_sha256", lambda _root: "a" * 64)
+    second_proposal = parse_executor_proposal(json.loads(retry.prompt)["response_template"])
+    second_snapshot = workflow.record_executor_proposal(retry, second_proposal)
+    completed, generation, _forwarding = workflow.materialize_executor_proposal(
+        retry,
+        second_proposal,
+        authoritative_verification=_passed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=second_snapshot,
+    )
+    completed, generation = workflow.acknowledge_forwarding(
+        completed.run_id,
+        expected_generation=generation,
+        dispatch_id=retry.dispatch.dispatch_id,
+    )
+    reviewer = workflow.prepare_from_supervisor(
+        completed.run_id,
+        expected_generation=generation,
+        supervisor_text=_dispatch_command(role="reviewer"),
+    )
+    assert isinstance(reviewer, PreparedDispatch)
+    reviewer = workflow.record_session_id(
+        workflow.mark_running(reviewer, process_id=1236, process_create_time=1236.0),
+        runtime_session_id="ses-verification-retry-reviewer",
+    )
+    changes_requested = parse_reviewer_result(
+        _reviewer_result(reviewer, verdict="changes_requested"),
+    )
+    changed, generation, _forwarding = workflow.apply_reviewer_result(
+        reviewer,
+        changes_requested,
+    )
+
+    assert changed.steps[reviewer.dispatch.step_id].state is StepStatus.READY
+    assert changed.dispatches[reviewer.dispatch.dispatch_id].state is DispatchStatus.FORWARDED
+    assert workflow.prepare_pending_verification_retry(changed, generation) is None
+
+    acknowledged, generation = workflow.acknowledge_forwarding(
+        changed.run_id,
+        expected_generation=generation,
+        dispatch_id=reviewer.dispatch.dispatch_id,
+    )
+    assert acknowledged.dispatches[reviewer.dispatch.dispatch_id].state is DispatchStatus.ACKNOWLEDGED
+    assert workflow.prepare_pending_verification_retry(acknowledged, generation) is None
+
+
+def test_budgeted_verification_without_usage_requires_halt(project: FixtureProject) -> None:
+    from helpers import config_values, write_config
+
+    values = config_values(project)
+    values["budget"].update(
+        {
+            "enabled": True,
+            "max_run_cost_usd": 1.0,
+            "max_step_cost_usd": 1.0,
+            "max_context_tokens": 100,
+            "on_limit": "halt",
+        }
+    )
+    configured = replace(project, config=write_config(project, values))
+    store, workflow, prepared, _clean, _current = _prepare_verification_feedback_executor(
+        configured,
+        max_executor_attempts=2,
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=_failed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+
+    assert failed.state is RunStatus.WAITING_OPERATOR
+    assert failed.steps[prepared.dispatch.step_id].state is StepStatus.BLOCKED
+    assert failed.operator_request is not None
+    assert failed.operator_request.kind == "budget"
+    assert failed.operator_request.allowed_answers == ["halt"]
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
+
+def test_batch_post_review_verification_failure_persists_authoritative_evidence_without_rework(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(project, max_executor_attempts=2)
+    stored, generation = store.load_run(reviewer.run_id)
+    batched_dispatch = stored.dispatches[reviewer.dispatch.dispatch_id].model_copy(
+        update={"batch_id": "batch-review-verification-feedback"}
+    )
+    stored = stored.model_copy(
+        update={"dispatches": {**stored.dispatches, batched_dispatch.dispatch_id: batched_dispatch}}
+    )
+    generation = store.save_run(stored, expected_generation=generation)
+    reviewer = replace(reviewer, generation=generation, dispatch=batched_dispatch)
+    result = parse_reviewer_result(_reviewer_result(reviewer))
+    assert result.verdict == "accepted"
+    snapshot = workflow.inspect_reviewer_result(reviewer, result)
+    verification = _failed_authoritative_verification(
+        summary="fresh acceptance assertion failed",
+    )
+
+    failed, generation = workflow.record_reviewer_verification_failure(
+        reviewer,
+        result,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+
+    dispatch = failed.dispatches[reviewer.dispatch.dispatch_id]
+    payload = store.load_dispatch_payload(failed.run_id, dispatch.dispatch_id)
+    assert dispatch.failure_category == "acceptance_verification"
+    assert dispatch.failure_detail is not None
+    assert "fresh acceptance assertion failed" in dispatch.failure_detail
+    assert failed.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert failed.state is RunStatus.RUNNING
+    assert store.review_for_dispatch(failed.run_id, dispatch.dispatch_id) is False
+    assert payload.result == result.model_dump(mode="json")
+    assert payload.authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in verification
+    )
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
+def test_verification_retry_recovery_uses_only_the_newest_durable_dirty_failure(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared, clean, current = _prepare_verification_feedback_executor(
+        project,
+        max_executor_attempts=3,
+    )
+    first_proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    first_snapshot = workflow.record_executor_proposal(prepared, first_proposal)
+    first_verification = _failed_authoritative_verification(
+        summary="first verification failure",
+        transcript_marker="c",
+    )
+    first_failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        first_proposal,
+        authoritative_verification=first_verification,
+        usage=None,
+        verified_snapshot=first_snapshot,
+    )
+    first_payload = store.load_dispatch_payload(
+        first_failed.run_id,
+        prepared.dispatch.dispatch_id,
+    )
+    assert first_payload.repository_after == current["snapshot"].model_dump(mode="json")
+
+    retry = workflow.prepare_pending_verification_retry(first_failed, generation)
+    assert isinstance(retry, PreparedDispatch)
+    retry = workflow.record_session_id(
+        workflow.mark_running(retry, process_id=1235, process_create_time=1235.0),
+        runtime_session_id="ses-verification-feedback",
+    )
+    current["snapshot"] = _dirty_snapshot(clean, marker="d")
+    second_proposal = parse_executor_proposal(json.loads(retry.prompt)["response_template"])
+    second_snapshot = workflow.record_executor_proposal(retry, second_proposal)
+    second_verification = _failed_authoritative_verification(
+        summary="newest verification failure",
+        transcript_marker="e",
+    )
+    second_failed, generation = workflow.record_executor_verification_failure(
+        retry,
+        second_proposal,
+        authoritative_verification=second_verification,
+        usage=None,
+        verified_snapshot=second_snapshot,
+    )
+    second_payload = store.load_dispatch_payload(
+        second_failed.run_id,
+        retry.dispatch.dispatch_id,
+    )
+    assert second_payload.repository_after == current["snapshot"].model_dump(mode="json")
+    assert not store.leases_for_run(second_failed.run_id)
+    store.close()
+
+    recovered_store = _store(project)
+    recovered_record, recovered_generation = recovered_store.load_run(second_failed.run_id)
+    recovered_workflow = SequentialWorkflow(
+        project.config,
+        recovered_store,
+        owner_id="verification-feedback-newest-recovery-owner",
+        repository_inspector=lambda _config, _repo_id, require_clean: (
+            clean if require_clean else current["snapshot"]
+        ),
+    )
+    recovered_retry = recovered_workflow.prepare_pending_verification_retry(
+        recovered_record,
+        recovered_generation,
+    )
+
+    assert isinstance(recovered_retry, PreparedDispatch)
+    assert recovered_retry.dispatch.attempt == 3
+    assert recovered_retry.session_id == "ses-verification-feedback"
+    assert recovered_retry.repository_before == clean
+    assert json.loads(recovered_retry.prompt)["verification_feedback"] == [
+        item.model_dump(mode="json") for item in second_verification
+    ]
+
+
+def test_verification_retry_preparation_failure_waits_for_operator(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared, clean, current = _prepare_verification_feedback_executor(
+        project,
+        max_executor_attempts=2,
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    verification = _failed_authoritative_verification()
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+    current["snapshot"] = _dirty_snapshot(clean, marker="d")
+
+    waiting = workflow.prepare_pending_verification_retry(failed, generation)
+
+    assert isinstance(waiting, tuple)
+    waiting_record, _waiting_generation = waiting
+    payload = store.load_dispatch_payload(failed.run_id, prepared.dispatch.dispatch_id)
+    assert waiting_record.state is RunStatus.WAITING_OPERATOR
+    assert waiting_record.steps[prepared.dispatch.step_id].state is StepStatus.BLOCKED
+    assert waiting_record.operator_request is not None
+    assert waiting_record.operator_request.kind == "reconciliation"
+    assert waiting_record.operator_request.context_ref == prepared.dispatch.dispatch_id
+    assert waiting_record.dispatches[prepared.dispatch.dispatch_id].failure_category == (
+        "authoritative_verification"
+    )
+    assert payload.repository_after == _dirty_snapshot(clean, marker="f").model_dump(mode="json")
+    assert payload.authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in verification
+    )
+
+
+def test_failed_post_review_verification_routes_to_prior_executor_session(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(
+        project,
+        max_executor_attempts=2,
+    )
+    result = parse_reviewer_result(_reviewer_result(reviewer))
+    assert result.verdict == "accepted"
+    review_snapshot = workflow.inspect_reviewer_result(reviewer, result)
+    verification = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="failed",
+            argv=("python", "-c", "raise SystemExit(1)"),
+            exit_code=1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            transcript_sha256="c" * 64,
+            duration_ms=5,
+            backend="fixture-isolation",
+            summary="fresh acceptance assertion failed",
+        ),
+    )
+
+    failed, generation = workflow.record_reviewer_verification_failure(
+        reviewer,
+        result,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=review_snapshot,
+    )
+
+    failed_dispatch = failed.dispatches[reviewer.dispatch.dispatch_id]
+    assert failed_dispatch.state.value == "FAILED"
+    assert failed_dispatch.failure_category == "acceptance_verification"
+    assert failed.steps[reviewer.dispatch.step_id].state is StepStatus.READY
+    assert store.review_for_dispatch(failed.run_id, reviewer.dispatch.dispatch_id) is False
+    assert store.load_dispatch_payload(
+        failed.run_id,
+        reviewer.dispatch.dispatch_id,
+    ).authoritative_verification == tuple(
+        item.model_dump(mode="json") for item in verification
+    )
+
+    retry = workflow.prepare_pending_verification_retry(
+        failed,
+        generation,
+    )
+    assert isinstance(retry, PreparedDispatch)
+    retry_context = json.loads(retry.prompt)
+    assert retry.dispatch.role_kind == "executor"
+    assert retry.dispatch.role_key == "terra"
+    assert retry.session_mode == "resume"
+    assert retry.session_id == "ses-executor"
+    assert retry.dispatch.attempt == 2
+    assert retry.repository_before == RepositorySnapshot.model_validate_json(
+        json.dumps(
+            store.load_dispatch_payload(
+                failed.run_id,
+                reviewer.dispatch.dispatch_id,
+            ).repository_before
+        )
+    )
+    assert retry_context["verification_feedback"] == [
+        item.model_dump(mode="json") for item in verification
+    ]
+
+
+def test_post_review_verification_usage_mismatch_waits_for_reconciliation(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(project, max_executor_attempts=2)
+    store.begin_opencode_invocation(
+        invocation_id="reviewer-invocation-usage-mismatch",
+        run_id=reviewer.run_id,
+        dispatch_id=reviewer.dispatch.dispatch_id,
+        role_kind="reviewer",
+        role_key="reviewer",
+        step_id=reviewer.dispatch.step_id,
+        session_mode="new",
+        requested_session_id=None,
+    )
+    _record, generation = store.finish_opencode_invocation(
+        invocation_id="reviewer-invocation-usage-mismatch",
+        runtime_session_id="ses-reviewer",
+        usage={
+            "cost_usd": 0.1,
+            "tokens_total": 10,
+            "tokens_input": 6,
+            "tokens_output": 4,
+            "tokens_reasoning": 0,
+        },
+    )
+    reviewer = replace(reviewer, generation=generation)
+    result = parse_reviewer_result(_reviewer_result(reviewer))
+    snapshot = workflow.inspect_reviewer_result(reviewer, result)
+    verification = _failed_authoritative_verification(
+        summary="fresh acceptance assertion failed",
+    )
+
+    failed, generation = workflow.record_reviewer_verification_failure(
+        reviewer,
+        result,
+        authoritative_verification=verification,
+        usage={
+            "cost_usd": 0.2,
+            "tokens_total": 20,
+            "tokens_input": 12,
+            "tokens_output": 8,
+            "tokens_reasoning": 0,
+        },
+        verified_snapshot=snapshot,
+    )
+
+    dispatch = failed.dispatches[reviewer.dispatch.dispatch_id]
+    assert dispatch.failure_category == "acceptance_verification"
+    assert failed.state is RunStatus.WAITING_OPERATOR
+    assert failed.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert failed.operator_request is not None
+    assert failed.operator_request.kind == "reconciliation"
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
+def test_acceptance_verification_failure_with_exhausted_reviewer_budget_fails_step(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(
+        project,
+        max_executor_attempts=2,
+        max_reviewer_attempts=1,
+    )
+    result = parse_reviewer_result(_reviewer_result(reviewer))
+    assert result.verdict == "accepted"
+    review_snapshot = workflow.inspect_reviewer_result(reviewer, result)
+    verification = (
+        AuthoritativeVerification(
+            check_id="fixture-check",
+            status="failed",
+            argv=("python", "-c", "raise SystemExit(1)"),
+            exit_code=1,
+            timed_out=False,
+            output_truncated=False,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            transcript_sha256="c" * 64,
+            duration_ms=5,
+            backend="fixture-isolation",
+            summary="fresh acceptance assertion failed",
+        ),
+    )
+
+    failed, generation = workflow.record_reviewer_verification_failure(
+        reviewer,
+        result,
+        authoritative_verification=verification,
+        usage=None,
+        verified_snapshot=review_snapshot,
+    )
+
+    dispatch = failed.dispatches[reviewer.dispatch.dispatch_id]
+    assert dispatch.failure_category == "acceptance_verification"
+    assert failed.steps[reviewer.dispatch.step_id].state is StepStatus.FAILED
+    assert failed.state is RunStatus.FAILED
+    assert store.load_dispatch_payload(
+        failed.run_id,
+        reviewer.dispatch.dispatch_id,
+    ).authoritative_verification == tuple(item.model_dump(mode="json") for item in verification)
+    assert workflow.prepare_pending_verification_retry(failed, generation) is None
+
+
 def test_discriminator_option_constants_track_result_union_literals() -> None:
     assert EXECUTOR_OUTCOME_OPTIONS == _result_union_discriminator_options(ExecutorResult, "outcome")
     assert EXECUTOR_PROPOSAL_OUTCOME_OPTIONS == ("completed", "blocked", "failed")
@@ -755,6 +1662,50 @@ def test_executor_dispatch_transitions_only_its_ready_step_and_completion_is_gua
     assert decision.accepted
     assert decision.report_path is not None
     assert store.load_run(record.run_id)[0].state.value == "SUCCEEDED"
+
+
+def test_recover_interrupted_dispatch_waits_for_reconciliation_after_usage_finalization(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared = _prepare_executor(project)
+    store.begin_opencode_invocation(
+        invocation_id="dispatch-interrupted-after-finish",
+        run_id=prepared.run_id,
+        dispatch_id=prepared.dispatch.dispatch_id,
+        role_kind="executor",
+        role_key="terra",
+        step_id=prepared.dispatch.step_id,
+        session_mode="new",
+        requested_session_id=None,
+    )
+    store.finish_opencode_invocation(
+        invocation_id="dispatch-interrupted-after-finish",
+        runtime_session_id="ses-executor",
+        usage=None,
+    )
+
+    recovered, generation = workflow.recover_interrupted_dispatch(
+        prepared.run_id,
+        prepared.dispatch.dispatch_id,
+    )
+
+    dispatch = recovered.dispatches[prepared.dispatch.dispatch_id]
+    assert dispatch.state is DispatchStatus.FAILED
+    assert dispatch.failure_category == "interrupted"
+    assert recovered.state is RunStatus.WAITING_OPERATOR
+    assert recovered.steps[dispatch.step_id].state is StepStatus.BLOCKED
+    assert recovered.operator_request is not None
+    assert recovered.operator_request.kind == "reconciliation"
+    assert recovered.operator_request.context_ref == dispatch.dispatch_id
+    resumed, _generation = store.answer_operator_request(
+        run_id=recovered.run_id,
+        expected_generation=generation,
+        request_id=recovered.operator_request.request_id,
+        answer="reconcile",
+        actor_id="operator",
+    )
+    assert resumed.state is RunStatus.RUNNING
+    assert resumed.steps[dispatch.step_id].state is StepStatus.READY
 
 
 def test_completed_executor_with_exact_passed_coverage_requires_review(

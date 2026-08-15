@@ -166,12 +166,19 @@ def test_decoder_uses_only_final_text_from_narration_then_result_fixture() -> No
         '"transcript_ref":null,"outcome":"completed"}'
     )
 
-    raw, chat, _usage, session_id = _parse_json_output(stdout)
+    raw, chat, usage, session_id = _parse_json_output(stdout)
 
     assert session_id == "ses_fixture_narration_result"
     assert chat == expected
     assert json.loads(chat)["response_contract"] == "dispatcher.executor_result.v1"
     assert parse_executor_result(json.loads(chat)).outcome == "completed"
+    assert usage == {
+        "total": 68,
+        "input": 43,
+        "output": 25,
+        "reasoning": 0,
+        "cache": {"read": 3, "write": 0},
+    }
     assert [event["part"]["id"] for event in raw if event["type"] == "text"] == [
         "prt_fixture_narration_one",
         "prt_fixture_narration_two",

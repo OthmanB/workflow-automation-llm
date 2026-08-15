@@ -603,6 +603,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     from .config import load_config
     from .execution import ExecutionCoordinatorError, _worker_json_object
     from .results import ResultError, parse_reviewer_result
+    from .scheduler import resource_keys
     from .sequential import SequentialWorkflow, SequentialWorkflowError
     from .sessions import OpenCodeAdapterError, OpenCodeJsonlDecoder
     from .state_store import StateStoreError
@@ -613,20 +614,30 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     try:
         store = state_mod.open_state_store(cfg)
         items = store.classify_recovery(args.run_id)
+        prepared_invocations = store.prepared_opencode_invocations_for_run(args.run_id)
         workflow = SequentialWorkflow(cfg, store, owner_id=f"recovery-{os.getpid()}")
         adopted: list[str] = []
         adopted_reviews: list[str] = []
         recovered_forwardings: list[str] = []
+        finalized_invocations: list[str] = []
+        reconciled_dispatches: list[str] = []
+        reconciled_batches: list[str] = []
         recovery_failures: list[str] = []
         candidates = [
             item for item in items if item.disposition == "structured_commit_adoption_required"
         ]
         completed = [item for item in items if item.disposition == "forwarding_required"]
+        interrupted = [
+            item
+            for item in items
+            if item.disposition == "operator_reconciliation_required"
+            and item.state.value in {"PREPARED", "RUNNING"}
+        ]
         if bool(args.adopt_failed_review) != bool(args.response_log):
             raise StateStoreError(
                 "--adopt-failed-review and --response-log must be provided together"
             )
-        if candidates or completed or args.adopt_failed_review:
+        if candidates or completed or interrupted or prepared_invocations or args.adopt_failed_review:
             recovery_owner = f"recovery-{os.getpid()}"
             store.acquire_run_lease(
                 project_id=cfg.project_id,
@@ -651,6 +662,70 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                         recovery_failures.append(f"{item.dispatch_id}: {exc}")
                         continue
                     recovered_forwardings.append(item.dispatch_id)
+                batch_ids: set[str] = set()
+                for item in interrupted:
+                    try:
+                        recovered, _generation = workflow.recover_interrupted_dispatch(
+                            args.run_id,
+                            item.dispatch_id,
+                        )
+                    except (SequentialWorkflowError, StateStoreError) as exc:
+                        recovery_failures.append(f"{item.dispatch_id}: {exc}")
+                        continue
+                    reconciled_dispatches.append(item.dispatch_id)
+                    batch_id = recovered.dispatches[item.dispatch_id].batch_id
+                    if batch_id is not None:
+                        batch_ids.add(batch_id)
+                for batch_id in sorted(batch_ids):
+                    record, generation = store.load_run(args.run_id)
+                    try:
+                        workflow.finalize_batch(
+                            args.run_id,
+                            expected_generation=generation,
+                            batch_id=batch_id,
+                        )
+                    except (SequentialWorkflowError, StateStoreError) as exc:
+                        recovery_failures.append(f"{batch_id}: {exc}")
+                        continue
+                    reconciled_batches.append(batch_id)
+                if reconciled_dispatches:
+                    record, _generation = store.load_run(args.run_id)
+                    dispatch_resource_keys: set[str] = set()
+                    for dispatch_id in reconciled_dispatches:
+                        dispatch = record.dispatches[dispatch_id]
+                        step = next(
+                            step for step in record.plan.steps if step.step_id == dispatch.step_id
+                        )
+                        dispatch_resource_keys.update(
+                            resource_keys(
+                                step.repo_id,
+                                tuple(lock.resource_id for lock in step.resource_locks),
+                            )
+                        )
+                        if dispatch.workspace_group_id is not None:
+                            dispatch_resource_keys.discard(f"repository:{step.repo_id}")
+                    store.release_interrupted_dispatch_leases(
+                        args.run_id,
+                        dispatch_resource_keys,
+                    )
+                record, _generation = store.load_run(args.run_id)
+                active_dispatch_ids = {
+                    dispatch.dispatch_id
+                    for dispatch in record.dispatches.values()
+                    if dispatch.state.value in {"PREPARED", "RUNNING"}
+                }
+                finalizable_invocation_ids = [
+                    str(invocation["invocation_id"])
+                    for invocation in prepared_invocations
+                    if invocation["dispatch_id"] is None
+                    or str(invocation["dispatch_id"]) not in active_dispatch_ids
+                ]
+                finalized_invocations.extend(
+                    store.finalize_prepared_opencode_invocations(
+                        args.run_id,
+                        invocation_ids=finalizable_invocation_ids,
+                    )
+                )
                 if args.adopt_failed_review:
                     record, generation = store.load_run(args.run_id)
                     request = record.operator_request
@@ -742,6 +817,12 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         print(f"{dispatch_id}: adopted exact interrupted structured Git commit")
     for dispatch_id in recovered_forwardings:
         print(f"{dispatch_id}: recovered durable forwarding from completed result")
+    for invocation_id in finalized_invocations:
+        print(f"{invocation_id}: finalized interrupted OpenCode invocation with missing usage")
+    for dispatch_id in reconciled_dispatches:
+        print(f"{dispatch_id}: marked interrupted dispatch for operator reconciliation")
+    for batch_id in reconciled_batches:
+        print(f"{batch_id}: joined recovered batch for operator reconciliation")
     for dispatch_id in adopted_reviews:
         print(f"{dispatch_id}: adopted typed result from immutable failed review response")
     for failure in recovery_failures:

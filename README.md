@@ -37,6 +37,7 @@ or complete work by prose alone.
 | [`docs/protocol.md`](docs/protocol.md) | Strict supervisor commands and typed worker results |
 | [`docs/workflow-state-schema.md`](docs/workflow-state-schema.md) | Run, step, dispatch, batch, and recovery transitions |
 | [`docs/operations.md`](docs/operations.md) | Safe operational command procedures and exit behavior |
+| [`docs/session-inspection.md`](docs/session-inspection.md) | Export and inspect isolated dispatcher OpenCode sessions |
 | [`docs/migration.md`](docs/migration.md) | Migration from proof-of-concept artifacts to SQLite state |
 | [`config/projects/example.yaml`](config/projects/example.yaml) | Sanitized, validating public example |
 | [`markdown/plans/dispatcher-remediation-plan-2026-08-09.md`](markdown/plans/dispatcher-remediation-plan-2026-08-09.md) | Authoritative remediation checklist and release gates |

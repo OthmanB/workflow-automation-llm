@@ -58,6 +58,9 @@ class OpenCodeAdapterError(RuntimeError):
         stdout_log_path: str = "",
         stderr_log_path: str = "",
         category: FailureCategory = "unknown",
+        usage: Mapping[str, Any] | None = None,
+        cost: float | None = None,
+        runtime_session_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
@@ -65,6 +68,9 @@ class OpenCodeAdapterError(RuntimeError):
         self.stdout_log_path = stdout_log_path
         self.stderr_log_path = stderr_log_path
         self.category = category
+        self.usage = dict(usage) if usage is not None else None
+        self.cost = cost
+        self.runtime_session_id = runtime_session_id
 
 
 class OpenCodeVersionError(OpenCodeAdapterError):
@@ -185,6 +191,7 @@ class OpenCodeJsonlDecoder:
         self._chat_bytes = 0
         self._usage: dict[str, Any] = {}
         self._cost: float | None = None
+        self._step_finish_ids: set[str] = set()
         self._session_id = ""
         self._structured_error = ""
         self._structured_error_name = ""
@@ -280,17 +287,44 @@ class OpenCodeJsonlDecoder:
             raise OpenCodeProtocolError(
                 f"OpenCode step_finish event at line {line_number} is missing tokens"
             )
-        if not all(isinstance(tokens.get(key), int) for key in ("total", "input", "output", "reasoning")):
+        if not all(
+            isinstance(tokens.get(key), int)
+            and not isinstance(tokens.get(key), bool)
+            and tokens[key] >= 0
+            for key in ("total", "input", "output", "reasoning")
+        ):
             raise OpenCodeProtocolError(
                 f"OpenCode step_finish event at line {line_number} has invalid tokens"
             )
         cost = part.get("cost")
-        if not isinstance(cost, (int, float)):
+        if (
+            not isinstance(cost, (int, float))
+            or isinstance(cost, bool)
+            or cost < 0
+        ):
             raise OpenCodeProtocolError(
                 f"OpenCode step_finish event at line {line_number} has invalid cost"
             )
-        self._usage = redact_value(tokens)
-        self._cost = float(cost)
+        finish_id = part.get("id")
+        if not isinstance(finish_id, str) or not finish_id:
+            finish_id = f"{part.get('messageID', '')}:{line_number}"
+        if finish_id in self._step_finish_ids:
+            raise OpenCodeProtocolError(
+                f"OpenCode step_finish event at line {line_number} duplicates part identity"
+            )
+        self._step_finish_ids.add(finish_id)
+        for key in ("total", "input", "output", "reasoning"):
+            self._usage[key] = int(self._usage.get(key, 0)) + int(tokens[key])
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            accumulated_cache = self._usage.setdefault("cache", {})
+            if isinstance(accumulated_cache, dict):
+                for key in ("read", "write"):
+                    value = cache.get(key, 0)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        accumulated_cache[key] = int(accumulated_cache.get(key, 0)) + value
+        self._usage = redact_value(self._usage)
+        self._cost = (self._cost or 0.0) + float(cost)
         self._saw_step_finish = True
 
     def _consume_error(self, event: dict[str, Any], line_number: int) -> None:
@@ -451,6 +485,8 @@ def run_session(
     except OpenCodeAdapterError as exc:
         if "exit_code" in locals() and exc.exit_code is None:
             exc.exit_code = exit_code
+        if "decoder" in locals():
+            _attach_decoder_measurement(exc, decoder)
         exc.stdout_log_path = exc.stdout_log_path or str(stdout_log)
         exc.stderr_log_path = exc.stderr_log_path or str(stderr_log)
         raise
@@ -817,8 +853,22 @@ def _run_streaming_process(
 
     exit_code = process.wait(timeout=termination_grace_seconds)
     if failure is not None:
+        if isinstance(failure, OpenCodeAdapterError):
+            _attach_decoder_measurement(failure, decoder)
         raise failure
     return exit_code, decoder, stderr_collector.value
+
+
+def _attach_decoder_measurement(
+    error: OpenCodeAdapterError,
+    decoder: OpenCodeJsonlDecoder,
+) -> None:
+    if error.usage is None and decoder._usage:
+        error.usage = dict(decoder._usage)
+    if error.cost is None:
+        error.cost = decoder._cost
+    if error.runtime_session_id is None and decoder._session_id:
+        error.runtime_session_id = decoder._session_id
 
 
 def _start_stream_reader(

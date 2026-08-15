@@ -11,6 +11,12 @@ Derived artifacts may be regenerated or retained according to the explicit
 `observability.retention` policy. Never delete, edit, or archive the SQLite
 database outside a separately approved lifecycle design.
 
+A legacy project subtree containing only `state.json`, `sessions.json`, old
+Markdown transcripts, mock session IDs, and JSONL audit output may be archived
+or removed after confirming that no active configuration points to it. This does
+not make the top-level `state/` convention obsolete; configured projects may
+recreate it. Never include `dispatcher.sqlite3` in legacy cleanup.
+
 ## Project Configuration
 
 Replace ad-hoc paths and implicit defaults with a schema-v2 project YAML:

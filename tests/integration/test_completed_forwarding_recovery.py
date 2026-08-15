@@ -1139,6 +1139,61 @@ def test_recover_command_recovers_a_durable_completed_forwarding(
     )
 
 
+def test_recover_command_reconciles_an_interrupted_worker_invocation(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    store, workflow, _record, _generation, running = _activate_and_prepare(tmp_path)
+    store.begin_opencode_invocation(
+        invocation_id="dispatch-interrupted-recovery",
+        run_id=running.run_id,
+        dispatch_id=running.dispatch.dispatch_id,
+        role_kind="executor",
+        role_key="terra",
+        step_id=running.dispatch.step_id,
+        session_mode="new",
+        requested_session_id=None,
+    )
+
+    from dispatcher.cli import main
+
+    assert (
+        main(
+            [
+                "recover",
+                "--config",
+                str(workflow.config.config_path),
+                "--run-id",
+                "completed-recovery-run",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "finalized interrupted OpenCode invocation with missing usage" in output
+    assert "marked interrupted dispatch for operator reconciliation" in output
+    persisted, generation = store.load_run("completed-recovery-run")
+    dispatch = persisted.dispatches[running.dispatch.dispatch_id]
+    invocation = store.opencode_invocations_for_run("completed-recovery-run")[0]
+    assert dispatch.state is DispatchStatus.FAILED
+    assert dispatch.failure_category == "interrupted"
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert persisted.operator_request is not None
+    assert invocation["lifecycle"] == "FAILED"
+    assert invocation["usage_status"] == "MISSING"
+    assert not [lease for lease in store.leases_for_run(persisted.run_id) if lease.resource_key != f"run:{persisted.project_id}"]
+
+    resumed, _generation = store.answer_operator_request(
+        run_id=persisted.run_id,
+        expected_generation=generation,
+        request_id=persisted.operator_request.request_id,
+        answer="reconcile",
+        actor_id="operator",
+    )
+    assert resumed.steps[dispatch.step_id].state is StepStatus.READY
+
+
 def _git(repository: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],

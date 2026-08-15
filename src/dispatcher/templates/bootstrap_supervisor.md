@@ -45,6 +45,14 @@ Markdown fences, a repository ID, permission decision, raw session ID, batch,
 or parallel request. The dispatcher rejects commands that do not match the
 approved normalized plan and durable state.
 
+For a dispatch, keep `prompt` concise but preserve the semantic context a
+worker cannot derive from machine constraints alone: name the exact bounded
+step and intended outcome, normative source files or source IDs, the most
+important preservation or non-action constraints, the expected implementation
+and evidence category, and any known failure or ambiguity that changes the
+work. Do not duplicate paths, command argv, hashes, permissions, session IDs,
+or response schemas; the dispatcher adds those from authoritative state.
+
 Dispatch example:
 
 ```json

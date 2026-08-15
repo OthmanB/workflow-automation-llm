@@ -14,7 +14,7 @@ from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.sequential import PreparedBatch, SequentialWorkflow
 from dispatcher.sessions import OpenCodeProcessError, SessionResult
 from dispatcher.state_store import StateStore
-from dispatcher.workflow import RunStatus, TransitionEvent, new_run_record
+from dispatcher.workflow import RunStatus, StepStatus, TransitionEvent, new_run_record
 
 
 def test_batch_preparation_is_all_or_none_and_failed_children_join_durably(
@@ -189,7 +189,7 @@ def test_successful_batch_forwards_and_acknowledges_every_child(
         store,
         workflow,
         owner_id="successful-batch-owner",
-        session_runner=_successful_session_runner,
+        session_runner=_usage_successful_session_runner,
     )
     coordinator.acquire_run(record.run_id)
     try:
@@ -226,6 +226,15 @@ def test_successful_batch_forwards_and_acknowledges_every_child(
         ]
         assert outcome.record.batches[outcome.batch_id].state.value == "JOINED"
         assert len(outcome.forwarded_dispatch_ids) == 2
+        invocations = store.opencode_invocations_for_run(record.run_id)
+        assert len(invocations) == 2
+        assert all(invocation["usage_status"] == "COMPLETE" for invocation in invocations)
+        assert outcome.record.usage.run.tokens_total == 20
+        assert outcome.record.usage.by_role["terra"].tokens_total == 20
+        assert {
+            step_id: usage.tokens_total
+            for step_id, usage in outcome.record.usage.by_step.items()
+        } == {"prepare-fixture": 10, "prepare-sibling": 10}
         acknowledged = outcome.record
         generation = outcome.generation
         for dispatch_id in outcome.forwarded_dispatch_ids:
@@ -244,6 +253,105 @@ def test_successful_batch_forwards_and_acknowledges_every_child(
         for record in caplog.records
         if record.name == "dispatcher.execution" and "batch child dispatch" in record.getMessage()
     ]
+
+
+def test_parallel_verification_failures_persist_authoritative_evidence_before_reconciliation(
+    tmp_path: Path,
+) -> None:
+    project = create_fixture_project(tmp_path)
+    sibling = _initialize_sibling_repository(project.root / "sibling")
+    config = _parallel_two_repository_config(project, sibling)
+    plan = _two_repository_plan(project, failing_criteria=True)
+    record = new_run_record(
+        run_id="verification-failure-batch-run",
+        project_id=config.project_id,
+        config_digest=config.config_digest,
+        plan=plan,
+        plan_approval=approve_plan(plan, "decision-verification-failure-batch"),
+        event=_event(1),
+    )
+    store = StateStore(
+        config.state_dir,
+        heartbeat_seconds=config.lease_heartbeat_seconds,
+        stale_after_seconds=config.lease_stale_after_seconds,
+    )
+    generation = store.create_run(record)
+    workflow = SequentialWorkflow(config, store, owner_id="verification-failure-batch-owner")
+    coordinator = SequentialExecutionCoordinator(
+        config,
+        store,
+        workflow,
+        owner_id="verification-failure-batch-owner",
+        session_runner=_successful_session_runner,
+    )
+    coordinator.acquire_run(record.run_id)
+    try:
+        active, generation = workflow.activate(record.run_id, expected_generation=generation)
+        prepared = workflow.prepare_from_supervisor(
+            active.run_id,
+            expected_generation=generation,
+            supervisor_text=json.dumps(
+                {
+                    "protocol_version": 2,
+                    "action": "dispatch_batch",
+                    "children": [
+                        {
+                            "step_id": "prepare-fixture",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "first fixture",
+                        },
+                        {
+                            "step_id": "prepare-sibling",
+                            "target_role": "terra",
+                            "session_mode": "new",
+                            "prompt": "second fixture",
+                        },
+                    ],
+                }
+            ),
+        )
+        assert isinstance(prepared, PreparedBatch)
+        outcome = coordinator.execute_batch(prepared)
+    finally:
+        coordinator.release_run()
+
+    assert outcome.record.state is RunStatus.WAITING_OPERATOR
+    assert outcome.record.operator_request is not None
+    assert outcome.record.operator_request.kind == "batch_reconciliation"
+    failed_ids = outcome.record.batches[outcome.batch_id].failed_dispatch_ids
+    assert len(failed_ids) == 2
+    for dispatch_id in failed_ids:
+        dispatch = outcome.record.dispatches[dispatch_id]
+        payload = store.load_dispatch_payload(outcome.record.run_id, dispatch_id)
+        assert dispatch.failure_category == "authoritative_verification"
+        assert dispatch.failure_detail is not None
+        assert "transcript=" in dispatch.failure_detail
+        assert outcome.record.steps[dispatch.step_id].state.value == "BLOCKED"
+        assert payload.result is not None
+        assert payload.authoritative_verification is not None
+        assert payload.authoritative_verification[0]["status"] == "failed"
+
+    reconciled, reconciled_generation = store.answer_operator_request(
+        run_id=record.run_id,
+        expected_generation=outcome.generation,
+        request_id=outcome.record.operator_request.request_id,
+        answer="reconcile",
+        actor_id="verification-failure-batch-operator",
+    )
+    assert reconciled.state is RunStatus.RUNNING
+    for dispatch_id in failed_ids:
+        assert reconciled.steps[outcome.record.dispatches[dispatch_id].step_id].state is (
+            StepStatus.READY
+        )
+    assert workflow.prepare_pending_verification_retry(reconciled, reconciled_generation) is None
+    persisted, _generation = store.load_run(record.run_id)
+    assert persisted.state is RunStatus.RUNNING
+    assert persisted.operator_request is None
+    for dispatch_id in failed_ids:
+        assert persisted.steps[outcome.record.dispatches[dispatch_id].step_id].state is (
+            StepStatus.READY
+        )
 
 
 def test_failed_batch_child_warns_once_and_preserves_successful_sibling(
@@ -388,7 +496,7 @@ def _parallel_two_repository_config(project, sibling: Path):
     return write_config(project, values)
 
 
-def _two_repository_plan(project) -> NormalizedPlan:
+def _two_repository_plan(project, *, failing_criteria: bool = False) -> NormalizedPlan:
     values = valid_plan_values(project)
     values["steps"][0]["authorization"] = {
         "authorized_actions": ["inspect", "modify", "verify", "commit"],
@@ -425,6 +533,13 @@ def _two_repository_plan(project) -> NormalizedPlan:
         }
     )
     values["steps"].append(second)
+    if failing_criteria:
+        for step in values["steps"]:
+            step["acceptance_criteria"][0]["check"]["argv"] = [
+                "python",
+                "-c",
+                "raise SystemExit(1)",
+            ]
     return NormalizedPlan.model_validate(values)
 
 
@@ -487,6 +602,13 @@ def _successful_session_runner(**kwargs: Any) -> SessionResult:
             }
         ),
     )
+
+
+def _usage_successful_session_runner(**kwargs: Any) -> SessionResult:
+    result = _successful_session_runner(**kwargs)
+    result.usage = {"total": 10, "input": 6, "output": 4, "reasoning": 0}
+    result.cost = 0.01
+    return result
 
 
 def _initialize_sibling_repository(path: Path) -> Path:
