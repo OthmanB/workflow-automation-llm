@@ -52,6 +52,16 @@ class IsolationBackend(Protocol):
     def command(self, argv: tuple[str, ...], workspace: Path, home: Path) -> list[str]: ...
 
 
+class DirectTestBackend:
+    """Environment-neutral test backend for dispatcher-owned check semantics."""
+
+    name = "direct-test-v1"
+    production_ready = False
+
+    def command(self, argv: tuple[str, ...], _workspace: Path, _home: Path) -> list[str]:
+        return list(argv)
+
+
 class DarwinSeatbeltBackend:
     """macOS local verification containment for dispatcher-owned checks."""
 
@@ -128,6 +138,8 @@ class LinuxBubblewrapBackend:
 def verification_backend(config: Config) -> IsolationBackend:
     """Create the explicitly configured backend or fail closed."""
     name = config.execution.verification_backend
+    if name == "direct_test_v1":
+        return DirectTestBackend()
     if name == "darwin_seatbelt_v1":
         return DarwinSeatbeltBackend()
     if name == "linux_bwrap_v1":

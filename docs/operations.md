@@ -55,17 +55,24 @@ dispatcher approve-real-operation --config <private-v2.yaml> --run-id <run-id> \
   --permission-digest supervisor=<sha256> \
   --permission-digest terra=<sha256> \
   --permission-digest reviewer=<sha256> \
+  --scope-manifest-digest <manifest.digest> \
   --output <approval.json>
 ```
 
-The manifest command computes the exact supervisor, eligible-executor, and
-compiled-reviewer role set for the first executable step. Each entry contains
-the role kind, role-scoped actions, and digest of the generated OpenCode
-permission JSON. The approval command requires the operator to supply that
-exact role/digest set and writes it into the owner-only approval record. These
-commands do not invoke OpenCode or make a network call. The record binds the
-decision to the exact project, configuration, plan, run, repository, step, role
-set, and role permissions.
+The manifest command computes the ordered autonomous scope beginning at the
+first executable step. It includes every currently pending or ready step the
+run can reach without another unresolved operator gate, in plan/dependency
+order. Each scoped entry contains the role kind, role-scoped actions, digest of
+the generated OpenCode permission JSON, and its structured-Git capability
+including the step ID, writable paths, evidence paths, commit policy, and
+identity digest. The top-level `digest` attests to the complete ordered scope.
+For a multi-step scope, the approval command requires that digest through
+`--scope-manifest-digest` after the operator has reviewed the entire manifest;
+it rejects absent or stale digests rather than deriving later-step permissions
+silently. The role/digest arguments still attest the first launch step and keep
+single-step invocation compatibility. These commands do not invoke OpenCode or
+make a network call. The record binds the decision to the exact project,
+configuration, plan, run, repository, first step, and complete scope.
 
 The role set is not hand-selected. It always contains the configured
 supervisor, every configured executor eligible for the step, and every role in
@@ -94,9 +101,14 @@ expected revision (`--expected-revision`), missing or mismatched live-smoke
 proof, any role-set or role-permission drift, stall-policy drift, missing preflight, and
 missing operator confirmation before launching a process. It exact-matches the
 approval record's project, configuration digest, plan digest, run, repository,
-first pending step, and complete role permission manifest before launching a process. The command runs preflight
-immediately before launch and records the validated approval record in the
-audit log.
+first remaining approved step, and complete ordered approval scope before launching a
+process. A recoverable `REVIEW_REQUIRED` step remains the first approved step
+on resume; an accepted prefix remains bound while its approved suffix continues.
+It rejects omitted, reordered, extra, or changed scoped entries,
+including later-step role, writable-path, evidence-path, and structured-Git
+changes. Legacy records without a scope remain valid only when the recomputed
+scope contains exactly one step. The command runs preflight immediately before
+launch and records the validated approval record in the audit log.
 
 Immediately before `smoke-proof` and `execute`, the dispatcher atomically copies
 the active operator OpenCode credential store from
@@ -515,6 +527,12 @@ Inspection is read-only and records observed revisions, evidence hashes, and
 review-proof files. Approval requires an explicit PENDING, ACCEPTED, or WAIVED
 decision for every step. Accepted requires the current evidence and review proof
 required by compiled policy; Waived requires its own operator decision reference.
+Freshness validation always rechecks plan and source identity, then compares
+evidence and review-proof path, size, and hash only for explicitly ACCEPTED
+steps. New PENDING-step artifacts and later repository revisions therefore do
+not invalidate an autonomous run's historical baseline. A WAIVED decision is
+still explicit and hydrates only as `WAIVED`, never as an evidence-backed
+acceptance; it makes no historical-evidence provenance claim.
 For generic historical review proof, place a proof file at
 `<evidence-root>/reviews/<step-id>.*`; the inspector hashes it without trusting
 its prose content. Approval records accepted reviewer role keys explicitly.

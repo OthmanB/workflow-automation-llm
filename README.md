@@ -62,6 +62,7 @@ dispatcher smoke-proof --config <private-v2.yaml> --model <provider/model> --out
 dispatcher approve-real-operation --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
    --repo-id <repo> --approval-ref <decision> \
    --permission-digest <role>=<sha256> [--permission-digest <role>=<sha256> ...] \
+   [--scope-manifest-digest <sha256>] \
    --output <approval.json>
 dispatcher start --config <project.yaml> --run-record <run.json>
 dispatcher status --config <project.yaml> [--run-id <id>] [--format text|json]

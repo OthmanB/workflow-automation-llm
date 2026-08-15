@@ -224,7 +224,8 @@
         "verification_backend": {
           "enum": [
             "darwin_seatbelt_v1",
-            "linux_bwrap_v1"
+            "linux_bwrap_v1",
+            "direct_test_v1"
           ],
           "title": "Verification Backend",
           "type": "string"

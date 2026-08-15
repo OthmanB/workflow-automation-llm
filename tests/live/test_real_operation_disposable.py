@@ -594,6 +594,7 @@ def _configure_real_project(
     values["execution"].update(
         {
             "mode": "real_operation",
+            "verification_backend": "darwin_seatbelt_v1",
             "scheduling": scheduling,
             "concurrency": {
                 **values["execution"]["concurrency"],

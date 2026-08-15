@@ -352,7 +352,7 @@ class ExecutionDefinition(ContractModel):
 
     mode: Literal["mock_workflow_test", "real_operation"]
     protocol_version: Literal[1]
-    verification_backend: Literal["darwin_seatbelt_v1", "linux_bwrap_v1"]
+    verification_backend: Literal["darwin_seatbelt_v1", "linux_bwrap_v1", "direct_test_v1"]
     structured_git: StructuredGitDefinition
     scheduling: Literal["sequential", "bounded_parallel"]
     concurrency: ConcurrencyDefinition
@@ -365,6 +365,14 @@ class ExecutionDefinition(ContractModel):
     halt_mode: Literal["ask_on_ambiguity", "full_auto"]
     underspec_mode: Literal["ask", "auto"]
     response_template: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+    @model_validator(mode="after")
+    def test_backend_is_limited_to_mock_workflows(self) -> Self:
+        if self.mode == "real_operation" and self.verification_backend == "direct_test_v1":
+            raise ValueError(
+                "direct_test_v1 verification backend is only allowed in mock_workflow_test mode"
+            )
+        return self
 
 
 class ReviewPolicyDefinition(ContractModel):

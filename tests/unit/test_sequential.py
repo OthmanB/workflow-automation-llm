@@ -46,7 +46,7 @@ from dispatcher.sequential import (
     SequentialWorkflowError,
     _validate_result_verification,
 )
-from dispatcher.state_store import StateStore
+from dispatcher.state_store import DispatchPayload, StateStore
 from dispatcher.verification import AuthoritativeVerification
 from dispatcher.workflow import (
     DispatchStatus,
@@ -2321,6 +2321,100 @@ def test_stall_requeues_with_a_fresh_dispatch_and_preserves_the_stall_count(proj
     assert retry.dispatch.dispatch_id != prepared.dispatch.dispatch_id
     assert retry.dispatch.attempt == 2
     assert json.loads(retry.prompt)["task"].startswith("Continue the current approved step")
+
+
+def test_durable_malformed_reviewer_retry_preserves_failed_dispatch_payload(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(project, max_reviewer_attempts=2)
+    failed, generation = workflow.fail_dispatch(
+        reviewer,
+        reason="reviewer response was malformed",
+        failure_category="result_validation",
+        failure_detail="accepted review cannot require remediation",
+    )
+    failed_dispatch = failed.dispatches[reviewer.dispatch.dispatch_id]
+    failed_payload = store.load_dispatch_payload(failed.run_id, failed_dispatch.dispatch_id)
+
+    retry = workflow.prepare_pending_reviewer_result_validation_retry(failed, generation)
+
+    assert isinstance(retry, PreparedDispatch)
+    assert retry.dispatch.dispatch_id != failed_dispatch.dispatch_id
+    assert retry.dispatch.role_key == failed_dispatch.role_key
+    assert retry.dispatch.attempt == failed_dispatch.attempt + 1
+    persisted, _generation = store.load_run(failed.run_id)
+    assert persisted.dispatches[failed_dispatch.dispatch_id] == failed_dispatch
+    assert store.load_dispatch_payload(failed.run_id, failed_dispatch.dispatch_id) == failed_payload
+
+
+def test_durable_malformed_reviewer_retry_stops_after_attempt_exhaustion(
+    project: FixtureProject,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(project, max_reviewer_attempts=1)
+    failed, generation = workflow.fail_dispatch(
+        reviewer,
+        reason="reviewer response was malformed",
+        failure_category="result_validation",
+        failure_detail="accepted review cannot require remediation",
+    )
+
+    waiting = workflow.prepare_pending_reviewer_result_validation_retry(failed, generation)
+
+    assert isinstance(waiting, tuple)
+    persisted, _generation = store.load_run(failed.run_id)
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert persisted.operator_request is not None
+    assert persisted.operator_request.kind == "reconciliation"
+    assert len(persisted.dispatches) == 2
+
+
+@pytest.mark.parametrize("invalid_field", ["review_target", "repository_before"])
+def test_durable_malformed_reviewer_retry_rejects_invalid_target_or_snapshot(
+    project: FixtureProject,
+    invalid_field: str,
+) -> None:
+    store, workflow, reviewer = _prepare_reviewer(project, max_reviewer_attempts=2)
+    failed, generation = workflow.fail_dispatch(
+        reviewer,
+        reason="reviewer response was malformed",
+        failure_category="result_validation",
+        failure_detail="accepted review cannot require remediation",
+    )
+    payload = store.load_dispatch_payload(failed.run_id, reviewer.dispatch.dispatch_id)
+    metadata = dict(payload.session_metadata or {})
+    repository_before = payload.repository_before
+    if invalid_field == "review_target":
+        review_target = dict(metadata["review_target"])
+        review_target["executor_attempt"] = 99
+        metadata["review_target"] = review_target
+    else:
+        repository_before = dict(repository_before or {})
+        repository_before["manifest_sha256"] = "f" * 64
+    generation = store.save_run(
+        failed,
+        expected_generation=generation,
+        dispatch_payloads={
+            reviewer.dispatch.dispatch_id: DispatchPayload(
+                prompt=payload.prompt,
+                policy=payload.policy,
+                result=payload.result,
+                authoritative_verification=payload.authoritative_verification,
+                forwarding_payload=payload.forwarding_payload,
+                process_id=payload.process_id,
+                session_metadata=metadata,
+                repository_before=repository_before,
+                repository_after=payload.repository_after,
+            )
+        },
+    )
+
+    waiting = workflow.prepare_pending_reviewer_result_validation_retry(failed, generation)
+
+    assert isinstance(waiting, tuple)
+    persisted, _generation = store.load_run(failed.run_id)
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert persisted.steps[reviewer.dispatch.step_id].state is StepStatus.REVIEW_REQUIRED
+    assert len(persisted.dispatches) == 2
 
 
 def test_stall_retry_exhaustion_enters_operator_wait(project: FixtureProject) -> None:

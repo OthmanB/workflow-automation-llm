@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from argparse import Namespace
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from helpers import create_fixture_project, valid_plan_values
 
 import dispatcher.cli as cli
 from dispatcher.cli import main
-from dispatcher.operation import RealOperationApproval, compile_role_permission_manifest
+from dispatcher.operation import RealOperationApproval, compile_real_operation_scope_manifest
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.sessions import SessionResult
 from dispatcher.workflow import TransitionEvent, new_run_record
@@ -165,8 +166,41 @@ def test_smoke_proof_command_reports_runner_failure_without_proof(
 def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path) -> None:
     project = create_fixture_project(tmp_path)
     plan_path = tmp_path / "plan.yaml"
-    plan_path.write_text(yaml.safe_dump(valid_plan_values(project), sort_keys=False), encoding="utf-8")
-    plan = NormalizedPlan.model_validate(valid_plan_values(project))
+    plan_values = valid_plan_values(project)
+    second = copy.deepcopy(plan_values["steps"][0])
+    second.update(
+        {
+            "ordinal": 2,
+            "step_id": "prepare-second",
+            "title": "Prepare second fixture",
+            "depends_on": ["prepare-fixture"],
+            "required_inputs": [
+                {
+                    "artifact_id": "fixture-output",
+                    "producer_step_id": "prepare-fixture",
+                    "description": "Prepared fixture output",
+                }
+            ],
+            "produced_outputs": [
+                {
+                    "artifact_id": "second-output",
+                    "producer_step_id": None,
+                    "description": "Second fixture output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "second-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "second-evidence",
+                    "relative_path": "second.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    plan_values["steps"].append(second)
+    plan_path.write_text(yaml.safe_dump(plan_values, sort_keys=False), encoding="utf-8")
+    plan = NormalizedPlan.model_validate(plan_values)
     record = new_run_record(
         run_id="approval-run",
         project_id=project.config.project_id,
@@ -186,7 +220,7 @@ def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path
     output = tmp_path / "approval.json"
     manifest_output = tmp_path / "permission-manifest.json"
     record_path.write_text(record.model_dump_json(), encoding="utf-8")
-    manifest = compile_role_permission_manifest(
+    scope_manifest = compile_real_operation_scope_manifest(
         config=project.config,
         plan=plan,
         record=record,
@@ -194,7 +228,7 @@ def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path
     )
     digest_args = [
         item
-        for role_key, entry in manifest.roles.items()
+        for role_key, entry in scope_manifest.steps[0].roles.items()
         for item in ("--permission-digest", f"{role_key}={entry.digest}")
     ]
 
@@ -217,7 +251,7 @@ def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path
         )
         == 0
     )
-    assert json.loads(manifest_output.read_text(encoding="utf-8")) == manifest.model_dump(mode="json")
+    assert json.loads(manifest_output.read_text(encoding="utf-8")) == scope_manifest.model_dump(mode="json")
     assert (
         main(
             [
@@ -233,6 +267,8 @@ def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path
                 "--approval-ref",
                 "decision-real-operation",
                 *digest_args,
+                "--scope-manifest-digest",
+                scope_manifest.digest,
                 "--output",
                 str(output),
             ]
@@ -248,7 +284,8 @@ def test_approve_real_operation_command_writes_exact_bound_record(tmp_path: Path
     assert approval.run_id == record.run_id
     assert approval.repo_id == "fixture-repo"
     assert approval.step_id == plan.steps[0].step_id
-    assert approval.permission_manifest == manifest
+    assert approval.permission_manifest == scope_manifest.steps[0]
+    assert approval.scope_manifest == scope_manifest
     assert approval.decided_at.tzinfo is not None
 
 

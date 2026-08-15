@@ -2000,6 +2000,63 @@ class StateStore:
                 ),
             )
 
+    def append_audit_event_idempotently(
+        self,
+        *,
+        run_id: str,
+        event_id: str,
+        sequence: int,
+        kind: str,
+        correlation_id: str,
+        causation_id: str | None,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Append a deterministic audit event once without rewriting its first accepted row.
+
+        A resumed real-operation approval can observe a later run sequence than its
+        original audit row. Sequence is therefore intentionally excluded from the
+        existing-event identity check; the original sequence and payload remain immutable.
+        """
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            existing = connection.execute(
+                """
+                SELECT run_id, kind, correlation_id, causation_id
+                FROM audit_events WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_identity = (
+                    existing["run_id"],
+                    existing["kind"],
+                    existing["correlation_id"],
+                    existing["causation_id"],
+                )
+                requested_identity = (run_id, kind, correlation_id, causation_id)
+                if existing_identity != requested_identity:
+                    raise StateStoreCorruptionError(
+                        f"audit event {event_id} conflicts with a different authoritative identity"
+                    )
+                return
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    event_id, run_id, sequence, kind, correlation_id, causation_id, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    run_id,
+                    sequence,
+                    kind,
+                    correlation_id,
+                    causation_id,
+                    _json_text(payload),
+                    _utc_now(),
+                ),
+            )
+
     def complete_run(
         self,
         record: RunRecord,

@@ -60,12 +60,15 @@ requires its own operator decision reference. Start a new run with
 `--use-approved-baseline` only after that immutable approval exists. Do not
 import private reference data into this public repository.
 
-Approvals are append-only. If repository revision, evidence, review proof, plan,
-or sources change, the previous approval no longer validates; inspect again and
-record a new explicit approval. Historical review proof follows the public
-convention `<evidence-root>/reviews/<step-id>.*`. Legacy step-prefixed review
-files matching `<evidence-root>/<lowercase-step-id>*review*` are observed too,
-but never automatically accepted.
+Approvals are append-only. Freshness always verifies plan and source identity;
+changed or deleted evidence or review proof for an ACCEPTED step requires a new
+explicit approval. Evidence, review proof, and repository revisions created by
+PENDING work do not invalidate accepted historical provenance. A WAIVED step
+remains an explicit waiver rather than evidence-backed acceptance. Historical
+review proof follows the public convention `<evidence-root>/reviews/<step-id>.*`.
+Legacy step-prefixed review files matching
+`<evidence-root>/<lowercase-step-id>*review*` are observed too, but never
+automatically accepted.
 
 ## Operational Migration
 

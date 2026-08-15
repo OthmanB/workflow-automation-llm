@@ -24,14 +24,20 @@ from dispatcher.cli import main
 from dispatcher.operation import (
     LiveSmokeProof,
     approve_real_operation,
-    compile_role_permission_manifest,
+    compile_real_operation_scope_manifest,
     digest_json,
 )
 from dispatcher.permissions import read_only_diagnostic_bash_rules
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.state import open_state_store
 from dispatcher.state_store import StateStore
-from dispatcher.workflow import RunRecord, RunStatus, TransitionEvent, new_run_record
+from dispatcher.workflow import (
+    RunRecord,
+    RunStatus,
+    TransitionEvent,
+    new_run_record,
+    transition_run,
+)
 
 
 @dataclass(frozen=True)
@@ -166,7 +172,115 @@ def test_execute_command_rejects_wrong_revision_without_launching_fake_opencode(
     assert not (fake_opencode.parent / "calls.jsonl").exists()
 
 
-def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
+def test_execute_command_accepts_complete_two_step_scope_before_worker_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepare_execute_fixture(tmp_path, two_steps=True)
+    monkeypatch.setattr("dispatcher.cli.refresh_opencode_credentials", lambda _state_dir: None)
+    backend = DirectProductionTestBackend()
+    monkeypatch.setattr("dispatcher.operation.verification_backend", lambda _config: backend)
+    monkeypatch.setattr("dispatcher.verification.verification_backend", lambda _config: backend)
+
+    class CompletedWithoutWorker:
+        accepted = True
+        report_path = tmp_path / "report.json"
+
+    monkeypatch.setattr(
+        "dispatcher.execution.SequentialExecutionCoordinator.run_to_completion",
+        lambda *_args, **_kwargs: CompletedWithoutWorker(),
+    )
+
+    assert main(_execute_argv(fixture)) == 0
+    assert "execute: completed accepted=True" in capsys.readouterr().out
+    approval = json.loads(fixture.approval_path.read_text(encoding="utf-8"))
+    assert [item["step_id"] for item in approval["scope_manifest"]["steps"]] == [
+        "prepare-fixture",
+        "prepare-second",
+    ]
+
+
+def test_execute_command_resume_reuses_real_operation_approval_audit_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepare_execute_fixture(tmp_path)
+    monkeypatch.setattr("dispatcher.cli.refresh_opencode_credentials", lambda _state_dir: None)
+    backend = DirectProductionTestBackend()
+    monkeypatch.setattr("dispatcher.operation.verification_backend", lambda _config: backend)
+    monkeypatch.setattr("dispatcher.verification.verification_backend", lambda _config: backend)
+
+    class CompletedWithoutWorker:
+        accepted = True
+        report_path = tmp_path / "report.json"
+
+    launches: list[tuple[str, int, int]] = []
+
+    def complete_without_worker(
+        _coordinator: object,
+        run_id: str,
+        *,
+        expected_generation: int,
+        max_turns: int,
+    ) -> CompletedWithoutWorker:
+        current, generation = fixture.store.load_run(run_id)
+        assert generation == expected_generation
+        target = RunStatus.READY if current.state is RunStatus.NEW else RunStatus.RUNNING
+        progressed = transition_run(
+            current,
+            target,
+            TransitionEvent(
+                event_id=f"event-resume-progress-{generation}",
+                sequence=current.sequence + 1,
+                actor="dispatcher",
+                reason="disposable execute resume progression",
+                correlation_id=run_id,
+                occurred_at=datetime.now(UTC),
+            ),
+        )
+        fixture.store.save_run(progressed, expected_generation=generation)
+        launches.append((run_id, expected_generation, max_turns))
+        return CompletedWithoutWorker()
+
+    monkeypatch.setattr(
+        "dispatcher.execution.SequentialExecutionCoordinator.run_to_completion",
+        complete_without_worker,
+    )
+
+    assert main(_execute_argv(fixture)) == 0
+    assert main(_execute_argv(fixture)) == 0
+
+    assert capsys.readouterr().out.count("execute: completed accepted=True") == 2
+    assert [(run_id, generation) for run_id, generation, _max_turns in launches] == [
+        (fixture.record.run_id, 1),
+        (fixture.record.run_id, 2),
+    ]
+    assert launches[0][2] == launches[1][2]
+    resumed_record, _resumed_generation = fixture.store.load_run(fixture.record.run_id)
+    assert resumed_record.sequence == fixture.record.sequence + 2
+    with sqlite3.connect(fixture.store.database_path) as connection:
+        approval_events = connection.execute(
+            """
+            SELECT event_id, sequence, kind, correlation_id, causation_id
+            FROM audit_events
+            WHERE run_id = ? AND kind = 'real_operation_approved'
+            """,
+            (fixture.record.run_id,),
+        ).fetchall()
+    assert approval_events == [
+        (
+            "audit-real-operation-decision-execute-run",
+            fixture.record.sequence + 1,
+            "real_operation_approved",
+            fixture.record.run_id,
+            None,
+        )
+    ]
+
+
+def _prepare_execute_fixture(tmp_path: Path, *, two_steps: bool = False) -> ExecuteFixture:
     project = create_fixture_project(tmp_path)
     values = config_values(project)
     values["execution"]["mode"] = "real_operation"
@@ -204,6 +318,44 @@ def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
         "on_changes_requested": "retry",
         "escalation_role_key": None,
     }
+    if two_steps:
+        second = json.loads(json.dumps(step))
+        second.update(
+            {
+                "ordinal": 2,
+                "step_id": "prepare-second",
+                "title": "Prepare second fixture",
+                "depends_on": ["prepare-fixture"],
+                "required_inputs": [
+                    {
+                        "artifact_id": "fixture-output",
+                        "producer_step_id": "prepare-fixture",
+                        "description": "Prepared fixture output",
+                    }
+                ],
+                "produced_outputs": [
+                    {
+                        "artifact_id": "second-output",
+                        "producer_step_id": None,
+                        "description": "Second fixture output",
+                    }
+                ],
+                "resource_locks": [{"resource_id": "second-resource", "mode": "write"}],
+                "authorization": {
+                    "authorized_actions": ["inspect", "modify", "verify", "commit"],
+                    "writable_paths": ["evidence/second.md", "src/second.txt"],
+                    "requires_operator_approval": False,
+                },
+                "evidence_requirements": [
+                    {
+                        "artifact_id": "second-evidence",
+                        "relative_path": "second.md",
+                        "media_type": "text/markdown",
+                    }
+                ],
+            }
+        )
+        plan_values["steps"].append(second)
     plan = NormalizedPlan.model_validate(plan_values)
     plan_path = project.plans / "execute-plan.yaml"
     plan_path.write_text(yaml.safe_dump(plan_values, sort_keys=False), encoding="utf-8")
@@ -212,13 +364,14 @@ def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
     observation = inspect_baseline(plan, project.config)
     approve_baseline(
         observation,
-        decisions=(
+        decisions=tuple(
             BaselineDecision(
-                step_id="prepare-fixture",
+                step_id=step.step_id,
                 state="PENDING",
                 reason="execute command disposable fixture starts as pending",
                 operator_decision_ref="decision-execute-baseline",
-            ),
+            )
+            for step in plan.steps
         ),
         plan=plan,
         config=project.config,
@@ -259,14 +412,14 @@ def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
         encoding="utf-8",
     )
     approval_path = project.root / "approval.json"
-    permission_manifest = compile_role_permission_manifest(
+    scope_manifest = compile_real_operation_scope_manifest(
         config=project.config,
         record=record,
         plan=plan,
         repo_id="fixture-repo",
     )
     permission_digests = {
-        role_key: entry.digest for role_key, entry in permission_manifest.roles.items()
+        role_key: entry.digest for role_key, entry in scope_manifest.steps[0].roles.items()
     }
     approval_path.write_text(
         approve_real_operation(
@@ -276,6 +429,7 @@ def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
             repo_id="fixture-repo",
             approval_ref="decision-execute-run",
             permission_digests=permission_digests,
+            scope_manifest_digest=scope_manifest.digest if len(scope_manifest.steps) > 1 else None,
         ).model_dump_json(),
         encoding="utf-8",
     )

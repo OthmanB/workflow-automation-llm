@@ -10,21 +10,17 @@ import pytest
 from helpers import create_fixture_project, valid_plan_values
 from pydantic import ValidationError
 
+from dispatcher.execution import SequentialExecutionCoordinator
 from dispatcher.plan import NormalizedPlan, VerificationCheck
+from dispatcher.sequential import SequentialWorkflow
+from dispatcher.state_store import StateStore
 from dispatcher.verification import (
     DarwinSeatbeltBackend,
+    DirectTestBackend,
     LinuxBubblewrapBackend,
     VerificationError,
     VerificationRunner,
 )
-
-
-class DirectTestBackend:
-    name = "direct-test"
-    production_ready = False
-
-    def command(self, argv: tuple[str, ...], _workspace: Path, _home: Path) -> list[str]:
-        return list(argv)
 
 
 def _step(tmp_path: Path, *, argv: list[str], timeout: int = 10, maximum: int = 65536):
@@ -39,6 +35,28 @@ def _step(tmp_path: Path, *, argv: list[str], timeout: int = 10, maximum: int = 
         }
     )
     return project, NormalizedPlan.model_validate(values).steps[0]
+
+
+def test_shared_fixture_coordinator_uses_direct_test_backend_without_seatbelt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dispatcher.verification.platform.system", lambda: "Linux")
+    project, step = _step(tmp_path, argv=[sys.executable, "-c", "print('verified')"])
+    store = StateStore(project.state, heartbeat_seconds=30, stale_after_seconds=120)
+    workflow = SequentialWorkflow(project.config, store, owner_id="test-backend-owner")
+    coordinator = SequentialExecutionCoordinator(
+        project.config,
+        store,
+        workflow,
+        owner_id="test-backend-owner",
+    )
+
+    runner = coordinator._verification_runner.__self__
+
+    assert isinstance(runner, VerificationRunner)
+    assert isinstance(runner.backend, DirectTestBackend)
+    assert coordinator._verification_runner(step, project.repository)[0].status == "passed"
 
 
 def test_verification_check_requires_argv_array_and_deny_network() -> None:

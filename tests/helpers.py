@@ -143,7 +143,7 @@ def create_fixture_project(
         "execution": {
             "mode": "mock_workflow_test",
             "protocol_version": 1,
-            "verification_backend": "darwin_seatbelt_v1",
+            "verification_backend": "direct_test_v1",
             "structured_git": {
                 "capability_version": 1,
                 "author_name": "Dispatcher Executor",

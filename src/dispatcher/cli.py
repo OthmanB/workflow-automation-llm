@@ -88,7 +88,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     approval_parser = sub.add_parser(
-        "approve-real-operation", help="write an approval record for one exact real-operation step"
+        "approve-real-operation", help="write an approval record for one exact autonomous scope"
     )
     approval_parser.add_argument("--config", required=True)
     approval_parser.add_argument("--run-id", required=True)
@@ -101,10 +101,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         metavar="ROLE=SHA256",
     )
+    approval_parser.add_argument(
+        "--scope-manifest-digest",
+        metavar="SHA256",
+        help="required for multi-step scopes; digest from permission-manifest after full review",
+    )
     approval_parser.add_argument("--output", required=True)
 
     manifest_parser = sub.add_parser(
-        "permission-manifest", help="write the exact role permission manifest for one step"
+        "permission-manifest", help="write the exact ordered real-operation approval scope"
     )
     manifest_parser.add_argument("--config", required=True)
     manifest_parser.add_argument("--run-id", required=True)
@@ -322,7 +327,7 @@ def _cmd_execute(args: argparse.Namespace) -> int:
         run_preflight(cfg, cfg.state_dir, run_session=run_session, skip_smoke=False)
         approval = details["approval"]
         assert isinstance(approval, dict)
-        store.append_audit_event(
+        store.append_audit_event_idempotently(
             run_id=args.run_id,
             event_id=f"audit-real-operation-{approval['approval_ref']}",
             sequence=record.sequence + 1,
@@ -377,14 +382,17 @@ def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
             repo_id=args.repo_id,
             approval_ref=args.approval_ref,
             permission_digests=parse_permission_digest_args(args.permission_digest),
+            scope_manifest_digest=args.scope_manifest_digest,
         )
         atomic_write_private_text(args.output, approval.model_dump_json(indent=2) + "\n")
     except (RealOperationError, StateStoreError, OSError, ValueError) as exc:
         print(f"approve-real-operation: FAILED - {exc}", file=sys.stderr)
         return 2
+    assert approval.scope_manifest is not None
     print(
         "approve-real-operation: written "
-        f"{args.output} run={approval.run_id} repo={approval.repo_id} step={approval.step_id}"
+        f"{args.output} run={approval.run_id} repo={approval.repo_id} "
+        f"steps={','.join(step.step_id for step in approval.scope_manifest.steps)}"
     )
     return 0
 
@@ -392,7 +400,7 @@ def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
 def _cmd_permission_manifest(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
-    from .operation import RealOperationError, compile_role_permission_manifest
+    from .operation import RealOperationError, compile_real_operation_scope_manifest
     from .plan import load_normalized_plan
     from .state_store import StateStoreError
 
@@ -402,7 +410,7 @@ def _cmd_permission_manifest(args: argparse.Namespace) -> int:
         store = state_mod.open_state_store(config)
         record, _generation = store.load_run(args.run_id)
         plan = load_normalized_plan(args.plan, config)
-        manifest = compile_role_permission_manifest(
+        manifest = compile_real_operation_scope_manifest(
             config=config,
             plan=plan,
             record=record,
@@ -414,8 +422,8 @@ def _cmd_permission_manifest(args: argparse.Namespace) -> int:
         return 2
     print(
         "permission-manifest: written "
-        f"{args.output} repo={manifest.repo_id} step={manifest.step_id} "
-        f"roles={','.join(manifest.roles)}"
+        f"{args.output} repo={args.repo_id} steps={','.join(step.step_id for step in manifest.steps)} "
+        f"digest={manifest.digest}"
     )
     return 0
 

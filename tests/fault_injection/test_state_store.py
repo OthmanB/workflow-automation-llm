@@ -936,6 +936,87 @@ def test_authoritative_run_report_includes_audit_event_summary(project: FixtureP
     assert "must-not-appear-in-summary" not in report
 
 
+def test_idempotent_audit_append_preserves_original_event_after_run_progresses(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-idempotent-event",
+        sequence=2,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload={"approval_ref": "decision-one"},
+    )
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-idempotent-event",
+        sequence=9,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload={"approval_ref": "different-payload-is-not-a-new-event"},
+    )
+
+    with sqlite3.connect(store.database_path) as connection:
+        rows = connection.execute(
+            "SELECT sequence, payload_json FROM audit_events WHERE event_id = 'audit-idempotent-event'"
+        ).fetchall()
+    assert [(row[0], json.loads(row[1])) for row in rows] == [(2, {"approval_ref": "decision-one"})]
+
+
+def test_idempotent_audit_append_rejects_incompatible_existing_event(project: FixtureProject) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    store.append_audit_event(
+        run_id=record.run_id,
+        event_id="audit-collision-event",
+        sequence=2,
+        kind="run_created",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload={"source": "existing"},
+    )
+
+    with pytest.raises(StateStoreError, match="UNIQUE constraint failed"):
+        store.append_audit_event(
+            run_id=record.run_id,
+            event_id="audit-collision-event",
+            sequence=2,
+            kind="run_created",
+            correlation_id=record.run_id,
+            causation_id=None,
+            payload={"source": "duplicate"},
+        )
+    for run_id, kind, correlation_id, causation_id in (
+        ("other-run", "run_created", record.run_id, None),
+        (record.run_id, "real_operation_approved", record.run_id, None),
+        (record.run_id, "run_created", "other-correlation", None),
+        (record.run_id, "run_created", record.run_id, "other-causation"),
+    ):
+        with pytest.raises(StateStoreCorruptionError, match="different authoritative identity"):
+            store.append_audit_event_idempotently(
+                run_id=run_id,
+                event_id="audit-collision-event",
+                sequence=9,
+                kind=kind,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                payload={"source": "incompatible"},
+            )
+
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT kind, payload_json FROM audit_events WHERE event_id = 'audit-collision-event'"
+        ).fetchone()
+    assert row == ("run_created", '{"source":"existing"}')
+
+
 @pytest.mark.parametrize(
     ("expires_at", "required_role", "actor_id", "message"),
     [

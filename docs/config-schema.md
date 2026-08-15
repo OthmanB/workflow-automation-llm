@@ -177,7 +177,9 @@ trimmed. The preflight check does not accept a substring match.
   supported local macOS backend for dispatcher-owned checks; it denies network
   and write access outside the disposable verification workspace.
   `linux_bwrap_v1` is an optional future Linux backend with an unshared network
-  namespace.
+  namespace. `direct_test_v1` is restricted to `mock_workflow_test` fixture
+  configurations; it preserves dispatcher-owned check execution semantics but
+  is rejected for `real_operation`.
 - `execution.structured_git` is explicit and has no runtime identity fallback.
   Its bounded dispatcher-owned capability calculates a candidate tree with an
   isolated temporary index, stages only the validated sorted path set in the

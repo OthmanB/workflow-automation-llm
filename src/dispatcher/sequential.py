@@ -17,7 +17,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Protocol, TypeVar, cast
 
-from .config import Config
+from .config import Config, ConfigError
 from .git_commit import (
     StructuredGitError,
     StructuredGitIntent,
@@ -41,6 +41,7 @@ from .protocol import (
     BatchDispatchCommand,
     DispatchCommand,
     HaltCommand,
+    ProtocolError,
     RequestCompletionCommand,
     RequestReviewWaiverCommand,
     parse_supervisor_command,
@@ -130,6 +131,10 @@ class RepositoryInspector(Protocol):
 
 class SequentialWorkflowError(ValueError):
     """A supervisor request or worker result violates dispatcher-owned invariants."""
+
+
+class SupervisorCommandRejectedError(SequentialWorkflowError):
+    """A supervisor command was rejected before it changed durable workflow state."""
 
 
 class WorkerResultValidationError(SequentialWorkflowError):
@@ -332,7 +337,10 @@ class SequentialWorkflow:
         supervisor_text: str,
     ) -> PreparedDispatch | PreparedBatch | CompletionDecision | RunRecord:
         """Parse and apply one strict supervisor command without launching a process."""
-        command = parse_supervisor_command(supervisor_text)
+        try:
+            command = parse_supervisor_command(supervisor_text)
+        except ProtocolError as exc:
+            raise SupervisorCommandRejectedError(str(exc)) from exc
         record, generation = self.store.load_run(run_id)
         if generation != expected_generation:
             raise SequentialWorkflowError("run generation changed before supervisor command")
@@ -353,7 +361,9 @@ class SequentialWorkflow:
             halted = transition_run(record, RunStatus.HALTED, event)
             self.store.save_run(halted, expected_generation=generation)
             return halted
-        raise SequentialWorkflowError(f"unsupported supervisor command: {type(command).__name__}")
+        raise SupervisorCommandRejectedError(
+            f"unsupported supervisor command: {type(command).__name__}"
+        )
 
     def prepare_dispatch(
         self,
@@ -367,9 +377,10 @@ class SequentialWorkflow:
         verification_feedback: tuple[AuthoritativeVerification, ...] = (),
     ) -> PreparedDispatch | RunRecord:
         """Commit a fully validated PREPARED dispatch before any worker launch."""
+        # Source drift is a fail-closed prerequisite, never a supervisor correction.
+        self._verify_dispatch_sources(record)
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a dispatch")
-        self._verify_dispatch_sources(record)
         if self.config.execution.scheduling == "sequential" and any(
             dispatch.state
             in {
@@ -388,7 +399,7 @@ class SequentialWorkflow:
                 raise SequentialWorkflowError(f"dispatch is not schedulable: {exc}") from exc
         step = _plan_step(record, command.step_id)
         if command.repo_id is not None and command.repo_id != step.repo_id:
-            raise SequentialWorkflowError(
+            raise SupervisorCommandRejectedError(
                 f"supervisor repository assertion {command.repo_id!r} does not match step repository {step.repo_id!r}"
             )
         role_kind = self._role_kind(command.target_role)
@@ -741,11 +752,16 @@ class SequentialWorkflow:
         command: BatchDispatchCommand,
     ) -> PreparedBatch:
         """Prepare one same-repository executor barrier in durable child worktrees."""
+        # Validate every command prerequisite before provisioning any worktree or lease.
+        self._verify_dispatch_sources(record)
+        for child in command.children:
+            self._role_kind(child.target_role)
         try:
             children = validate_workspace_batch(self.config, record, tuple(command.children))
         except SchedulingError as exc:
-            raise SequentialWorkflowError(f"workspace batch is not schedulable: {exc}") from exc
-        self._verify_dispatch_sources(record)
+            raise SequentialWorkflowError(
+                f"workspace batch is not schedulable: {exc}"
+            ) from exc
         repo_id = _plan_step(record, children[0].step_id).repo_id
         try:
             outcome = self.workspace_coordinator.prepare(
@@ -772,6 +788,10 @@ class SequentialWorkflow:
                     )
                 except WorkspaceError:
                     pass
+                if isinstance(exc, SupervisorCommandRejectedError):
+                    raise SequentialWorkflowError(
+                        "workspace batch command became invalid after workspace preparation"
+                    ) from exc
             if isinstance(exc, SequentialWorkflowError):
                 raise
             raise SequentialWorkflowError(f"workspace batch preparation failed: {exc}") from exc
@@ -786,10 +806,11 @@ class SequentialWorkflow:
         sources_verified: bool = False,
     ) -> PreparedBatch:
         """Atomically prepare every independently valid child in a protocol-v2 batch."""
-        if record.state is not RunStatus.RUNNING:
-            raise SequentialWorkflowError("only RUNNING runs may prepare a batch")
+        # Source drift is a fail-closed prerequisite, never a supervisor correction.
         if not sources_verified:
             self._verify_dispatch_sources(record)
+        if record.state is not RunStatus.RUNNING:
+            raise SequentialWorkflowError("only RUNNING runs may prepare a batch")
         if workspace_group is None:
             try:
                 children = validate_batch(self.config, record, tuple(command.children))
@@ -804,7 +825,7 @@ class SequentialWorkflow:
         for child in children:
             step = _plan_step(working, child.step_id)
             if child.repo_id is not None and child.repo_id != step.repo_id:
-                raise SequentialWorkflowError(
+                raise SupervisorCommandRejectedError(
                     f"supervisor repository assertion {child.repo_id!r} does not match step repository {step.repo_id!r}"
                 )
             role_kind = self._role_kind(child.target_role)
@@ -813,7 +834,9 @@ class SequentialWorkflow:
                 role_kind,
             )
             if not working.steps[step.step_id].operator_gate_resolved:
-                raise SequentialWorkflowError(f"batch step {step.step_id} has an unresolved operator gate")
+                raise SequentialWorkflowError(
+                    f"batch step {step.step_id} has an unresolved operator gate"
+                )
             self._ensure_budget_allows_dispatch(
                 working,
                 step,
@@ -2483,6 +2506,189 @@ class SequentialWorkflow:
                 reason=str(exc),
             )
 
+    @_serialized_transition
+    def prepare_pending_reviewer_result_validation_retry(
+        self,
+        record: RunRecord,
+        generation: int,
+    ) -> PreparedDispatch | tuple[RunRecord, int] | None:
+        """Prepare one safe fresh retry for a durable malformed reviewer response."""
+        candidates = [
+            dispatch
+            for dispatch in record.dispatches.values()
+            if dispatch.role_kind == "reviewer"
+            and dispatch.state is DispatchStatus.FAILED
+            and dispatch.failure_category == "result_validation"
+            and record.steps[dispatch.step_id].state is StepStatus.REVIEW_REQUIRED
+        ]
+        if not candidates:
+            return None
+        failed_dispatch = max(
+            candidates,
+            key=lambda dispatch: (dispatch.last_event.sequence, dispatch.dispatch_id),
+        )
+        try:
+            self._verify_reviewer_result_validation_retry(record, failed_dispatch)
+            if record.state is RunStatus.WAITING_OPERATOR:
+                request = record.operator_request
+                if (
+                    request is None
+                    or request.kind != "reconciliation"
+                    or request.context_ref != failed_dispatch.dispatch_id
+                    or request.step_id != failed_dispatch.step_id
+                ):
+                    raise SequentialWorkflowError(
+                        "failed reviewer retry is blocked by an unrelated operator request"
+                    )
+                resume_event = self._event(
+                    record,
+                    "dispatcher",
+                    "durable malformed reviewer response is safe to retry",
+                    failed_dispatch.dispatch_id,
+                )
+                record = transition_run(record, RunStatus.RUNNING, resume_event)
+                generation = self.store.save_run(record, expected_generation=generation)
+            if record.state is not RunStatus.RUNNING:
+                raise SequentialWorkflowError(
+                    f"failed reviewer retry requires a RUNNING run, found {record.state.value}"
+                )
+            retried = self.prepare_dispatch(
+                record,
+                generation,
+                DispatchCommand(
+                    protocol_version=1,
+                    action="dispatch",
+                    step_id=failed_dispatch.step_id,
+                    target_role=failed_dispatch.role_key,
+                    session_mode="new",
+                    prompt=(
+                        "Return the required typed reviewer result for the same immutable review target. "
+                        "Do not repeat any executor work or accepted reviewer work."
+                    ),
+                    rationale="dispatcher-owned malformed reviewer response recovery",
+                ),
+            )
+            if not isinstance(retried, PreparedDispatch):
+                raise SequentialWorkflowError("reviewer result-validation retry unexpectedly requested an operator gate")
+            return retried
+        except (SequentialWorkflowError, RepositoryValidationError, StateStoreError, ValueError) as exc:
+            return self._reviewer_result_validation_retry_waiting_record(
+                record,
+                generation,
+                failed_dispatch,
+                reason=str(exc),
+            )
+
+    def _verify_reviewer_result_validation_retry(
+        self,
+        record: RunRecord,
+        failed_dispatch: DispatchRecord,
+    ) -> None:
+        """Reject retries unless the failed reader still targets the exact same work product."""
+        if failed_dispatch.batch_id is not None:
+            raise SequentialWorkflowError("batch reviewer result-validation retries require reconciliation")
+        step = _plan_step(record, failed_dispatch.step_id)
+        step_record = record.steps[failed_dispatch.step_id]
+        if failed_dispatch.attempt != step_record.reviewer_attempts:
+            raise SequentialWorkflowError("failed reviewer attempt is not the step's current reviewer attempt")
+        if step_record.reviewer_attempts >= step.retry.max_reviewer_attempts:
+            raise SequentialWorkflowError("step exhausted reviewer attempts")
+        if step_record.stalls >= self.config.execution.stall_policy.maximum_retries_per_step:
+            raise SequentialWorkflowError("step exhausted bounded reviewer retries")
+        obligation = self._review_obligation(record, step)
+        if failed_dispatch.role_key not in obligation.reviewer_role_keys:
+            raise SequentialWorkflowError("failed reviewer role is no longer obligated for the step")
+        if failed_dispatch.role_key in step_record.accepted_reviewer_role_keys:
+            raise SequentialWorkflowError("failed reviewer role already accepted the immutable artifact")
+        if any(
+            dispatch.dispatch_id != failed_dispatch.dispatch_id
+            and dispatch.state in ACTIVE_DISPATCH_STATES
+            for dispatch in record.dispatches.values()
+        ):
+            raise SequentialWorkflowError("another dispatch is unresolved during reviewer retry recovery")
+        self._verify_dispatch_sources(record)
+        payload = self.store.load_dispatch_payload(record.run_id, failed_dispatch.dispatch_id)
+        if (
+            payload.result is not None
+            or payload.forwarding_payload is not None
+            or self.store.review_for_dispatch(record.run_id, failed_dispatch.dispatch_id)
+        ):
+            raise SequentialWorkflowError("failed reviewer response was already durably applied")
+        if hashlib.sha256(payload.prompt.encode("utf-8")).hexdigest() != failed_dispatch.intent.prompt_sha256:
+            raise SequentialWorkflowError("failed reviewer prompt does not match its immutable dispatch intent")
+        if _sha256_json(payload.policy) != failed_dispatch.intent.policy_digest:
+            raise SequentialWorkflowError("failed reviewer policy does not match its immutable dispatch intent")
+        if payload.repository_before is None:
+            raise SequentialWorkflowError("failed reviewer dispatch has no durable repository snapshot")
+        metadata = payload.session_metadata or {}
+        raw_target = metadata.get("review_target")
+        if not isinstance(raw_target, dict):
+            raise SequentialWorkflowError("failed reviewer dispatch has no durable review target")
+        try:
+            review_target = ReviewTarget.model_validate_json(json.dumps(raw_target))
+            repository_before = RepositorySnapshot.model_validate_json(
+                json.dumps(payload.repository_before)
+            )
+        except ValueError as exc:
+            raise SequentialWorkflowError(
+                "failed reviewer retry recovery metadata is malformed"
+            ) from exc
+        if review_target != self._review_target(record, step):
+            raise SequentialWorkflowError(
+                "failed reviewer target no longer matches the immutable work product"
+            )
+        observed = self._inspect_dispatch_repository(record, failed_dispatch, require_clean=True)
+        if observed != repository_before:
+            raise SequentialWorkflowError(
+                "repository snapshot changed after the malformed reviewer response"
+            )
+        validate_review_snapshot(
+            self.config,
+            coordinate=failed_dispatch.intent.repository,
+            before=repository_before,
+            after=observed,
+            review_target=review_target,
+        )
+
+    def _reviewer_result_validation_retry_waiting_record(
+        self,
+        record: RunRecord,
+        generation: int,
+        failed_dispatch: DispatchRecord,
+        *,
+        reason: str,
+    ) -> tuple[RunRecord, int]:
+        """Preserve failed reviewer evidence and require an operator when retry checks fail."""
+        if record.state is RunStatus.WAITING_OPERATOR:
+            return record, generation
+        if record.state is not RunStatus.RUNNING:
+            raise SequentialWorkflowError(
+                f"failed reviewer retry cannot enter recovery from {record.state.value}"
+            )
+        safe_reason = redact_text(reason)[:5000]
+        event = self._event(
+            record,
+            "dispatcher",
+            "malformed reviewer response retry requires operator reconciliation",
+            failed_dispatch.dispatch_id,
+        )
+        request = OperatorRequest(
+            request_id=f"request-{uuid.uuid4().hex}",
+            question=(
+                f"A malformed response from reviewer {failed_dispatch.role_key} cannot be retried safely: "
+                f"{safe_reason}. Reconcile the immutable review target and repository snapshot or halt."
+            ),
+            allowed_answers=["reconcile", "halt"],
+            context_ref=failed_dispatch.dispatch_id,
+            resume_to=RunStatus.RUNNING,
+            expires_at=None,
+            required_role=None,
+            kind="reconciliation",
+            step_id=failed_dispatch.step_id,
+        )
+        waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+        return waiting, self.store.save_run(waiting, expected_generation=generation)
+
     def _verification_usage_waiting_record(
         self,
         record: RunRecord,
@@ -3533,7 +3739,7 @@ class SequentialWorkflow:
         command: AskOperatorCommand,
     ) -> RunRecord:
         if record.policy is None or record.policy.underspec_mode != "ask":
-            raise SequentialWorkflowError(
+            raise SupervisorCommandRejectedError(
                 "underspecification requests are denied when execution.underspec_mode is auto"
             )
         event = self._event(record, "supervisor", "operator input requested", "operator-request")
@@ -3561,9 +3767,9 @@ class SequentialWorkflow:
         step = _plan_step(record, command.step_id)
         obligation = self._review_obligation(record, step)
         if record.steps[step.step_id].state is not StepStatus.REVIEW_REQUIRED:
-            raise SequentialWorkflowError("review waiver requires a step awaiting review")
+            raise SupervisorCommandRejectedError("review waiver requires a step awaiting review")
         if not obligation.waivable:
-            raise SequentialWorkflowError("compiled review obligation cannot be waived")
+            raise SupervisorCommandRejectedError("compiled review obligation cannot be waived")
         event = self._event(record, "supervisor", command.rationale, step.step_id)
         request = OperatorRequest(
             request_id=f"request-{uuid.uuid4().hex}",
@@ -3610,9 +3816,13 @@ class SequentialWorkflow:
         budget = self.config.model.budget
         step_usage = record.usage.by_step.get(step.step_id, UsageAmount())
         if record.usage.run.cost_usd >= budget.max_run_cost_usd:
-            raise SequentialWorkflowError("run cost budget is exhausted; a new dispatch is forbidden")
+            raise SequentialWorkflowError(
+                "run cost budget is exhausted; a new dispatch is forbidden"
+            )
         if step_usage.cost_usd >= budget.max_step_cost_usd:
-            raise SequentialWorkflowError(f"step {step.step_id} cost budget is exhausted; a new dispatch is forbidden")
+            raise SequentialWorkflowError(
+                f"step {step.step_id} cost budget is exhausted; a new dispatch is forbidden"
+            )
         if session_mode == "resume":
             pool = "executors" if self._role_kind(role_key) == "executor" else "reviewers"
             session = self.store.sessions_for_run(record.run_id).get(pool, {}).get(role_key, {})
@@ -3775,7 +3985,7 @@ class SequentialWorkflow:
         step_record = record.steps[step.step_id]
         expected_state = StepStatus.READY if role_kind == "executor" else StepStatus.REVIEW_REQUIRED
         if step_record.state is not expected_state:
-            raise SequentialWorkflowError(
+            raise SupervisorCommandRejectedError(
                 f"step {step.step_id} is {step_record.state.value}, not {expected_state.value}"
             )
         if role_kind == "executor":
@@ -3783,25 +3993,35 @@ class SequentialWorkflow:
                 step_record.reassignment_role_key is not None
                 and role_key != step_record.reassignment_role_key
             ):
-                raise SequentialWorkflowError(
+                raise SupervisorCommandRejectedError(
                     f"step {step.step_id} requires reassignment to {step_record.reassignment_role_key}"
                 )
             if step_record.executor_attempts >= step.retry.max_executor_attempts:
-                raise SequentialWorkflowError(f"step {step.step_id} exhausted executor attempts")
+                raise SequentialWorkflowError(
+                    f"step {step.step_id} exhausted executor attempts"
+                )
         else:
             obligation = self._review_obligation(record, step)
             if mode != "new":
-                raise SequentialWorkflowError("reviewer sessions must be new for independent review")
+                raise SupervisorCommandRejectedError(
+                    "reviewer sessions must be new for independent review"
+                )
             if role_key not in obligation.reviewer_role_keys:
-                raise SequentialWorkflowError(f"role {role_key} is not compiled to review step {step.step_id}")
+                raise SupervisorCommandRejectedError(
+                    f"role {role_key} is not compiled to review step {step.step_id}"
+                )
             if role_key in step_record.accepted_reviewer_role_keys:
-                raise SequentialWorkflowError(f"role {role_key} already accepted step {step.step_id}")
+                raise SupervisorCommandRejectedError(
+                    f"role {role_key} already accepted step {step.step_id}"
+                )
             if step_record.reviewer_attempts >= step.retry.max_reviewer_attempts:
-                raise SequentialWorkflowError(f"step {step.step_id} exhausted reviewer attempts")
+                raise SequentialWorkflowError(
+                    f"step {step.step_id} exhausted reviewer attempts"
+                )
         for dependency_id in step.depends_on:
             dependency = record.steps[dependency_id]
             if dependency.state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}:
-                raise SequentialWorkflowError(
+                raise SupervisorCommandRejectedError(
                     f"step {step.step_id} dependency {dependency_id} is not accepted"
                 )
         for artifact in step.required_inputs:
@@ -3809,14 +4029,16 @@ class SequentialWorkflow:
                 continue
             producer = record.steps[artifact.producer_step_id]
             if producer.state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}:
-                raise SequentialWorkflowError(
+                raise SupervisorCommandRejectedError(
                     f"step {step.step_id} input producer {artifact.producer_step_id} is not accepted"
                 )
         if mode in {"resume", "fork"}:
             sessions = self.store.sessions_for_run(record.run_id)
             pool = "executors" if role_kind == "executor" else "reviewers"
             if not sessions.get(pool, {}).get(role_key, {}).get("session_id"):
-                raise SequentialWorkflowError("requested session mode has no dispatcher-owned session")
+                raise SequentialWorkflowError(
+                    "requested session mode has no dispatcher-owned session"
+                )
 
     def _review_target(self, record: RunRecord, step: PlanStep) -> ReviewTarget:
         candidates = [
@@ -3959,9 +4181,12 @@ class SequentialWorkflow:
         return transition_step(blocked, StepStatus.FAILED, event)
 
     def _role_kind(self, role_key: str) -> Literal["executor", "reviewer"]:
-        role_kind = self.config.role_kind(role_key)
+        try:
+            role_kind = self.config.role_kind(role_key)
+        except ConfigError as exc:
+            raise SupervisorCommandRejectedError(str(exc)) from exc
         if role_kind not in {"executor", "reviewer"}:
-            raise SequentialWorkflowError("supervisor cannot be a dispatch target")
+            raise SupervisorCommandRejectedError("supervisor cannot be a dispatch target")
         return cast(Literal["executor", "reviewer"], role_kind)
 
     def _owned_session_id(
@@ -4002,7 +4227,7 @@ def _plan_step(record: RunRecord, step_id: str) -> PlanStep:
     for step in record.plan.steps:
         if step.step_id == step_id:
             return step
-    raise SequentialWorkflowError(f"supervisor requested unknown plan step: {step_id}")
+    raise SupervisorCommandRejectedError(f"supervisor requested unknown plan step: {step_id}")
 
 
 def session_registry_identity(
@@ -4350,7 +4575,8 @@ def _worker_prompt(
                 "no extra fields, no missing required fields, and no values outside any defined enum. "
                 "verification MUST provide exact one-to-one criterion_id/check_id coverage with no duplicate, "
                 "missing, renamed, or extra IDs; accepted requires every verification status to be passed, "
-                "while non-success verdicts still require exact coverage."
+                "accepted requires required_remediation to be an empty list, while non-success verdicts "
+                "still require exact coverage."
             ),
             "acceptance_criteria": [
                 criterion.model_dump(mode="json") for criterion in step.acceptance_criteria

@@ -33,6 +33,14 @@ def test_minimal_schema_v1_fixture_loads(project: FixtureProject) -> None:
     assert config.model_json_schema()["properties"]["schema_version"]
 
 
+def test_direct_test_backend_is_rejected_for_real_operations(project: FixtureProject) -> None:
+    values = config_values(project)
+    values["execution"]["mode"] = "real_operation"
+
+    with pytest.raises(ConfigError, match="only allowed in mock_workflow_test mode"):
+        _write_and_load(project, values)
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

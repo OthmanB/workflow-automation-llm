@@ -73,6 +73,14 @@ class RolePermissionManifest(ContractModel):
     structured_git: "StructuredGitCapability"
 
 
+class RealOperationScopeManifest(ContractModel):
+    """Ordered set of step permissions approved for one autonomous run segment."""
+
+    scope_version: Literal[1]
+    steps: tuple[RolePermissionManifest, ...]
+    digest: Sha256
+
+
 class StructuredGitCapability(ContractModel):
     """Dispatcher-side commit authority bound independently of child permissions."""
 
@@ -90,7 +98,7 @@ class StructuredGitCapability(ContractModel):
 
 
 class RealOperationApproval(ContractModel):
-    """Operator decision bound to one exact real-operation launch target."""
+    """Operator decision bound to an exact autonomous real-operation scope."""
 
     approval_ref: Identifier
     project_id: Identifier
@@ -100,6 +108,7 @@ class RealOperationApproval(ContractModel):
     repo_id: Identifier
     step_id: Identifier
     permission_manifest: RolePermissionManifest
+    scope_manifest: RealOperationScopeManifest | None = None
     decided_at: datetime
 
 
@@ -145,6 +154,77 @@ def first_pending_executable_step(
     )
 
 
+def autonomous_execution_scope(
+    plan: NormalizedPlan,
+    record: RunRecord,
+) -> tuple[PlanStep, ...]:
+    """Return every pending or ready step reachable without another operator gate."""
+    completed = {
+        step_id
+        for step_id, step in record.steps.items()
+        if step.state in {StepStatus.ACCEPTED, StepStatus.WAIVED}
+    }
+    scoped: list[PlanStep] = []
+    scoped_ids: set[str] = set()
+    for step in plan.steps:
+        current = record.steps[step.step_id]
+        if current.state not in {StepStatus.PENDING, StepStatus.READY}:
+            continue
+        if not current.operator_gate_resolved:
+            break
+        if any(dependency_id not in completed | scoped_ids for dependency_id in step.depends_on):
+            continue
+        if any(
+            artifact.producer_step_id is not None
+            and artifact.producer_step_id not in completed | scoped_ids
+            for artifact in step.required_inputs
+        ):
+            continue
+        scoped.append(step)
+        scoped_ids.add(step.step_id)
+    return tuple(scoped)
+
+
+def _approval_scope_steps(
+    plan: NormalizedPlan,
+    record: RunRecord,
+    *,
+    start_step_id: str,
+) -> tuple[PlanStep, ...]:
+    """Rebuild an approval's ordered scope while retaining completed and recoverable prefix steps."""
+    try:
+        start_index = next(
+            index for index, step in enumerate(plan.steps) if step.step_id == start_step_id
+        )
+    except StopIteration as exc:
+        raise RealOperationError("real operation approval record references an unknown step") from exc
+    completed = {
+        step_id
+        for step_id, step in record.steps.items()
+        if step.state in {StepStatus.ACCEPTED, StepStatus.WAIVED}
+    }
+    resumable = {StepStatus.PENDING, StepStatus.READY, StepStatus.REVIEW_REQUIRED}
+    scoped: list[PlanStep] = []
+    scoped_ids: set[str] = set()
+    for step in plan.steps[start_index:]:
+        current = record.steps[step.step_id]
+        if current.state not in resumable | {StepStatus.ACCEPTED, StepStatus.WAIVED}:
+            break
+        if not current.operator_gate_resolved:
+            break
+        if any(dependency_id not in completed | scoped_ids for dependency_id in step.depends_on):
+            break
+        if any(
+            artifact.producer_step_id is not None
+            and artifact.producer_step_id not in completed | scoped_ids
+            for artifact in step.required_inputs
+        ):
+            break
+        scoped.append(step)
+        scoped_ids.add(step.step_id)
+    return tuple(scoped)
+
+
 def compile_role_permission_manifest(
     *,
     config: Config,
@@ -156,7 +236,18 @@ def compile_role_permission_manifest(
     pending_step = first_pending_executable_step(plan, record)
     if pending_step is None or pending_step.repo_id != repo_id:
         raise RealOperationError("requested repository is not the first pending executable step")
-    obligation = compile_run_policy(config, plan).review_obligations[pending_step.step_id]
+    return _compile_role_permission_manifest_for_step(config=config, plan=plan, step=pending_step)
+
+
+def _compile_role_permission_manifest_for_step(
+    *,
+    config: Config,
+    plan: NormalizedPlan,
+    step: PlanStep,
+) -> RolePermissionManifest:
+    """Compile the canonical role and structured-Git manifest for one plan step."""
+    repo_id = step.repo_id
+    obligation = compile_run_policy(config, plan).review_obligations[step.step_id]
     role_keys = [
         *config.model.roles.supervisor,
         *config.model.roles.executors,
@@ -169,7 +260,7 @@ def compile_role_permission_manifest(
         role_kind = config.role_kind(role_key)
         try:
             authorized_actions = role_scoped_authorized_actions(
-                pending_step.authorization.authorized_actions,
+                step.authorization.authorized_actions,
                 role_kind,
             )
             permission = generate_opencode_config(
@@ -194,7 +285,7 @@ def compile_role_permission_manifest(
     repository = config.repository(repo_id)
     evidence_paths = tuple(
         (PurePosixPath(root) / PurePosixPath(requirement.relative_path)).as_posix()
-        for requirement in pending_step.evidence_requirements
+        for requirement in step.evidence_requirements
         for root in repository.evidence_roots
     )
     identity_digest = digest_json(
@@ -209,10 +300,10 @@ def compile_role_permission_manifest(
         "capability_version": config.execution.structured_git.capability_version,
         "safety_policy_version": 1,
         "repo_id": repo_id,
-        "step_id": pending_step.step_id,
+        "step_id": step.step_id,
         "commit_policy": repository.commit_policy,
-        "commit_authorized": "commit" in pending_step.authorization.authorized_actions,
-        "writable_paths": list(pending_step.authorization.writable_paths),
+        "commit_authorized": "commit" in step.authorization.authorized_actions,
+        "writable_paths": list(step.authorization.writable_paths),
         "evidence_paths": list(evidence_paths),
         "message_format": "dispatcher: <step_id> attempt <n>",
         "identity_digest": identity_digest,
@@ -221,10 +312,10 @@ def compile_role_permission_manifest(
         capability_version=config.execution.structured_git.capability_version,
         safety_policy_version=1,
         repo_id=repo_id,
-        step_id=pending_step.step_id,
+        step_id=step.step_id,
         commit_policy=repository.commit_policy,
-        commit_authorized="commit" in pending_step.authorization.authorized_actions,
-        writable_paths=pending_step.authorization.writable_paths,
+        commit_authorized="commit" in step.authorization.authorized_actions,
+        writable_paths=step.authorization.writable_paths,
         evidence_paths=evidence_paths,
         message_format="dispatcher: <step_id> attempt <n>",
         identity_digest=identity_digest,
@@ -233,10 +324,87 @@ def compile_role_permission_manifest(
     return RolePermissionManifest(
         manifest_version=2,
         repo_id=repo_id,
-        step_id=pending_step.step_id,
+        step_id=step.step_id,
         roles=entries,
         structured_git=structured_git,
     )
+
+
+def compile_real_operation_scope_manifest(
+    *,
+    config: Config,
+    plan: NormalizedPlan,
+    record: RunRecord,
+    repo_id: str,
+) -> RealOperationScopeManifest:
+    """Compile the complete ordered scope reachable from the current launch step."""
+    pending_step = first_pending_executable_step(plan, record)
+    if pending_step is None or pending_step.repo_id != repo_id:
+        raise RealOperationError("requested repository is not the first pending executable step")
+    scoped_steps = autonomous_execution_scope(plan, record)
+    if not scoped_steps or scoped_steps[0].step_id != pending_step.step_id:
+        raise RealOperationError(
+            "the first pending executable step cannot run without an unresolved dependency or operator gate"
+        )
+    return _scope_manifest_for_steps(config=config, plan=plan, steps=scoped_steps)
+
+
+def _scope_manifest_for_steps(
+    *,
+    config: Config,
+    plan: NormalizedPlan,
+    steps: tuple[PlanStep, ...],
+) -> RealOperationScopeManifest:
+    """Compile ordered immutable role and structured-Git permissions for known scope steps."""
+    manifests = tuple(
+        _compile_role_permission_manifest_for_step(config=config, plan=plan, step=step)
+        for step in steps
+    )
+    payload = {
+        "scope_version": 1,
+        "steps": [manifest.model_dump(mode="json") for manifest in manifests],
+    }
+    return RealOperationScopeManifest(
+        scope_version=1,
+        steps=manifests,
+        digest=digest_json(payload),
+    )
+
+
+def _compile_approved_real_operation_scope_manifest(
+    *,
+    config: Config,
+    plan: NormalizedPlan,
+    record: RunRecord,
+    repo_id: str,
+    start_step_id: str,
+) -> RealOperationScopeManifest:
+    """Rebuild the originally approved scope across a completed or recoverable prefix."""
+    scoped_steps = _approval_scope_steps(plan, record, start_step_id=start_step_id)
+    if not scoped_steps or scoped_steps[0].step_id != start_step_id:
+        raise RealOperationError(
+            "the approved real-operation scope cannot resume without an unresolved dependency or operator gate"
+        )
+    if scoped_steps[0].repo_id != repo_id:
+        raise RealOperationError("real operation approval record does not match the current repository")
+    return _scope_manifest_for_steps(config=config, plan=plan, steps=scoped_steps)
+
+
+def _first_remaining_scope_manifest(
+    scope_manifest: RealOperationScopeManifest,
+    record: RunRecord,
+) -> RolePermissionManifest:
+    """Return the first unfinished approved step without discarding the completed prefix."""
+    for manifest in scope_manifest.steps:
+        state = record.steps[manifest.step_id].state
+        if state not in {StepStatus.ACCEPTED, StepStatus.WAIVED}:
+            if state not in {StepStatus.PENDING, StepStatus.READY, StepStatus.REVIEW_REQUIRED}:
+                raise RealOperationError(
+                    f"approved real-operation scope cannot resume from step {manifest.step_id} "
+                    f"in state {state.value}"
+                )
+            return manifest
+    raise RealOperationError("approved real-operation scope has no unfinished step to execute")
 
 
 def parse_permission_digest_args(values: Sequence[str]) -> dict[str, str]:
@@ -276,6 +444,26 @@ def _validate_permission_digests(
         )
 
 
+def _validate_scope_manifest_digest(
+    scope_manifest: RealOperationScopeManifest,
+    supplied: str | None,
+) -> None:
+    if supplied is None:
+        if len(scope_manifest.steps) > 1:
+            raise RealOperationError(
+                "multi-step real-operation approval requires --scope-manifest-digest from "
+                "permission-manifest after reviewing every scoped step"
+            )
+        return
+    if not re.fullmatch(r"[a-f0-9]{64}", supplied):
+        raise RealOperationError("scope manifest digest is not a SHA-256 value")
+    if supplied != scope_manifest.digest:
+        raise RealOperationError(
+            "scope manifest digest does not match the current full scope; rerun permission-manifest "
+            "and review every scoped step"
+        )
+
+
 def approve_real_operation(
     *,
     config: Config,
@@ -284,18 +472,18 @@ def approve_real_operation(
     repo_id: str,
     approval_ref: str,
     permission_digests: Mapping[str, str],
+    scope_manifest_digest: str | None = None,
 ) -> RealOperationApproval:
-    """Bind an operator decision to the current run's first executable step."""
-    pending_step = first_pending_executable_step(plan, record)
-    if pending_step is None or pending_step.repo_id != repo_id:
-        raise RealOperationError("requested repository is not the first pending executable step")
-    permission_manifest = compile_role_permission_manifest(
+    """Bind an operator decision to every reachable autonomous plan step."""
+    scope_manifest = compile_real_operation_scope_manifest(
         config=config,
         plan=plan,
         record=record,
         repo_id=repo_id,
     )
+    permission_manifest = scope_manifest.steps[0]
     _validate_permission_digests(permission_manifest, permission_digests)
+    _validate_scope_manifest_digest(scope_manifest, scope_manifest_digest)
     return RealOperationApproval(
         approval_ref=approval_ref,
         project_id=config.project_id,
@@ -303,8 +491,9 @@ def approve_real_operation(
         plan_digest=record.plan_digest,
         run_id=record.run_id,
         repo_id=repo_id,
-        step_id=pending_step.step_id,
+        step_id=permission_manifest.step_id,
         permission_manifest=permission_manifest,
+        scope_manifest=scope_manifest,
         decided_at=datetime.now(UTC),
     )
 
@@ -349,9 +538,6 @@ def validate_real_operation_prerequisites(
     snapshot = inspect_repository(config, repo_id, require_clean=True)
     if snapshot.revision != expected_revision:
         raise RealOperationError("repository is not at the expected revision")
-    pending_step = first_pending_executable_step(current_plan, record)
-    if pending_step is None or pending_step.repo_id != repo_id:
-        raise RealOperationError("requested repository is not the first pending executable step")
     approval = load_real_operation_approval(approval_record_path)
     if approval.project_id != config.project_id:
         raise RealOperationError("real operation approval record does not match the current project")
@@ -363,20 +549,34 @@ def validate_real_operation_prerequisites(
         raise RealOperationError("real operation approval record does not match the current run")
     if approval.repo_id != repo_id:
         raise RealOperationError("real operation approval record does not match the current repository")
-    if approval.step_id != pending_step.step_id:
+    if approval.step_id not in {step.step_id for step in current_plan.steps}:
         raise RealOperationError("real operation approval record does not match the current step")
-    expected_permission_manifest = compile_role_permission_manifest(
+    expected_scope_manifest = _compile_approved_real_operation_scope_manifest(
         config=config,
         plan=current_plan,
         record=record,
         repo_id=repo_id,
+        start_step_id=approval.step_id,
     )
-    if approval.permission_manifest.model_dump(mode="json") != expected_permission_manifest.model_dump(
+    if approval.permission_manifest.model_dump(mode="json") != expected_scope_manifest.steps[0].model_dump(
         mode="json"
     ):
         raise RealOperationError(
             "real operation approval record does not match the current role permission manifest"
         )
+    if approval.scope_manifest is None:
+        if len(expected_scope_manifest.steps) > 1:
+            raise RealOperationError(
+                "legacy single-step real operation approval cannot authorize the current multi-step "
+                "scope; rerun permission-manifest and approve the full scope"
+            )
+    elif approval.scope_manifest.model_dump(mode="json") != expected_scope_manifest.model_dump(
+        mode="json"
+    ):
+        raise RealOperationError(
+            "real operation approval record does not match the current complete approval scope"
+        )
+    expected_permission_manifest = _first_remaining_scope_manifest(expected_scope_manifest, record)
     smoke = load_live_smoke_proof(smoke_proof_path)
     if not smoke.passed or not smoke.session_id_present or not smoke.workdir_clean or smoke.evidence_written:
         raise RealOperationError("live smoke proof does not prove a clean read-only run")
@@ -404,8 +604,9 @@ def validate_real_operation_prerequisites(
         "repo_id": repo_id,
         "revision": snapshot.revision,
         "branch": snapshot.branch,
-        "step_id": pending_step.step_id,
+        "step_id": expected_permission_manifest.step_id,
         "permission_manifest": expected_permission_manifest.model_dump(mode="json"),
+        "scope_manifest": expected_scope_manifest.model_dump(mode="json"),
         "verification_backend": backend.name,
         "stall_policy_digest": expected_stall_digest,
         "approval": approval.model_dump(mode="json"),

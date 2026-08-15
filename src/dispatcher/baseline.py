@@ -212,7 +212,7 @@ def validate_approved_baseline(
     config: Config,
     store: StateStore,
 ) -> BaselineApproval:
-    """Reject an approved baseline if its source, repositories, or evidence changed."""
+    """Reject an approval when plan sources or ACCEPTED provenance has changed."""
     stored = store.load_baseline(project_id=config.project_id, plan_digest=plan.plan_digest)
     if stored is None:
         raise BaselineError("no approved baseline exists for the active normalized plan")
@@ -224,8 +224,7 @@ def validate_approved_baseline(
         raise BaselineError("stored baseline uses an unsupported historical approval format; inspect and approve again") from exc
     _validate_observation(approval.observation, plan, config)
     current = inspect_baseline(plan, config)
-    if approval.observation.observation_digest != current.observation_digest:
-        raise BaselineError("historical evidence changed since baseline approval; inspect and approve again")
+    _validate_accepted_provenance(approval, current)
     return approval
 
 
@@ -304,6 +303,35 @@ def _validate_observation(observation: BaselineObservation, plan: NormalizedPlan
     if {step.step_id for step in observation.steps} != {step.step_id for step in plan.steps}:
         raise BaselineError("baseline observation must cover every normalized plan step")
     _verify_sources(plan, config)
+
+
+def _validate_accepted_provenance(
+    approval: BaselineApproval,
+    current: BaselineObservation,
+) -> None:
+    """Keep only explicit ACCEPTED decisions bound to their approved artifact facts.
+
+    PENDING work may create evidence, review proof, and commits while an autonomous
+    run advances. WAIVED is an explicit non-acceptance disposition, so it carries no
+    evidence provenance claim to revalidate.
+    """
+    approved_steps = {step.step_id: step for step in approval.observation.steps}
+    current_steps = {step.step_id: step for step in current.steps}
+    for decision in approval.decisions:
+        if decision.state != "ACCEPTED":
+            continue
+        approved = approved_steps[decision.step_id]
+        observed = current_steps[decision.step_id]
+        if approved.evidence != observed.evidence:
+            raise BaselineError(
+                f"historical evidence changed for accepted step {decision.step_id} since baseline approval; "
+                "inspect and approve again"
+            )
+        if approved.review_evidence != observed.review_evidence:
+            raise BaselineError(
+                f"historical review proof changed for accepted step {decision.step_id} since baseline approval; "
+                "inspect and approve again"
+            )
 
 
 def _verify_sources(plan: NormalizedPlan, config: Config) -> None:

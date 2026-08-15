@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from dispatcher.operation import (
     RealOperationApproval,
     RealOperationError,
     approve_real_operation,
+    compile_real_operation_scope_manifest,
     compile_role_permission_manifest,
     digest_json,
     parse_permission_digest_args,
@@ -20,7 +23,13 @@ from dispatcher.operation import (
 from dispatcher.plan import NormalizedPlan, approve_plan
 from dispatcher.repository import RepositorySnapshot
 from dispatcher.state_store import StateStore
-from dispatcher.workflow import TransitionEvent, new_run_record
+from dispatcher.verification import verification_backend
+from dispatcher.workflow import StepStatus, TransitionEvent, new_run_record
+
+
+class AvailableDarwinSeatbeltBackend:
+    name = "darwin-seatbelt-v1"
+    production_ready = True
 
 
 def _record(project, plan: NormalizedPlan):
@@ -50,6 +59,12 @@ def _write_approval(
     repo_id: str = "fixture-repo",
 ) -> Path:
     permission_digests = _permission_digests(config, record, plan, repo_id)
+    scope_manifest = compile_real_operation_scope_manifest(
+        config=config,
+        record=record,
+        plan=plan,
+        repo_id=repo_id,
+    )
     approval = approve_real_operation(
         config=config,
         record=record,
@@ -57,6 +72,7 @@ def _write_approval(
         repo_id=repo_id,
         approval_ref="decision-real-operation",
         permission_digests=permission_digests,
+        scope_manifest_digest=scope_manifest.digest if len(scope_manifest.steps) > 1 else None,
     )
     path.write_text(approval.model_dump_json(), encoding="utf-8")
     return path
@@ -70,6 +86,54 @@ def _permission_digests(config, record, plan: NormalizedPlan, repo_id: str = "fi
         repo_id=repo_id,
     )
     return {role_key: entry.digest for role_key, entry in manifest.roles.items()}
+
+
+def _two_step_plan_values(project) -> dict:
+    values = valid_plan_values(project)
+    first = values["steps"][0]
+    first["authorization"] = {
+        "authorized_actions": ["inspect", "modify", "commit"],
+        "writable_paths": ["evidence/", "first.txt"],
+        "requires_operator_approval": False,
+    }
+    second = copy.deepcopy(first)
+    second.update(
+        {
+            "ordinal": 2,
+            "step_id": "prepare-second",
+            "title": "Prepare second fixture",
+            "depends_on": ["prepare-fixture"],
+            "required_inputs": [
+                {
+                    "artifact_id": "fixture-output",
+                    "producer_step_id": "prepare-fixture",
+                    "description": "Prepared fixture output",
+                }
+            ],
+            "produced_outputs": [
+                {
+                    "artifact_id": "second-output",
+                    "producer_step_id": None,
+                    "description": "Second fixture output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "second-resource", "mode": "write"}],
+            "authorization": {
+                "authorized_actions": ["inspect", "modify", "commit"],
+                "writable_paths": ["evidence/", "second.txt"],
+                "requires_operator_approval": False,
+            },
+            "evidence_requirements": [
+                {
+                    "artifact_id": "second-evidence",
+                    "relative_path": "second.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    values["steps"].append(second)
+    return values
 
 
 def test_permission_manifest_binds_mcp_tools_and_rejects_drift(tmp_path: Path) -> None:
@@ -148,6 +212,7 @@ def test_real_operation_requires_explicit_confirmation_and_schema_v2(tmp_path: P
     project = create_fixture_project(tmp_path)
     values = config_values(project)
     values["execution"]["mode"] = "real_operation"
+    values["execution"]["verification_backend"] = "darwin_seatbelt_v1"
     config = write_config(project, values)
     plan = NormalizedPlan.model_validate(valid_plan_values(project))
     record = _record(project, plan).model_copy(update={"config_digest": config.config_digest})
@@ -180,6 +245,7 @@ def test_real_operation_gates_on_the_expected_revision(
     project = create_fixture_project(tmp_path)
     values = config_values(project)
     values["execution"]["mode"] = "real_operation"
+    values["execution"]["verification_backend"] = "darwin_seatbelt_v1"
     config = write_config(project, values)
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(
@@ -241,13 +307,18 @@ def _real_operation_kwargs_with_smoke_proof(
     completed_at: datetime,
     *,
     review_required: bool = False,
+    two_steps: bool = False,
 ) -> dict[str, object]:
     project = create_fixture_project(tmp_path)
     values = config_values(project)
     values["execution"]["mode"] = "real_operation"
+    values["execution"]["verification_backend"] = "darwin_seatbelt_v1"
+    if two_steps:
+        values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+        values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
     config = write_config(project, values)
     plan_path = tmp_path / "plan.yaml"
-    plan_values = valid_plan_values(project)
+    plan_values = _two_step_plan_values(project) if two_steps else valid_plan_values(project)
     if review_required:
         plan_values["steps"][0]["review"] = {
             "required": True,
@@ -280,6 +351,10 @@ def _real_operation_kwargs_with_smoke_proof(
     )
     monkeypatch.setattr("dispatcher.operation.inspect_repository", lambda *args, **kwargs: snapshot)
     monkeypatch.setattr("dispatcher.operation.validate_approved_baseline", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "dispatcher.operation.verification_backend",
+        lambda _config: AvailableDarwinSeatbeltBackend(),
+    )
     smoke_path = project.root / "smoke.json"
     proof = LiveSmokeProof(
         proof_version=1,
@@ -349,6 +424,185 @@ def test_real_operation_accepts_matching_approval_record(
 
     with pytest.raises(RealOperationError, match="stall-policy digest"):
         validate_real_operation_prerequisites(**kwargs)
+
+
+def test_real_operation_scope_binds_every_reachable_two_step_manifest(tmp_path: Path) -> None:
+    project = create_fixture_project(tmp_path)
+    values = config_values(project)
+    values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
+    object.__setattr__(project, "config", write_config(project, values))
+    plan = NormalizedPlan.model_validate(_two_step_plan_values(project))
+    record = _record(project, plan)
+    scope = compile_real_operation_scope_manifest(
+        config=project.config,
+        plan=plan,
+        record=record,
+        repo_id="fixture-repo",
+    )
+
+    assert [manifest.step_id for manifest in scope.steps] == ["prepare-fixture", "prepare-second"]
+    assert scope.steps[0].structured_git.writable_paths == ("evidence/", "first.txt")
+    assert scope.steps[1].structured_git.writable_paths == ("evidence/", "second.txt")
+    assert scope.steps[1].structured_git.evidence_paths == ("evidence/second.md",)
+
+    with pytest.raises(RealOperationError, match="scope-manifest-digest"):
+        approve_real_operation(
+            config=project.config,
+            record=record,
+            plan=plan,
+            repo_id="fixture-repo",
+            approval_ref="decision-real-operation",
+            permission_digests=_permission_digests(project.config, record, plan),
+        )
+
+    approval = approve_real_operation(
+        config=project.config,
+        record=record,
+        plan=plan,
+        repo_id="fixture-repo",
+        approval_ref="decision-real-operation",
+        permission_digests=_permission_digests(project.config, record, plan),
+        scope_manifest_digest=scope.digest,
+    )
+    assert approval.scope_manifest == scope
+
+
+@pytest.mark.parametrize("mutation", ["missing", "reordered", "extra", "later_role", "writable", "evidence"])
+def test_execute_gate_rejects_changed_two_step_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        two_steps=True,
+    )
+    approval_path = Path(kwargs["approval_record_path"])
+    approval = RealOperationApproval.model_validate_json(approval_path.read_text(encoding="utf-8"))
+    assert approval.scope_manifest is not None
+    scope = approval.scope_manifest
+    first, second = scope.steps
+    if mutation == "missing":
+        steps = (first,)
+    elif mutation == "reordered":
+        steps = (second, first)
+    elif mutation == "extra":
+        steps = (first, second, first)
+    elif mutation == "later_role":
+        role = second.roles["supervisor"].model_copy(update={"digest": "0" * 64})
+        steps = (first, second.model_copy(update={"roles": {**second.roles, "supervisor": role}}))
+    elif mutation == "writable":
+        capability = second.structured_git.model_copy(update={"writable_paths": ("other.txt",)})
+        steps = (first, second.model_copy(update={"structured_git": capability}))
+    else:
+        capability = second.structured_git.model_copy(update={"evidence_paths": ("evidence/other.md",)})
+        steps = (first, second.model_copy(update={"structured_git": capability}))
+    approval_path.write_text(
+        approval.model_copy(update={"scope_manifest": scope.model_copy(update={"steps": steps})}).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RealOperationError, match="complete approval scope"):
+        validate_real_operation_prerequisites(**kwargs)
+
+
+def test_execute_gate_accepts_legacy_single_step_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(tmp_path, monkeypatch, datetime.now(UTC))
+    approval_path = Path(kwargs["approval_record_path"])
+    legacy = RealOperationApproval.model_validate_json(approval_path.read_text(encoding="utf-8")).model_dump(
+        mode="json"
+    )
+    legacy.pop("scope_manifest")
+    approval_path.write_text(json.dumps(legacy), encoding="utf-8")
+    config = kwargs["config"]
+    kwargs["stall_policy_digest"] = digest_json(config.execution.stall_policy.model_dump(mode="json"))
+
+    assert validate_real_operation_prerequisites(**kwargs)["step_id"] == "prepare-fixture"
+
+
+def test_execute_gate_rejects_legacy_single_step_approval_for_two_step_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        two_steps=True,
+    )
+    approval_path = Path(kwargs["approval_record_path"])
+    legacy = RealOperationApproval.model_validate_json(approval_path.read_text(encoding="utf-8")).model_dump(
+        mode="json"
+    )
+    legacy.pop("scope_manifest")
+    approval_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    with pytest.raises(RealOperationError, match="legacy single-step"):
+        validate_real_operation_prerequisites(**kwargs)
+
+
+def test_execute_gate_resumes_complete_scope_from_first_review_required_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        two_steps=True,
+    )
+    record = kwargs["record"]
+    first = record.steps["prepare-fixture"].model_copy(update={"state": StepStatus.REVIEW_REQUIRED})
+    kwargs["record"] = record.model_copy(
+        update={"steps": {**record.steps, "prepare-fixture": first}}
+    )
+    kwargs["stall_policy_digest"] = digest_json(
+        kwargs["config"].execution.stall_policy.model_dump(mode="json")
+    )
+
+    validated = validate_real_operation_prerequisites(**kwargs)
+
+    assert validated["step_id"] == "prepare-fixture"
+    assert [item["step_id"] for item in validated["scope_manifest"]["steps"]] == [
+        "prepare-fixture",
+        "prepare-second",
+    ]
+
+
+def test_execute_gate_resumes_approved_suffix_after_first_step_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        two_steps=True,
+    )
+    record = kwargs["record"]
+    first = record.steps["prepare-fixture"].model_copy(update={"state": StepStatus.ACCEPTED})
+    resumed = record.model_copy(update={"steps": {**record.steps, "prepare-fixture": first}})
+    kwargs["record"] = resumed
+    kwargs["permission_digests"] = _permission_digests(
+        kwargs["config"],
+        resumed,
+        resumed.plan,
+    )
+    kwargs["stall_policy_digest"] = digest_json(
+        kwargs["config"].execution.stall_policy.model_dump(mode="json")
+    )
+
+    validated = validate_real_operation_prerequisites(**kwargs)
+
+    assert validated["step_id"] == "prepare-second"
+    assert validated["permission_manifest"]["step_id"] == "prepare-second"
+    assert [item["step_id"] for item in validated["scope_manifest"]["steps"]] == [
+        "prepare-fixture",
+        "prepare-second",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -622,3 +876,19 @@ def test_execute_gate_accepts_supported_macos_verification_backend(
     result = validate_real_operation_prerequisites(**kwargs)
 
     assert result["verification_backend"] == "darwin-seatbelt-v1"
+
+
+def test_execute_gate_rejects_unavailable_darwin_seatbelt_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(tmp_path, monkeypatch, datetime.now(UTC))
+    config = kwargs["config"]
+    kwargs["stall_policy_digest"] = digest_json(
+        config.execution.stall_policy.model_dump(mode="json")
+    )
+    monkeypatch.setattr("dispatcher.operation.verification_backend", verification_backend)
+    monkeypatch.setattr("dispatcher.verification.platform.system", lambda: "Linux")
+
+    with pytest.raises(RealOperationError, match="production verification isolation is unavailable"):
+        validate_real_operation_prerequisites(**kwargs)

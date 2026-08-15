@@ -139,6 +139,75 @@ def test_accepted_baseline_requires_review_proof_and_hydrates_new_run(project: F
     assert step.accepted_reviewer_role_keys == ["reviewer"]
 
 
+def test_pending_successor_artifacts_and_later_revision_do_not_invalidate_accepted_baseline(
+    project: FixtureProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _accepted_and_pending_plan(project)
+    (project.evidence / "fixture.md").write_text("historical fixture evidence\n", encoding="utf-8")
+    historical_review = project.evidence / "reviews" / "prepare-fixture.md"
+    historical_review.parent.mkdir()
+    historical_review.write_text("historical review proof\n", encoding="utf-8")
+    store = _store(project)
+    approval = approve_baseline(
+        inspect_baseline(plan, project.config),
+        decisions=(
+            _decision("prepare-fixture", "ACCEPTED", reviewers=("reviewer",)),
+            _decision("prepare-successor", "PENDING"),
+        ),
+        plan=plan,
+        config=project.config,
+        store=store,
+        approval_decision_ref="decision-accepted-with-pending-successor",
+    )
+
+    (project.evidence / "successor.md").write_text("new successor evidence\n", encoding="utf-8")
+    successor_review = project.evidence / "reviews" / "prepare-successor.md"
+    successor_review.write_text("new successor review proof\n", encoding="utf-8")
+    monkeypatch.setattr("dispatcher.baseline._git_revision", lambda _root: "later-revision")
+
+    assert inspect_baseline(plan, project.config).observation_digest != approval.observation.observation_digest
+    assert validate_approved_baseline(plan=plan, config=project.config, store=store) == approval
+
+
+@pytest.mark.parametrize(
+    ("artifact", "message"),
+    [
+        ("evidence", "historical evidence changed for accepted step"),
+        ("review", "historical review proof changed for accepted step"),
+    ],
+)
+def test_accepted_baseline_rejects_tampered_evidence_and_review_proof(
+    project: FixtureProject,
+    artifact: str,
+    message: str,
+) -> None:
+    plan = _accepted_and_pending_plan(project)
+    evidence = project.evidence / "fixture.md"
+    evidence.write_text("historical fixture evidence\n", encoding="utf-8")
+    review_proof = project.evidence / "reviews" / "prepare-fixture.md"
+    review_proof.parent.mkdir()
+    review_proof.write_text("historical review proof\n", encoding="utf-8")
+    store = _store(project)
+    approve_baseline(
+        inspect_baseline(plan, project.config),
+        decisions=(
+            _decision("prepare-fixture", "ACCEPTED", reviewers=("reviewer",)),
+            _decision("prepare-successor", "PENDING"),
+        ),
+        plan=plan,
+        config=project.config,
+        store=store,
+        approval_decision_ref="decision-tampered-accepted-provenance",
+    )
+
+    path = evidence if artifact == "evidence" else review_proof
+    path.write_text(f"changed accepted {artifact}\n", encoding="utf-8")
+
+    with pytest.raises(BaselineError, match=message):
+        validate_approved_baseline(plan=plan, config=project.config, store=store)
+
+
 def test_every_historical_step_requires_explicit_pending_or_waived_decision(project: FixtureProject) -> None:
     values = valid_plan_values(project)
     second = json.loads(json.dumps(values["steps"][0]))
@@ -210,3 +279,47 @@ def test_every_historical_step_requires_explicit_pending_or_waived_decision(proj
 
     assert hydrated.steps["prepare-fixture"].state is StepStatus.PENDING
     assert hydrated.steps["prepare-second"].state is StepStatus.WAIVED
+
+
+def _accepted_and_pending_plan(project: FixtureProject) -> NormalizedPlan:
+    values = valid_plan_values(project)
+    first = values["steps"][0]
+    first["review"] = {
+        "required": True,
+        "reviewer_role_keys": ["reviewer"],
+        "required_acceptances": 1,
+    }
+    first["retry"]["max_reviewer_attempts"] = 1
+    successor = json.loads(json.dumps(first))
+    successor.update(
+        {
+            "ordinal": 2,
+            "step_id": "prepare-successor",
+            "title": "Prepare successor",
+            "depends_on": ["prepare-fixture"],
+            "required_inputs": [
+                {
+                    "artifact_id": "fixture-output",
+                    "producer_step_id": "prepare-fixture",
+                    "description": "Prepared fixture output",
+                }
+            ],
+            "produced_outputs": [
+                {
+                    "artifact_id": "successor-output",
+                    "producer_step_id": None,
+                    "description": "Prepared successor output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "successor-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "successor-evidence",
+                    "relative_path": "successor.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    values["steps"].append(successor)
+    return NormalizedPlan.model_validate(values)
