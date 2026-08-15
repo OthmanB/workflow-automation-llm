@@ -477,20 +477,26 @@ class SequentialExecutionCoordinator:
             stored_dispatch = stored.dispatches[current.dispatch.dispatch_id]
             if stored_dispatch.state.value in {"PREPARED", "RUNNING"}:
                 current = _refresh_prepared(current, stored, stored_generation)
-                record, generation, retry_allowed = self.workflow.handle_stall(
+                record, generation = self.workflow.record_reviewer_result_validation_failure(
                     current,
-                    category="result_validation",
                     reason=str(exc),
+                    failure_detail=str(exc),
                 )
-                if retry_allowed:
+                retry = self.workflow.prepare_pending_reviewer_result_validation_retry(
+                    record,
+                    generation,
+                )
+                if isinstance(retry, PreparedDispatch):
                     sleep(self.config.execution.stall_policy.cooldown_seconds)
-                    retry = self.workflow.prepare_stall_retry(
-                        record,
-                        generation,
-                        current,
-                        category="result_validation",
-                    )
                     return self.execute_worker(retry)
+                if isinstance(retry, tuple):
+                    waiting, waiting_generation = retry
+                    return WorkerOutcome(
+                        waiting,
+                        waiting_generation,
+                        current.dispatch.dispatch_id,
+                        "",
+                    )
             raise
         except OpenCodeAdapterError as exc:
             failure_category, failure_detail = _worker_failure(exc)

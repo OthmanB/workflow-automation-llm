@@ -14,6 +14,7 @@ from pydantic import Field, field_validator, model_validator
 from .config import Config, ContractModel, Identifier
 from .plan import NormalizedPlan, PlanApproval, Sha256, verify_plan_sources
 from .policy import compile_run_policy
+from .repository import SAFE_GIT_ARGS, hardened_git_environment
 from .state_store import StateStore
 from .workflow import RunRecord, StepStatus, TransitionEvent, new_run_record, transition_step
 
@@ -224,7 +225,7 @@ def validate_approved_baseline(
         raise BaselineError("stored baseline uses an unsupported historical approval format; inspect and approve again") from exc
     _validate_observation(approval.observation, plan, config)
     current = inspect_baseline(plan, config)
-    _validate_accepted_provenance(approval, current)
+    _validate_accepted_provenance(approval, current, config)
     return approval
 
 
@@ -308,6 +309,7 @@ def _validate_observation(observation: BaselineObservation, plan: NormalizedPlan
 def _validate_accepted_provenance(
     approval: BaselineApproval,
     current: BaselineObservation,
+    config: Config,
 ) -> None:
     """Keep only explicit ACCEPTED decisions bound to their approved artifact facts.
 
@@ -331,6 +333,21 @@ def _validate_accepted_provenance(
             raise BaselineError(
                 f"historical review proof changed for accepted step {decision.step_id} since baseline approval; "
                 "inspect and approve again"
+            )
+        if approved.repo_id != observed.repo_id:
+            raise BaselineError(
+                f"historical repository changed for accepted step {decision.step_id}; inspect and approve again"
+            )
+        if approved.repository_revision is None or observed.repository_revision is None:
+            raise BaselineError(
+                f"cannot establish repository ancestry for accepted step {decision.step_id}; "
+                "inspect and approve again"
+            )
+        root = Path(config.repository(approved.repo_id).root)
+        if not _is_ancestor(root, approved.repository_revision, observed.repository_revision):
+            raise BaselineError(
+                f"approved repository revision is not an ancestor of the current revision for accepted "
+                f"step {decision.step_id}; inspect and approve again"
             )
 
 
@@ -416,8 +433,9 @@ def _inspect_review_proof(
 def _git_revision(root: Path) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *SAFE_GIT_ARGS, "rev-parse", "HEAD"],
             cwd=root,
+            env=hardened_git_environment(),
             capture_output=True,
             check=True,
             text=True,
@@ -426,6 +444,23 @@ def _git_revision(root: Path) -> str | None:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() or None
+
+
+def _is_ancestor(root: Path, approved_revision: str, current_revision: str) -> bool:
+    """Return false for rewritten, unreachable, or uninspectable Git history."""
+    try:
+        subprocess.run(
+            ["git", *SAFE_GIT_ARGS, "merge-base", "--is-ancestor", approved_revision, current_revision],
+            cwd=root,
+            env=hardened_git_environment(),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return True
 
 
 def _digest(payload: object) -> str:

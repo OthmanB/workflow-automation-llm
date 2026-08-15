@@ -45,6 +45,55 @@ from dispatcher.workflow import (
 _DIGEST = "d" * 64
 
 
+def _real_operation_approval_payload(
+    *,
+    config_digest: str = "a" * 64,
+    writable_path: str = "src/fixture.py",
+) -> dict[str, object]:
+    return {
+        "approval_ref": "decision-one",
+        "project_id": "fixture-project",
+        "config_digest": config_digest,
+        "plan_digest": "b" * 64,
+        "run_id": "fixture-run",
+        "repo_id": "fixture-repo",
+        "step_id": "prepare-fixture",
+        "permission_manifest": {
+            "manifest_version": 2,
+            "repo_id": "fixture-repo",
+            "step_id": "prepare-fixture",
+            "roles": {
+                "executor": {
+                    "role_kind": "executor",
+                    "authorized_actions": ["inspect"],
+                    "mcp_tools": [],
+                    "digest": "c" * 64,
+                }
+            },
+            "structured_git": {
+                "capability_version": 1,
+                "safety_policy_version": 1,
+                "repo_id": "fixture-repo",
+                "step_id": "prepare-fixture",
+                "commit_policy": "required",
+                "commit_authorized": True,
+                "writable_paths": [writable_path],
+                "evidence_paths": ["evidence/fixture.json"],
+                "message_format": "dispatcher: <step_id> attempt <n>",
+                "identity_digest": "d" * 64,
+                "digest": "e" * 64,
+            },
+        },
+        "decided_at": "2026-08-16T12:00:00+00:00",
+    }
+
+
+def _approval_identity(approval: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(approval, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _acquire_lease_in_child(state_dir: str, output: multiprocessing.Queue[str]) -> None:
     store = StateStore(state_dir, heartbeat_seconds=30, stale_after_seconds=120)
     try:
@@ -942,6 +991,8 @@ def test_idempotent_audit_append_preserves_original_event_after_run_progresses(
     store = _store(project)
     record = _record(project)
     store.create_run(record)
+    approval = _real_operation_approval_payload()
+    approval_identity = _approval_identity(approval)
 
     store.append_audit_event_idempotently(
         run_id=record.run_id,
@@ -950,7 +1001,12 @@ def test_idempotent_audit_append_preserves_original_event_after_run_progresses(
         kind="real_operation_approved",
         correlation_id=record.run_id,
         causation_id=None,
-        payload={"approval_ref": "decision-one"},
+        payload={
+            "approval": approval,
+            "approval_identity_sha256": approval_identity,
+            "expected_revision": "first-revision",
+            "smoke_proof": "first-proof",
+        },
     )
     store.append_audit_event_idempotently(
         run_id=record.run_id,
@@ -959,14 +1015,176 @@ def test_idempotent_audit_append_preserves_original_event_after_run_progresses(
         kind="real_operation_approved",
         correlation_id=record.run_id,
         causation_id=None,
-        payload={"approval_ref": "different-payload-is-not-a-new-event"},
+        payload={
+            "approval": approval,
+            "approval_identity_sha256": approval_identity,
+            "expected_revision": "later-revision",
+            "smoke_proof": "later-proof",
+        },
     )
 
     with sqlite3.connect(store.database_path) as connection:
         rows = connection.execute(
             "SELECT sequence, payload_json FROM audit_events WHERE event_id = 'audit-idempotent-event'"
         ).fetchall()
-    assert [(row[0], json.loads(row[1])) for row in rows] == [(2, {"approval_ref": "decision-one"})]
+    assert [(row[0], json.loads(row[1])) for row in rows] == [
+        (
+            2,
+            {
+                "approval": approval,
+                "approval_identity_sha256": approval_identity,
+                "expected_revision": "first-revision",
+                "smoke_proof": "first-proof",
+            },
+        )
+    ]
+
+
+def test_idempotent_real_operation_approval_rejects_different_approval_payload(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    first_approval = _real_operation_approval_payload(config_digest="a" * 64)
+    second_approval = _real_operation_approval_payload(config_digest="b" * 64)
+
+    def payload(approval: dict[str, object]) -> dict[str, object]:
+        return {
+            "approval": approval,
+            "approval_identity_sha256": _approval_identity(approval),
+            "expected_revision": "mutable-revision",
+        }
+
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-approval-collision",
+        sequence=2,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload=payload(first_approval),
+    )
+
+    with pytest.raises(StateStoreCorruptionError, match="immutable approval identity"):
+        store.append_audit_event_idempotently(
+            run_id=record.run_id,
+            event_id="audit-approval-collision",
+            sequence=9,
+            kind="real_operation_approved",
+            correlation_id=record.run_id,
+            causation_id=None,
+            payload=payload(second_approval),
+        )
+
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT sequence, payload_json FROM audit_events WHERE event_id = 'audit-approval-collision'"
+        ).fetchone()
+    assert row == (2, json.dumps(payload(first_approval), sort_keys=True, separators=(",", ":")))
+
+
+def test_idempotent_real_operation_approval_verifies_legacy_serialized_approval(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    approval = _real_operation_approval_payload()
+    identity = _approval_identity(approval)
+    store.append_audit_event(
+        run_id=record.run_id,
+        event_id="audit-legacy-approval",
+        sequence=2,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload={"approval": approval, "expected_revision": "legacy-revision"},
+    )
+
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-legacy-approval",
+        sequence=9,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload={
+            "approval": approval,
+            "approval_identity_sha256": identity,
+            "expected_revision": "current-revision",
+        },
+    )
+
+
+def test_idempotent_real_operation_approval_uses_raw_identity_before_redaction(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+    approval = _real_operation_approval_payload(writable_path="token=credential-shaped")
+    identity = _approval_identity(approval)
+    payload = {"approval": approval, "approval_identity_sha256": identity}
+
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-redacted-approval",
+        sequence=2,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload=payload,
+    )
+    store.append_audit_event_idempotently(
+        run_id=record.run_id,
+        event_id="audit-redacted-approval",
+        sequence=9,
+        kind="real_operation_approved",
+        correlation_id=record.run_id,
+        causation_id=None,
+        payload=payload,
+    )
+
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT sequence, payload_json FROM audit_events WHERE event_id = 'audit-redacted-approval'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 2
+    assert "credential-shaped" not in row[1]
+    assert (
+        json.loads(row[1])["approval"]["permission_manifest"]["structured_git"]["writable_paths"]
+        == ["token=[REDACTED]"]
+    )
+
+
+def test_idempotent_real_operation_approval_rejects_malformed_approval_before_insert(
+    project: FixtureProject,
+) -> None:
+    store = _store(project)
+    record = _record(project)
+    store.create_run(record)
+
+    with pytest.raises(StateStoreCorruptionError, match="valid structured approval"):
+        store.append_audit_event_idempotently(
+            run_id=record.run_id,
+            event_id="audit-malformed-approval",
+            sequence=2,
+            kind="real_operation_approved",
+            correlation_id=record.run_id,
+            causation_id=None,
+            payload={
+                "approval": {"approval_ref": "decision-one"},
+                "approval_identity_sha256": "a" * 64,
+            },
+        )
+
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT event_id FROM audit_events WHERE event_id = 'audit-malformed-approval'"
+        ).fetchone()
+    assert row is None
 
 
 def test_idempotent_audit_append_rejects_incompatible_existing_event(project: FixtureProject) -> None:

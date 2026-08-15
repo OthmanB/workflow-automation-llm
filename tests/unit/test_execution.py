@@ -1520,8 +1520,9 @@ def test_malformed_worker_result_usage_is_accounted_before_validation(
     assert invocations[0]["usage_status"] == "COMPLETE"
 
 
-def test_malformed_reviewer_response_retries_once_without_reconciliation(
+def test_malformed_reviewer_response_retries_once_with_configured_cooldown(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatch_ids: list[str] = []
 
@@ -1552,7 +1553,10 @@ def test_malformed_reviewer_response_retries_once_without_reconciliation(
         tmp_path,
         session_runner=reviewer_runner,
         max_reviewer_attempts=2,
+        cooldown_seconds=3,
     )
+    sleeps: list[int] = []
+    monkeypatch.setattr("dispatcher.execution.sleep", lambda seconds: sleeps.append(seconds))
 
     try:
         outcome = coordinator.execute_worker(prepared)
@@ -1577,6 +1581,7 @@ def test_malformed_reviewer_response_retries_once_without_reconciliation(
     assert invocations[0]["usage_status"] == "COMPLETE"
     assert invocations[1]["usage_status"] == "MISSING"
     assert dispatch_ids == [failed.dispatch_id, retried.dispatch_id]
+    assert sleeps == [3]
     assert store.review_for_dispatch(prepared.run_id, failed.dispatch_id) is False
     assert not store.leases_for_run(prepared.run_id)
 
@@ -1607,8 +1612,7 @@ def test_malformed_reviewer_response_asks_only_after_retry_exhaustion(tmp_path: 
     )
 
     try:
-        with pytest.raises(ExecutionCoordinatorError, match="final JSON object"):
-            coordinator.execute_worker(prepared)
+        outcome = coordinator.execute_worker(prepared)
     finally:
         coordinator.release_run()
 
@@ -1619,10 +1623,108 @@ def test_malformed_reviewer_response_asks_only_after_retry_exhaustion(tmp_path: 
     assert failed.failure_category == "result_validation"
     assert record.steps[prepared.dispatch.step_id].state.value == "REVIEW_REQUIRED"
     assert record.state is RunStatus.WAITING_OPERATOR
+    assert outcome.record == record
+    assert outcome.forwarding == ""
     assert record.operator_request is not None
     assert record.operator_request.kind == "stall_recovery"
-    assert record.operator_request.kind != "reconciliation"
     assert not store.leases_for_run(prepared.run_id)
+
+
+def test_reinvoking_execution_does_not_infer_reconciliation_after_reviewer_context_is_repaired(
+    tmp_path: Path,
+) -> None:
+    worker_calls = 0
+
+    def malformed_reviewer_runner(**kwargs: Any) -> SessionResult:
+        nonlocal worker_calls
+        worker_calls += 1
+        prompt = json.loads(kwargs["prompt"])
+        lifecycle = kwargs["lifecycle"]
+        lifecycle.on_process_started(3500, 3500.0)
+        lifecycle.on_session_identified(f"session-{prompt['dispatch_id']}")
+        return SessionResult(
+            session_id=f"session-{prompt['dispatch_id']}",
+            exit_code=0,
+            chat_response="not a strict JSON response",
+            evidence_written=[],
+            usage={"total": 9, "input": 5, "output": 3, "reasoning": 1},
+            cost=0.09,
+        )
+
+    coordinator, store, prepared = _prepared_reviewer_coordinator(
+        tmp_path,
+        session_runner=malformed_reviewer_runner,
+        max_reviewer_attempts=2,
+    )
+    payload = store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id)
+    original_snapshot = payload.repository_before
+    assert original_snapshot is not None
+    changed_snapshot = dict(original_snapshot)
+    changed_snapshot["manifest_sha256"] = "f" * 64
+    record, generation = store.load_run(prepared.run_id)
+    generation = store.save_run(
+        record,
+        expected_generation=generation,
+        dispatch_payloads={
+            prepared.dispatch.dispatch_id: DispatchPayload(
+                prompt=payload.prompt,
+                policy=payload.policy,
+                result=payload.result,
+                authoritative_verification=payload.authoritative_verification,
+                forwarding_payload=payload.forwarding_payload,
+                process_id=payload.process_id,
+                session_metadata=payload.session_metadata,
+                repository_before=changed_snapshot,
+                repository_after=payload.repository_after,
+            )
+        },
+    )
+    prepared = _refresh_prepared(prepared, record, generation)
+
+    try:
+        outcome = coordinator.execute_worker(prepared)
+        coordinator.release_run()
+        waiting, generation = store.load_run(prepared.run_id)
+        store.save_run(
+            waiting,
+            expected_generation=generation,
+            dispatch_payloads={
+                prepared.dispatch.dispatch_id: DispatchPayload(
+                    prompt=payload.prompt,
+                    policy=payload.policy,
+                    result=payload.result,
+                    authoritative_verification=payload.authoritative_verification,
+                    forwarding_payload=payload.forwarding_payload,
+                    process_id=payload.process_id,
+                    session_metadata=payload.session_metadata,
+                    repository_before=original_snapshot,
+                    repository_after=payload.repository_after,
+                )
+            },
+        )
+        repaired, repaired_generation = store.load_run(prepared.run_id)
+        first = coordinator.run_to_completion(
+            prepared.run_id,
+            expected_generation=repaired_generation,
+            max_turns=1,
+        )
+        persisted, persisted_generation = store.load_run(prepared.run_id)
+        second = coordinator.run_to_completion(
+            prepared.run_id,
+            expected_generation=persisted_generation,
+            max_turns=1,
+        )
+    finally:
+        coordinator.release_run()
+
+    assert outcome.record.state is RunStatus.WAITING_OPERATOR
+    assert worker_calls == 1
+    assert repaired.state is RunStatus.WAITING_OPERATOR
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert first.accepted is False
+    assert second.accepted is False
+    assert persisted.operator_request is not None
+    assert persisted.operator_request.kind == "reconciliation"
 
 
 def test_restart_recovers_only_failed_reviewer_and_resumes_supervisor_session(tmp_path: Path) -> None:
@@ -1776,6 +1878,15 @@ def test_restart_recovers_only_failed_reviewer_and_resumes_supervisor_session(tm
         }
     }
     generation = store.save_run(failed, expected_generation=generation, sessions=sessions)
+    request = failed.operator_request
+    assert request is not None
+    failed, generation = store.answer_operator_request(
+        run_id=failed.run_id,
+        expected_generation=generation,
+        request_id=request.request_id,
+        answer="reconcile",
+        actor_id="fixture-operator",
+    )
 
     launched_reviewer_models: list[str] = []
     supervisor_calls: list[tuple[str | None, str]] = []
@@ -2438,8 +2549,13 @@ def _prepared_reviewer_coordinator(
     *,
     session_runner,
     max_reviewer_attempts: int,
+    cooldown_seconds: int = 0,
 ) -> tuple[SequentialExecutionCoordinator, StateStore, PreparedDispatch]:
     project = create_fixture_project(tmp_path)
+    if cooldown_seconds:
+        values = config_values(project)
+        values["execution"]["stall_policy"]["cooldown_seconds"] = cooldown_seconds
+        project = replace(project, config=write_config(project, values))
     plan_values = valid_plan_values(project)
     plan_values["steps"][0]["review"] = {
         "required": True,

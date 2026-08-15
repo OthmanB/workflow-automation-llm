@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -2021,7 +2022,7 @@ class StateStore:
         with self._transaction(connection):
             existing = connection.execute(
                 """
-                SELECT run_id, kind, correlation_id, causation_id
+                SELECT run_id, kind, correlation_id, causation_id, payload_json
                 FROM audit_events WHERE event_id = ?
                 """,
                 (event_id,),
@@ -2038,7 +2039,33 @@ class StateStore:
                     raise StateStoreCorruptionError(
                         f"audit event {event_id} conflicts with a different authoritative identity"
                     )
+                if kind == "real_operation_approved":
+                    approval_identity = _real_operation_approval_identity(
+                        payload,
+                        require_explicit_identity=True,
+                    )
+                    try:
+                        existing_payload = json.loads(existing["payload_json"])
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise StateStoreCorruptionError(
+                            f"real-operation approval audit event {event_id} has invalid payload JSON"
+                        ) from exc
+                    if not isinstance(existing_payload, dict):
+                        raise StateStoreCorruptionError(
+                            f"real-operation approval audit event {event_id} payload is not an object"
+                        )
+                    existing_approval_identity = _real_operation_approval_identity(
+                        existing_payload,
+                        require_explicit_identity=False,
+                    )
+                    if existing_approval_identity != approval_identity:
+                        raise StateStoreCorruptionError(
+                            f"real-operation approval audit event {event_id} conflicts with a different "
+                            "immutable approval identity"
+                        )
                 return
+            if kind == "real_operation_approved":
+                _real_operation_approval_identity(payload, require_explicit_identity=True)
             connection.execute(
                 """
                 INSERT INTO audit_events(
@@ -3175,6 +3202,75 @@ def _usage_delta_text(ledger: UsageAmount, invocation_total: UsageAmount) -> str
 
 def _json_text(value: object) -> str:
     return json.dumps(redact_value(value or {}), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _real_operation_approval_identity(
+    payload: Mapping[str, Any],
+    *,
+    require_explicit_identity: bool,
+) -> str:
+    """Return the immutable approval digest, validating legacy rows from their serialized approval."""
+    approval = payload.get("approval")
+    if not isinstance(approval, dict) or not _is_json_value(approval):
+        raise StateStoreCorruptionError("real-operation approval audit payload has no serialized approval")
+    try:
+        serialized_approval = json.dumps(
+            approval,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise StateStoreCorruptionError(
+            "real-operation approval audit payload is not a JSON object"
+        ) from exc
+    try:
+        # Avoid a module-import cycle while requiring the closed approval contract.
+        from .operation import RealOperationApproval
+
+        RealOperationApproval.model_validate_json(serialized_approval)
+    except (TypeError, ValueError):
+        raise StateStoreCorruptionError(
+            "real-operation approval audit payload is not a valid structured approval"
+        ) from None
+    serialized_identity = hashlib.sha256(serialized_approval.encode("utf-8")).hexdigest()
+    identity = payload.get("approval_identity_sha256")
+    if identity is None:
+        if require_explicit_identity:
+            raise StateStoreCorruptionError(
+                "real-operation approval audit payload has no immutable approval identity"
+            )
+        return serialized_identity
+    if not _is_sha256(identity) or (require_explicit_identity and identity != serialized_identity):
+        raise StateStoreCorruptionError(
+            "real-operation approval audit payload immutable approval identity is invalid"
+        )
+    # Audit payloads are redacted at rest. The explicit digest was validated
+    # against the raw approval before that transform and remains its binding.
+    return identity
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _sha256_json(value: Mapping[str, Any]) -> str:

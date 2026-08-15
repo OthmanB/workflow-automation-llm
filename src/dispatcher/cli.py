@@ -106,6 +106,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SHA256",
         help="required for multi-step scopes; digest from permission-manifest after full review",
     )
+    approval_parser.add_argument(
+        "--expected-repository-revision",
+        action="append",
+        metavar="REPOSITORY=REVISION",
+        help="required for multi-repository scopes; one clean expected revision per scoped repository",
+    )
     approval_parser.add_argument("--output", required=True)
 
     manifest_parser = sub.add_parser(
@@ -131,7 +137,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="ROLE=SHA256",
     )
     execute_parser.add_argument("--stall-policy-digest", required=True)
-    execute_parser.add_argument("--expected-revision", required=True)
+    execute_parser.add_argument("--expected-revision")
+    execute_parser.add_argument(
+        "--expected-repository-revision",
+        action="append",
+        metavar="REPOSITORY=REVISION",
+        help="required for multi-repository scopes; one clean expected revision per scoped repository",
+    )
     execute_parser.add_argument("--approval-record", required=True)
     execute_parser.add_argument("--confirm-real-operation", action="store_true")
     execute_parser.add_argument("--max-turns", type=int, default=20)
@@ -294,7 +306,9 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     from .execution import SequentialExecutionCoordinator
     from .operation import (
         RealOperationError,
+        digest_json,
         parse_permission_digest_args,
+        parse_repository_revision_args,
         validate_real_operation_prerequisites,
     )
     from .preflight import PreflightError, run_preflight
@@ -319,6 +333,10 @@ def _cmd_execute(args: argparse.Namespace) -> int:
             permission_digests=parse_permission_digest_args(args.permission_digest),
             stall_policy_digest=args.stall_policy_digest,
             expected_revision=args.expected_revision,
+            expected_repository_revisions=parse_repository_revision_args(
+                args.expected_repository_revision or []
+            )
+            or None,
             approval_record_path=args.approval_record,
             confirm=args.confirm_real_operation,
         )
@@ -327,6 +345,7 @@ def _cmd_execute(args: argparse.Namespace) -> int:
         run_preflight(cfg, cfg.state_dir, run_session=run_session, skip_smoke=False)
         approval = details["approval"]
         assert isinstance(approval, dict)
+        details = {**details, "approval_identity_sha256": digest_json(approval)}
         store.append_audit_event_idempotently(
             run_id=args.run_id,
             event_id=f"audit-real-operation-{approval['approval_ref']}",
@@ -365,7 +384,12 @@ def _cmd_execute(args: argparse.Namespace) -> int:
 def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
     from . import state as state_mod
     from .config import load_config
-    from .operation import RealOperationError, approve_real_operation, parse_permission_digest_args
+    from .operation import (
+        RealOperationError,
+        approve_real_operation,
+        parse_permission_digest_args,
+        parse_repository_revision_args,
+    )
     from .plan import load_normalized_plan
     from .state_store import StateStoreError
 
@@ -383,6 +407,10 @@ def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
             approval_ref=args.approval_ref,
             permission_digests=parse_permission_digest_args(args.permission_digest),
             scope_manifest_digest=args.scope_manifest_digest,
+            expected_repository_revisions=parse_repository_revision_args(
+                args.expected_repository_revision or []
+            )
+            or None,
         )
         atomic_write_private_text(args.output, approval.model_dump_json(indent=2) + "\n")
     except (RealOperationError, StateStoreError, OSError, ValueError) as exc:

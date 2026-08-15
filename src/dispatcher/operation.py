@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping, Sequence
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .baseline import BaselineError, validate_approved_baseline
 from .config import Config, ContractModel, Identifier, MCPToolName
@@ -81,6 +81,13 @@ class RealOperationScopeManifest(ContractModel):
     digest: Sha256
 
 
+class RepositoryRevisionExpectation(ContractModel):
+    """One repository revision the operator approved for an autonomous scope."""
+
+    repo_id: Identifier
+    revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+
+
 class StructuredGitCapability(ContractModel):
     """Dispatcher-side commit authority bound independently of child permissions."""
 
@@ -109,7 +116,16 @@ class RealOperationApproval(ContractModel):
     step_id: Identifier
     permission_manifest: RolePermissionManifest
     scope_manifest: RealOperationScopeManifest | None = None
+    repository_revisions: tuple[RepositoryRevisionExpectation, ...] | None = None
     decided_at: datetime
+
+    @model_validator(mode="after")
+    def validate_repository_revisions(self) -> "RealOperationApproval":
+        if self.repository_revisions is not None:
+            repo_ids = [item.repo_id for item in self.repository_revisions]
+            if not repo_ids or len(repo_ids) != len(set(repo_ids)):
+                raise ValueError("repository_revisions must contain each repository exactly once")
+        return self
 
 
 LIVE_SMOKE_PROOF_MAX_AGE_SECONDS = 1800
@@ -158,40 +174,26 @@ def autonomous_execution_scope(
     plan: NormalizedPlan,
     record: RunRecord,
 ) -> tuple[PlanStep, ...]:
-    """Return every pending or ready step reachable without another operator gate."""
-    completed = {
-        step_id
-        for step_id, step in record.steps.items()
-        if step.state in {StepStatus.ACCEPTED, StepStatus.WAIVED}
-    }
-    scoped: list[PlanStep] = []
-    scoped_ids: set[str] = set()
-    for step in plan.steps:
-        current = record.steps[step.step_id]
-        if current.state not in {StepStatus.PENDING, StepStatus.READY}:
-            continue
-        if not current.operator_gate_resolved:
-            break
-        if any(dependency_id not in completed | scoped_ids for dependency_id in step.depends_on):
-            continue
-        if any(
-            artifact.producer_step_id is not None
-            and artifact.producer_step_id not in completed | scoped_ids
-            for artifact in step.required_inputs
-        ):
-            continue
-        scoped.append(step)
-        scoped_ids.add(step.step_id)
-    return tuple(scoped)
+    """Return the contiguous pending or ready scope from the next executable step."""
+    pending_step = first_pending_executable_step(plan, record)
+    if pending_step is None:
+        return ()
+    return _contiguous_autonomous_scope(
+        plan,
+        record,
+        start_step_id=pending_step.step_id,
+        retain_completed=False,
+    )
 
 
-def _approval_scope_steps(
+def _contiguous_autonomous_scope(
     plan: NormalizedPlan,
     record: RunRecord,
     *,
     start_step_id: str,
+    retain_completed: bool,
 ) -> tuple[PlanStep, ...]:
-    """Rebuild an approval's ordered scope while retaining completed and recoverable prefix steps."""
+    """Build a scope until the first unresolved step makes later work unreachable."""
     try:
         start_index = next(
             index for index, step in enumerate(plan.steps) if step.step_id == start_step_id
@@ -203,12 +205,14 @@ def _approval_scope_steps(
         for step_id, step in record.steps.items()
         if step.state in {StepStatus.ACCEPTED, StepStatus.WAIVED}
     }
-    resumable = {StepStatus.PENDING, StepStatus.READY, StepStatus.REVIEW_REQUIRED}
+    executable = {StepStatus.PENDING, StepStatus.READY}
+    if retain_completed:
+        executable |= {StepStatus.REVIEW_REQUIRED, StepStatus.ACCEPTED, StepStatus.WAIVED}
     scoped: list[PlanStep] = []
     scoped_ids: set[str] = set()
     for step in plan.steps[start_index:]:
         current = record.steps[step.step_id]
-        if current.state not in resumable | {StepStatus.ACCEPTED, StepStatus.WAIVED}:
+        if current.state not in executable:
             break
         if not current.operator_gate_resolved:
             break
@@ -380,7 +384,12 @@ def _compile_approved_real_operation_scope_manifest(
     start_step_id: str,
 ) -> RealOperationScopeManifest:
     """Rebuild the originally approved scope across a completed or recoverable prefix."""
-    scoped_steps = _approval_scope_steps(plan, record, start_step_id=start_step_id)
+    scoped_steps = _contiguous_autonomous_scope(
+        plan,
+        record,
+        start_step_id=start_step_id,
+        retain_completed=True,
+    )
     if not scoped_steps or scoped_steps[0].step_id != start_step_id:
         raise RealOperationError(
             "the approved real-operation scope cannot resume without an unresolved dependency or operator gate"
@@ -464,6 +473,134 @@ def _validate_scope_manifest_digest(
         )
 
 
+def parse_repository_revision_args(values: Sequence[str]) -> dict[str, str]:
+    """Parse repeated REPOSITORY=REVISION arguments without accepting duplicates."""
+    parsed: dict[str, str] = {}
+    for value in values:
+        repo_id, separator, revision = value.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,127}", repo_id):
+            raise RealOperationError(
+                f"invalid repository revision argument {value!r}; expected REPOSITORY=REVISION"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+            raise RealOperationError(
+                f"repository revision for {repo_id} is not a full lowercase Git object ID"
+            )
+        if repo_id in parsed:
+            raise RealOperationError(f"duplicate repository revision for {repo_id}")
+        parsed[repo_id] = revision
+    return parsed
+
+
+def _scope_repository_ids(scope_manifest: RealOperationScopeManifest) -> tuple[str, ...]:
+    """Return repositories once each in their first appearance in the ordered scope."""
+    return tuple(dict.fromkeys(manifest.repo_id for manifest in scope_manifest.steps))
+
+
+def _ordered_repository_revisions(
+    scope_manifest: RealOperationScopeManifest,
+    supplied: Mapping[str, str],
+) -> tuple[RepositoryRevisionExpectation, ...]:
+    expected_repo_ids = _scope_repository_ids(scope_manifest)
+    supplied_repo_ids = set(supplied)
+    if supplied_repo_ids != set(expected_repo_ids):
+        missing = ", ".join(repo_id for repo_id in expected_repo_ids if repo_id not in supplied_repo_ids) or "none"
+        extra = ", ".join(sorted(supplied_repo_ids - set(expected_repo_ids))) or "none"
+        raise RealOperationError(
+            f"repository revision expectations do not match approval scope; missing: {missing}; extra: {extra}"
+        )
+    try:
+        return tuple(
+            RepositoryRevisionExpectation(repo_id=repo_id, revision=supplied[repo_id])
+            for repo_id in expected_repo_ids
+        )
+    except ValueError as exc:
+        raise RealOperationError(f"invalid repository revision expectation: {exc}") from exc
+
+
+def _inspect_expected_scope_repositories(
+    config: Config,
+    expectations: Sequence[RepositoryRevisionExpectation],
+) -> dict[str, Any]:
+    """Require every repository bound to an approval scope to remain clean and pinned."""
+    snapshots: dict[str, Any] = {}
+    for expectation in expectations:
+        try:
+            snapshot = inspect_repository(config, expectation.repo_id, require_clean=True)
+        except Exception as exc:
+            raise RealOperationError(
+                f"repository {expectation.repo_id} is not clean and inspectable for the approved scope: {exc}"
+            ) from exc
+        if not snapshot.clean:
+            raise RealOperationError(
+                f"repository {expectation.repo_id} is not clean for the approved scope"
+            )
+        if snapshot.revision != expectation.revision:
+            raise RealOperationError(
+                f"repository is not at the expected revision: {expectation.repo_id}"
+            )
+        snapshots[expectation.repo_id] = snapshot
+    return snapshots
+
+
+def _approval_repository_revisions(
+    *,
+    config: Config,
+    scope_manifest: RealOperationScopeManifest,
+    supplied: Mapping[str, str] | None,
+) -> tuple[RepositoryRevisionExpectation, ...] | None:
+    """Bind supplied revisions while retaining the legacy single-repository command shape."""
+    repo_ids = _scope_repository_ids(scope_manifest)
+    if supplied:
+        expectations = _ordered_repository_revisions(scope_manifest, supplied)
+        _inspect_expected_scope_repositories(config, expectations)
+        return expectations
+    if len(repo_ids) != 1:
+        raise RealOperationError(
+            "multi-repository real-operation approval requires complete "
+            "--expected-repository-revision input for every scoped repository"
+        )
+    return None
+
+
+def _execution_repository_revisions(
+    *,
+    scope_manifest: RealOperationScopeManifest,
+    approval: RealOperationApproval,
+    expected_revision: str | None,
+    supplied: Mapping[str, str] | None,
+) -> tuple[RepositoryRevisionExpectation, ...]:
+    """Resolve legacy single-repository input while failing closed for multi-repository scopes."""
+    repo_ids = _scope_repository_ids(scope_manifest)
+    supplied = supplied or {}
+    if len(repo_ids) == 1:
+        repo_id = repo_ids[0]
+        if supplied:
+            expectations = _ordered_repository_revisions(scope_manifest, supplied)
+            if expected_revision is not None and expectations[0].revision != expected_revision:
+                raise RealOperationError("legacy expected revision conflicts with repository revision expectation")
+        elif expected_revision is not None:
+            expectations = _ordered_repository_revisions(scope_manifest, {repo_id: expected_revision})
+        else:
+            raise RealOperationError("single-repository real operation requires --expected-revision")
+    else:
+        if expected_revision is not None or not supplied:
+            raise RealOperationError(
+                "multi-repository real operation requires complete --expected-repository-revision input"
+            )
+        expectations = _ordered_repository_revisions(scope_manifest, supplied)
+    if approval.repository_revisions is None:
+        if len(repo_ids) != 1:
+            raise RealOperationError(
+                "legacy real-operation approval cannot authorize a multi-repository scope"
+            )
+    elif approval.repository_revisions != expectations:
+        raise RealOperationError(
+            "repository revision expectations do not match the real-operation approval record"
+        )
+    return expectations
+
+
 def approve_real_operation(
     *,
     config: Config,
@@ -473,6 +610,7 @@ def approve_real_operation(
     approval_ref: str,
     permission_digests: Mapping[str, str],
     scope_manifest_digest: str | None = None,
+    expected_repository_revisions: Mapping[str, str] | None = None,
 ) -> RealOperationApproval:
     """Bind an operator decision to every reachable autonomous plan step."""
     scope_manifest = compile_real_operation_scope_manifest(
@@ -484,6 +622,11 @@ def approve_real_operation(
     permission_manifest = scope_manifest.steps[0]
     _validate_permission_digests(permission_manifest, permission_digests)
     _validate_scope_manifest_digest(scope_manifest, scope_manifest_digest)
+    repository_revisions = _approval_repository_revisions(
+        config=config,
+        scope_manifest=scope_manifest,
+        supplied=expected_repository_revisions,
+    )
     return RealOperationApproval(
         approval_ref=approval_ref,
         project_id=config.project_id,
@@ -494,6 +637,7 @@ def approve_real_operation(
         step_id=permission_manifest.step_id,
         permission_manifest=permission_manifest,
         scope_manifest=scope_manifest,
+        repository_revisions=repository_revisions,
         decided_at=datetime.now(UTC),
     )
 
@@ -509,9 +653,10 @@ def validate_real_operation_prerequisites(
     smoke_model: str,
     permission_digests: Mapping[str, str],
     stall_policy_digest: str,
-    expected_revision: str,
+    expected_revision: str | None,
     approval_record_path: str | Path,
     confirm: bool,
+    expected_repository_revisions: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Perform every pre-launch real-operation check without starting OpenCode."""
     if config.model.schema_version != 2 or config.execution.mode != "real_operation":
@@ -535,9 +680,6 @@ def validate_real_operation_prerequisites(
         validate_approved_baseline(plan=current_plan, config=config, store=store)
     except BaselineError as exc:
         raise RealOperationError(f"approved baseline is not current: {exc}") from exc
-    snapshot = inspect_repository(config, repo_id, require_clean=True)
-    if snapshot.revision != expected_revision:
-        raise RealOperationError("repository is not at the expected revision")
     approval = load_real_operation_approval(approval_record_path)
     if approval.project_id != config.project_id:
         raise RealOperationError("real operation approval record does not match the current project")
@@ -577,6 +719,14 @@ def validate_real_operation_prerequisites(
             "real operation approval record does not match the current complete approval scope"
         )
     expected_permission_manifest = _first_remaining_scope_manifest(expected_scope_manifest, record)
+    repository_revisions = _execution_repository_revisions(
+        scope_manifest=expected_scope_manifest,
+        approval=approval,
+        expected_revision=expected_revision,
+        supplied=expected_repository_revisions,
+    )
+    snapshots = _inspect_expected_scope_repositories(config, repository_revisions)
+    snapshot = snapshots[repo_id]
     smoke = load_live_smoke_proof(smoke_proof_path)
     if not smoke.passed or not smoke.session_id_present or not smoke.workdir_clean or smoke.evidence_written:
         raise RealOperationError("live smoke proof does not prove a clean read-only run")
@@ -607,6 +757,9 @@ def validate_real_operation_prerequisites(
         "step_id": expected_permission_manifest.step_id,
         "permission_manifest": expected_permission_manifest.model_dump(mode="json"),
         "scope_manifest": expected_scope_manifest.model_dump(mode="json"),
+        "repository_revisions": [
+            expectation.model_dump(mode="json") for expectation in repository_revisions
+        ],
         "verification_backend": backend.name,
         "stall_policy_digest": expected_stall_digest,
         "approval": approval.model_dump(mode="json"),

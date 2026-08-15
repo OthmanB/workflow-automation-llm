@@ -54,9 +54,10 @@ dispatcher approve-real-operation --config <private-v2.yaml> --run-id <run-id> \
   --plan <plan.yaml> --repo-id <repo-id> --approval-ref <decision-ref> \
   --permission-digest supervisor=<sha256> \
   --permission-digest terra=<sha256> \
-  --permission-digest reviewer=<sha256> \
-  --scope-manifest-digest <manifest.digest> \
-  --output <approval.json>
+   --permission-digest reviewer=<sha256> \
+   --scope-manifest-digest <manifest.digest> \
+   [--expected-repository-revision <repo-id>=<commit-sha> ...] \
+   --output <approval.json>
 ```
 
 The manifest command computes the ordered autonomous scope beginning at the
@@ -70,9 +71,13 @@ For a multi-step scope, the approval command requires that digest through
 `--scope-manifest-digest` after the operator has reviewed the entire manifest;
 it rejects absent or stale digests rather than deriving later-step permissions
 silently. The role/digest arguments still attest the first launch step and keep
-single-step invocation compatibility. These commands do not invoke OpenCode or
-make a network call. The record binds the decision to the exact project,
-configuration, plan, run, repository, first step, and complete scope.
+single-step invocation compatibility. A scope spanning repositories requires one
+`--expected-repository-revision` per repository; each is inspected clean and is
+bound to the approval record in first-scope-use order. Single-repository approvals
+retain the existing command shape and can optionally bind the same explicit
+revision. These commands do not invoke OpenCode or make a network call. The record
+binds the decision to the exact project, configuration, plan, run, repository,
+first step, complete scope, and, when supplied, ordered repository revisions.
 
 The role set is not hand-selected. It always contains the configured
 supervisor, every configured executor eligible for the step, and every role in
@@ -88,21 +93,25 @@ dispatcher execute --config <private-v2.yaml> --run-id <run-id> \
   --smoke-proof <proof.json> --smoke-model <provider/model> \
   --permission-digest supervisor=<sha256> \
   --permission-digest terra=<sha256> \
-  --permission-digest reviewer=<sha256> \
-  --stall-policy-digest <sha256> \
-  --expected-revision <commit-sha> \
-  --approval-record <approval.json> --confirm-real-operation
+   --permission-digest reviewer=<sha256> \
+   --stall-policy-digest <sha256> \
+   [--expected-revision <commit-sha> | \
+    --expected-repository-revision <repo-id>=<commit-sha> ...] \
+   --approval-record <approval.json> --confirm-real-operation
 ```
 
 This is the only command that can request real OpenCode execution. It rejects
 public/mock configurations, stale plan or baseline hashes, unresolved recovery,
 unclean or wrong-branch repositories, repositories not at the operator-supplied
-expected revision (`--expected-revision`), missing or mismatched live-smoke
+expected revisions, missing or mismatched live-smoke
 proof, any role-set or role-permission drift, stall-policy drift, missing preflight, and
 missing operator confirmation before launching a process. It exact-matches the
 approval record's project, configuration digest, plan digest, run, repository,
 first remaining approved step, and complete ordered approval scope before launching a
-process. A recoverable `REVIEW_REQUIRED` step remains the first approved step
+process. A multi-repository scope requires a complete, exact repository/revision
+mapping that matches the approval record; each unique scope repository is checked
+clean at its expected revision before launch or resume, including the next step's
+repository. A recoverable `REVIEW_REQUIRED` step remains the first approved step
 on resume; an accepted prefix remains bound while its approved suffix continues.
 It rejects omitted, reordered, extra, or changed scoped entries,
 including later-step role, writable-path, evidence-path, and structured-Git

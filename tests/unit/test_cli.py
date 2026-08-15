@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -352,6 +353,7 @@ def test_status_json_and_support_export_are_derived_from_authoritative_state(tmp
 def test_baseline_cli_inspect_and_approve_are_read_only_until_approval(tmp_path: Path) -> None:
     project = create_fixture_project(tmp_path)
     (project.evidence / "fixture.md").write_text("fixture evidence\n", encoding="utf-8")
+    _commit_baseline_evidence(project.repository)
     plan_path = tmp_path / "plan.yaml"
     observation_path = tmp_path / "baseline-observation.json"
     decisions_path = tmp_path / "baseline-decisions.json"
@@ -495,3 +497,21 @@ def test_baseline_approve_rejects_duplicate_decision_keys(tmp_path: Path, capsys
 
     assert result == 2
     assert "duplicate JSON key in decisions file: state" in capsys.readouterr().err
+
+
+def _commit_baseline_evidence(repository: Path) -> None:
+    for args in (
+        ("config", "user.name", "Fixture Baseline"),
+        ("config", "user.email", "baseline@example.invalid"),
+        ("branch", "-M", "main"),
+        ("add", "."),
+        ("commit", "-m", "accepted baseline evidence"),
+    ):
+        subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )

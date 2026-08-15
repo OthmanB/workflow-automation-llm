@@ -2513,11 +2513,15 @@ class SequentialWorkflow:
         generation: int,
     ) -> PreparedDispatch | tuple[RunRecord, int] | None:
         """Prepare one safe fresh retry for a durable malformed reviewer response."""
+        # A reconciliation request is an explicit operator boundary. Never infer
+        # approval from a later safe-looking repository or payload.
+        if record.state is RunStatus.WAITING_OPERATOR:
+            return record, generation
         candidates = [
             dispatch
             for dispatch in record.dispatches.values()
             if dispatch.role_kind == "reviewer"
-            and dispatch.state is DispatchStatus.FAILED
+            and dispatch.state in {DispatchStatus.FAILED, DispatchStatus.ABANDONED}
             and dispatch.failure_category == "result_validation"
             and record.steps[dispatch.step_id].state is StepStatus.REVIEW_REQUIRED
         ]
@@ -2529,28 +2533,15 @@ class SequentialWorkflow:
         )
         try:
             self._verify_reviewer_result_validation_retry(record, failed_dispatch)
-            if record.state is RunStatus.WAITING_OPERATOR:
-                request = record.operator_request
-                if (
-                    request is None
-                    or request.kind != "reconciliation"
-                    or request.context_ref != failed_dispatch.dispatch_id
-                    or request.step_id != failed_dispatch.step_id
-                ):
-                    raise SequentialWorkflowError(
-                        "failed reviewer retry is blocked by an unrelated operator request"
-                    )
-                resume_event = self._event(
-                    record,
-                    "dispatcher",
-                    "durable malformed reviewer response is safe to retry",
-                    failed_dispatch.dispatch_id,
-                )
-                record = transition_run(record, RunStatus.RUNNING, resume_event)
-                generation = self.store.save_run(record, expected_generation=generation)
             if record.state is not RunStatus.RUNNING:
                 raise SequentialWorkflowError(
                     f"failed reviewer retry requires a RUNNING run, found {record.state.value}"
+                )
+            if self._reviewer_result_validation_retry_exhausted(record, failed_dispatch):
+                return self._reviewer_result_validation_retry_exhausted_record(
+                    record,
+                    generation,
+                    failed_dispatch,
                 )
             retried = self.prepare_dispatch(
                 record,
@@ -2591,10 +2582,6 @@ class SequentialWorkflow:
         step_record = record.steps[failed_dispatch.step_id]
         if failed_dispatch.attempt != step_record.reviewer_attempts:
             raise SequentialWorkflowError("failed reviewer attempt is not the step's current reviewer attempt")
-        if step_record.reviewer_attempts >= step.retry.max_reviewer_attempts:
-            raise SequentialWorkflowError("step exhausted reviewer attempts")
-        if step_record.stalls >= self.config.execution.stall_policy.maximum_retries_per_step:
-            raise SequentialWorkflowError("step exhausted bounded reviewer retries")
         obligation = self._review_obligation(record, step)
         if failed_dispatch.role_key not in obligation.reviewer_role_keys:
             raise SequentialWorkflowError("failed reviewer role is no longer obligated for the step")
@@ -2618,6 +2605,19 @@ class SequentialWorkflow:
             raise SequentialWorkflowError("failed reviewer prompt does not match its immutable dispatch intent")
         if _sha256_json(payload.policy) != failed_dispatch.intent.policy_digest:
             raise SequentialWorkflowError("failed reviewer policy does not match its immutable dispatch intent")
+        try:
+            prompt_context = json.loads(payload.prompt)
+        except json.JSONDecodeError as exc:
+            raise SequentialWorkflowError(
+                "failed reviewer prompt is not a valid immutable worker context"
+            ) from exc
+        if not isinstance(prompt_context, dict) or prompt_context.get("authoritative_sources") != _authoritative_sources(
+            record.plan.sources,
+            _source_roots(self.config),
+        ):
+            raise SequentialWorkflowError(
+                "failed reviewer prompt lacks the exact authoritative-source ledger"
+            )
         if payload.repository_before is None:
             raise SequentialWorkflowError("failed reviewer dispatch has no durable repository snapshot")
         metadata = payload.session_metadata or {}
@@ -2649,6 +2649,71 @@ class SequentialWorkflow:
             after=observed,
             review_target=review_target,
         )
+
+    def _reviewer_result_validation_retry_exhausted(
+        self,
+        record: RunRecord,
+        failed_dispatch: DispatchRecord,
+    ) -> bool:
+        """Return whether a fully validated reviewer retry has reached a configured bound."""
+        step = _plan_step(record, failed_dispatch.step_id)
+        step_record = record.steps[failed_dispatch.step_id]
+        return (
+            step_record.reviewer_attempts >= step.retry.max_reviewer_attempts
+            or step_record.stalls >= self.config.execution.stall_policy.maximum_retries_per_step
+        )
+
+    def _reviewer_result_validation_retry_exhausted_record(
+        self,
+        record: RunRecord,
+        generation: int,
+        failed_dispatch: DispatchRecord,
+    ) -> tuple[RunRecord, int]:
+        """Apply the configured stall policy after immutable reviewer retry checks pass."""
+        step = record.steps[failed_dispatch.step_id]
+        policy = self.config.execution.stall_policy.on_exhausted
+        if policy == "ask":
+            event = self._event(
+                record,
+                "dispatcher",
+                "safe reviewer result-validation retry limit exhausted",
+                failed_dispatch.dispatch_id,
+            )
+            request = OperatorRequest(
+                request_id=f"request-{uuid.uuid4().hex}",
+                question=(
+                    f"Step {failed_dispatch.step_id} exhausted safe reviewer result-validation retries. "
+                    "Retry once more or halt?"
+                ),
+                allowed_answers=["retry", "halt"],
+                context_ref=failed_dispatch.dispatch_id,
+                resume_to=RunStatus.RUNNING,
+                expires_at=None,
+                required_role=None,
+                kind="stall_recovery",
+                step_id=failed_dispatch.step_id,
+            )
+            waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
+            return waiting, self.store.save_run(waiting, expected_generation=generation)
+        if policy == "halt":
+            event = self._event(
+                record,
+                "dispatcher",
+                "safe reviewer result-validation retry limit exhausted; halted",
+                failed_dispatch.dispatch_id,
+            )
+            halted = transition_run(record, RunStatus.HALTED, event)
+            return halted, self.store.save_run(halted, expected_generation=generation)
+
+        failed_event = self._event(
+            record,
+            "dispatcher",
+            "safe reviewer result-validation retry limit exhausted; step failed",
+            failed_dispatch.step_id,
+            sequence=step.last_event.sequence + 1,
+        )
+        failed_step = transition_step(step, StepStatus.FAILED, failed_event)
+        return self._replace_step(record, generation, failed_step)
 
     def _reviewer_result_validation_retry_waiting_record(
         self,
@@ -2688,6 +2753,61 @@ class SequentialWorkflow:
         )
         waiting = transition_run(record, RunStatus.WAITING_OPERATOR, event, operator_request=request)
         return waiting, self.store.save_run(waiting, expected_generation=generation)
+
+    @_serialized_transition
+    def record_reviewer_result_validation_failure(
+        self,
+        prepared: PreparedDispatch,
+        *,
+        reason: str,
+        failure_detail: str,
+    ) -> tuple[RunRecord, int]:
+        """Persist a post-session read-only reviewer response failure for durable retry verification."""
+        safe_reason = redact_text(reason)[:5000]
+        safe_detail = redact_text(failure_detail)[:5000]
+        try:
+            record, generation = self.store.load_run(prepared.run_id)
+            if generation != prepared.generation and self.config.execution.scheduling == "sequential":
+                raise SequentialWorkflowError("reviewer response validation generation is stale")
+            dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+            if dispatch.role_kind != "reviewer" or dispatch.state is not DispatchStatus.RUNNING:
+                raise SequentialWorkflowError(
+                    "post-session reviewer response validation requires a running reviewer dispatch"
+                )
+            event = self._event(record, "dispatcher", safe_reason, dispatch.dispatch_id)
+            record, generation = self.store.commit_dispatch_transition(
+                record,
+                expected_generation=generation,
+                dispatch_id=dispatch.dispatch_id,
+                target=DispatchStatus.FAILED,
+                event=event,
+                failure_category="result_validation",
+                failure_detail=safe_detail,
+            )
+            step = record.steps[dispatch.step_id]
+            if step.state is not StepStatus.REVIEWING:
+                raise SequentialWorkflowError(
+                    f"reviewer response validation has incompatible step state {step.state.value}"
+                )
+            step_event = self._event(
+                record,
+                "dispatcher",
+                "read-only reviewer response validation failed",
+                dispatch.dispatch_id,
+            )
+            retry_ready = transition_step(step, StepStatus.REVIEW_REQUIRED, step_event).model_copy(
+                update={
+                    "stalls": step.stalls + 1,
+                    "last_stall_category": "result_validation",
+                    "last_stall_reason": safe_detail,
+                }
+            )
+            return self._replace_step(record, generation, retry_ready)
+        finally:
+            self.store.release_leases(
+                owner_id=prepared.lease_owner_id,
+                resource_keys=prepared.lease_keys,
+            )
 
     def _verification_usage_waiting_record(
         self,

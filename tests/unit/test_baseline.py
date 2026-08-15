@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -48,6 +49,7 @@ def test_baseline_observation_never_infers_acceptance_and_tampering_invalidates_
 ) -> None:
     evidence = project.evidence / "fixture.md"
     evidence.write_text("historical fixture evidence\n", encoding="utf-8")
+    _commit(project.repository, "accepted baseline evidence")
     plan = NormalizedPlan.model_validate(valid_plan_values(project))
     store = _store(project)
 
@@ -141,13 +143,13 @@ def test_accepted_baseline_requires_review_proof_and_hydrates_new_run(project: F
 
 def test_pending_successor_artifacts_and_later_revision_do_not_invalidate_accepted_baseline(
     project: FixtureProject,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = _accepted_and_pending_plan(project)
     (project.evidence / "fixture.md").write_text("historical fixture evidence\n", encoding="utf-8")
     historical_review = project.evidence / "reviews" / "prepare-fixture.md"
     historical_review.parent.mkdir()
     historical_review.write_text("historical review proof\n", encoding="utf-8")
+    _commit(project.repository, "accepted baseline evidence")
     store = _store(project)
     approval = approve_baseline(
         inspect_baseline(plan, project.config),
@@ -164,9 +166,80 @@ def test_pending_successor_artifacts_and_later_revision_do_not_invalidate_accept
     (project.evidence / "successor.md").write_text("new successor evidence\n", encoding="utf-8")
     successor_review = project.evidence / "reviews" / "prepare-successor.md"
     successor_review.write_text("new successor review proof\n", encoding="utf-8")
-    monkeypatch.setattr("dispatcher.baseline._git_revision", lambda _root: "later-revision")
+    _commit(project.repository, "pending successor evidence")
 
     assert inspect_baseline(plan, project.config).observation_digest != approval.observation.observation_digest
+    assert validate_approved_baseline(plan=plan, config=project.config, store=store) == approval
+
+
+def test_accepted_baseline_allows_descendant_repository_revision(project: FixtureProject) -> None:
+    plan = _accepted_and_pending_plan(project)
+    evidence = project.evidence / "fixture.md"
+    evidence.write_text("historical fixture evidence\n", encoding="utf-8")
+    review_proof = project.evidence / "reviews" / "prepare-fixture.md"
+    review_proof.parent.mkdir()
+    review_proof.write_text("historical review proof\n", encoding="utf-8")
+    _commit(project.repository, "accepted baseline evidence")
+    store = _store(project)
+    approval = approve_baseline(
+        inspect_baseline(plan, project.config),
+        decisions=(
+            _decision("prepare-fixture", "ACCEPTED", reviewers=("reviewer",)),
+            _decision("prepare-successor", "PENDING"),
+        ),
+        plan=plan,
+        config=project.config,
+        store=store,
+        approval_decision_ref="decision-accepted-provenance",
+    )
+
+    (project.evidence / "successor.md").write_text("successor evidence\n", encoding="utf-8")
+    _commit(project.repository, "pending successor commit")
+
+    assert validate_approved_baseline(plan=plan, config=project.config, store=store) == approval
+
+
+def test_accepted_baseline_rejects_rewritten_repository_history(project: FixtureProject) -> None:
+    plan = _accepted_and_pending_plan(project)
+    evidence = project.evidence / "fixture.md"
+    evidence.write_text("historical fixture evidence\n", encoding="utf-8")
+    review_proof = project.evidence / "reviews" / "prepare-fixture.md"
+    review_proof.parent.mkdir()
+    review_proof.write_text("historical review proof\n", encoding="utf-8")
+    _commit(project.repository, "accepted baseline evidence")
+    store = _store(project)
+    approve_baseline(
+        inspect_baseline(plan, project.config),
+        decisions=(
+            _decision("prepare-fixture", "ACCEPTED", reviewers=("reviewer",)),
+            _decision("prepare-successor", "PENDING"),
+        ),
+        plan=plan,
+        config=project.config,
+        store=store,
+        approval_decision_ref="decision-rewritten-provenance",
+    )
+
+    tree = _git(project.repository, "rev-parse", "HEAD^{tree}")
+    rewritten = _git(project.repository, "commit-tree", tree, "-m", "rewritten history")
+    _git(project.repository, "update-ref", "HEAD", rewritten)
+
+    with pytest.raises(BaselineError, match="not an ancestor"):
+        validate_approved_baseline(plan=plan, config=project.config, store=store)
+
+
+def test_waived_baseline_does_not_claim_evidence_backed_provenance(project: FixtureProject) -> None:
+    plan = NormalizedPlan.model_validate(valid_plan_values(project))
+    store = _store(project)
+    approval = approve_baseline(
+        inspect_baseline(plan, project.config),
+        decisions=(_decision("prepare-fixture", "WAIVED"),),
+        plan=plan,
+        config=project.config,
+        store=store,
+        approval_decision_ref="decision-waived-provenance",
+    )
+
     assert validate_approved_baseline(plan=plan, config=project.config, store=store) == approval
 
 
@@ -323,3 +396,23 @@ def _accepted_and_pending_plan(project: FixtureProject) -> NormalizedPlan:
     )
     values["steps"].append(successor)
     return NormalizedPlan.model_validate(values)
+
+
+def _commit(repository: Path, message: str) -> None:
+    _git(repository, "config", "user.name", "Fixture Baseline")
+    _git(repository, "config", "user.email", "baseline@example.invalid")
+    _git(repository, "branch", "-M", "main")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", message)
+
+
+def _git(repository: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    return result.stdout.strip()

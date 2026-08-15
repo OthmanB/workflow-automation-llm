@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,10 +19,11 @@ from dispatcher.operation import (
     compile_role_permission_manifest,
     digest_json,
     parse_permission_digest_args,
+    parse_repository_revision_args,
     validate_real_operation_prerequisites,
 )
 from dispatcher.plan import NormalizedPlan, approve_plan
-from dispatcher.repository import RepositorySnapshot
+from dispatcher.repository import RepositorySnapshot, inspect_repository
 from dispatcher.state_store import StateStore
 from dispatcher.verification import verification_backend
 from dispatcher.workflow import StepStatus, TransitionEvent, new_run_record
@@ -57,6 +59,7 @@ def _write_approval(
     record,
     plan: NormalizedPlan,
     repo_id: str = "fixture-repo",
+    expected_repository_revisions: dict[str, str] | None = None,
 ) -> Path:
     permission_digests = _permission_digests(config, record, plan, repo_id)
     scope_manifest = compile_real_operation_scope_manifest(
@@ -65,6 +68,13 @@ def _write_approval(
         plan=plan,
         repo_id=repo_id,
     )
+    if expected_repository_revisions is None:
+        scope_repo_ids = tuple(dict.fromkeys(step.repo_id for step in scope_manifest.steps))
+        if len(scope_repo_ids) > 1:
+            expected_repository_revisions = {
+                scoped_repo_id: inspect_repository(config, scoped_repo_id, require_clean=True).revision
+                for scoped_repo_id in scope_repo_ids
+            }
     approval = approve_real_operation(
         config=config,
         record=record,
@@ -73,6 +83,7 @@ def _write_approval(
         approval_ref="decision-real-operation",
         permission_digests=permission_digests,
         scope_manifest_digest=scope_manifest.digest if len(scope_manifest.steps) > 1 else None,
+        expected_repository_revisions=expected_repository_revisions,
     )
     path.write_text(approval.model_dump_json(), encoding="utf-8")
     return path
@@ -133,6 +144,104 @@ def _two_step_plan_values(project) -> dict:
         }
     )
     values["steps"].append(second)
+    return values
+
+
+def _cross_repository_plan_values(project) -> dict:
+    values = _two_step_plan_values(project)
+    values["steps"][1]["repo_id"] = "sibling-repo"
+    return values
+
+
+def _scope_gap_plan_values(project) -> dict:
+    values = _two_step_plan_values(project)
+    first, runnable = values["steps"]
+    runnable.update(
+        {
+            "step_id": "prepare-runnable",
+            "title": "Prepare runnable fixture",
+            "depends_on": [],
+            "required_inputs": [],
+            "produced_outputs": [
+                {
+                    "artifact_id": "runnable-output",
+                    "producer_step_id": None,
+                    "description": "Runnable fixture output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "runnable-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "runnable-evidence",
+                    "relative_path": "runnable.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    blocked = copy.deepcopy(runnable)
+    blocked.update(
+        {
+            "ordinal": 3,
+            "step_id": "prepare-blocked",
+            "title": "Prepare blocked fixture",
+            "depends_on": [first["step_id"]],
+            "required_inputs": [
+                {
+                    "artifact_id": "fixture-output",
+                    "producer_step_id": first["step_id"],
+                    "description": "Blocked fixture input",
+                }
+            ],
+            "produced_outputs": [
+                {
+                    "artifact_id": "blocked-output",
+                    "producer_step_id": None,
+                    "description": "Blocked fixture output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "blocked-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "blocked-evidence",
+                    "relative_path": "blocked.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    later = copy.deepcopy(runnable)
+    later.update(
+        {
+            "ordinal": 4,
+            "step_id": "prepare-later",
+            "title": "Prepare later fixture",
+            "depends_on": [runnable["step_id"]],
+            "required_inputs": [
+                {
+                    "artifact_id": "runnable-output",
+                    "producer_step_id": runnable["step_id"],
+                    "description": "Runnable fixture input",
+                }
+            ],
+            "produced_outputs": [
+                {
+                    "artifact_id": "later-output",
+                    "producer_step_id": None,
+                    "description": "Later fixture output",
+                }
+            ],
+            "resource_locks": [{"resource_id": "later-resource", "mode": "write"}],
+            "evidence_requirements": [
+                {
+                    "artifact_id": "later-evidence",
+                    "relative_path": "later.md",
+                    "media_type": "text/markdown",
+                }
+            ],
+        }
+    )
+    values["steps"] = [first, runnable, blocked, later]
     return values
 
 
@@ -218,7 +327,10 @@ def test_real_operation_requires_explicit_confirmation_and_schema_v2(tmp_path: P
     record = _record(project, plan).model_copy(update={"config_digest": config.config_digest})
     store = StateStore(config.state_dir, heartbeat_seconds=30, stale_after_seconds=120)
     approval_path = _write_approval(
-        tmp_path / "approval.json", config=config, record=record, plan=plan
+        tmp_path / "approval.json",
+        config=config,
+        record=record,
+        plan=plan,
     )
 
     with pytest.raises(RealOperationError, match="confirm-real-operation"):
@@ -279,7 +391,10 @@ def test_real_operation_gates_on_the_expected_revision(
     )
     monkeypatch.setattr("dispatcher.operation.validate_approved_baseline", lambda **kwargs: None)
     approval_path = _write_approval(
-        tmp_path / "approval.json", config=config, record=record, plan=plan
+        tmp_path / "approval.json",
+        config=config,
+        record=record,
+        plan=plan,
     )
 
     kwargs = dict(
@@ -308,17 +423,47 @@ def _real_operation_kwargs_with_smoke_proof(
     *,
     review_required: bool = False,
     two_steps: bool = False,
+    cross_repository: bool = False,
 ) -> dict[str, object]:
     project = create_fixture_project(tmp_path)
     values = config_values(project)
     values["execution"]["mode"] = "real_operation"
     values["execution"]["verification_backend"] = "darwin_seatbelt_v1"
-    if two_steps:
+    if two_steps or cross_repository:
         values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
         values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
+    if cross_repository:
+        sibling = project.root / "sibling-repository"
+        subprocess.run(
+            ["git", "init", "--quiet", str(sibling)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/sibling.git"],
+            cwd=sibling,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        (sibling / "evidence").mkdir()
+        values["repositories"]["sibling-repo"] = {
+            **values["repositories"]["fixture-repo"],
+            "root": str(sibling),
+            "expected_remote": {"name": "origin", "url": "https://example.invalid/sibling.git"},
+        }
     config = write_config(project, values)
     plan_path = tmp_path / "plan.yaml"
-    plan_values = _two_step_plan_values(project) if two_steps else valid_plan_values(project)
+    plan_values = (
+        _cross_repository_plan_values(project)
+        if cross_repository
+        else _two_step_plan_values(project)
+        if two_steps
+        else valid_plan_values(project)
+    )
     if review_required:
         plan_values["steps"][0]["review"] = {
             "required": True,
@@ -331,11 +476,13 @@ def _real_operation_kwargs_with_smoke_proof(
     record = _record(project, plan).model_copy(update={"config_digest": config.config_digest})
     store = StateStore(config.state_dir, heartbeat_seconds=30, stale_after_seconds=120)
     store.create_run(record)
-    revision = "ab" * 20
+    revisions = {"fixture-repo": "ab" * 20}
+    if cross_repository:
+        revisions["sibling-repo"] = "cd" * 20
     snapshot = RepositorySnapshot(
         repo_id="fixture-repo",
         branch="main",
-        revision=revision,
+        revision=revisions["fixture-repo"],
         worktree_id="cd" * 32,
         remote_name="origin",
         remote_url="https://example.invalid/fixture.git",
@@ -349,7 +496,14 @@ def _real_operation_kwargs_with_smoke_proof(
         git_metadata_sha256="ab" * 32,
         git_refs_sha256="cd" * 32,
     )
-    monkeypatch.setattr("dispatcher.operation.inspect_repository", lambda *args, **kwargs: snapshot)
+    snapshots = {
+        repo_id: snapshot.model_copy(update={"repo_id": repo_id, "revision": revision})
+        for repo_id, revision in revisions.items()
+    }
+    monkeypatch.setattr(
+        "dispatcher.operation.inspect_repository",
+        lambda _config, repo_id, **_kwargs: snapshots[repo_id],
+    )
     monkeypatch.setattr("dispatcher.operation.validate_approved_baseline", lambda **kwargs: None)
     monkeypatch.setattr(
         "dispatcher.operation.verification_backend",
@@ -370,7 +524,11 @@ def _real_operation_kwargs_with_smoke_proof(
     )
     smoke_path.write_text(proof.model_dump_json(), encoding="utf-8")
     approval_path = _write_approval(
-        tmp_path / "approval.json", config=config, record=record, plan=plan
+        tmp_path / "approval.json",
+        config=config,
+        record=record,
+        plan=plan,
+        expected_repository_revisions=revisions if cross_repository else None,
     )
     return {
         "config": config,
@@ -382,7 +540,8 @@ def _real_operation_kwargs_with_smoke_proof(
         "smoke_model": "fixture/executor",
         "permission_digests": _permission_digests(config, record, plan),
         "stall_policy_digest": "0" * 64,
-        "expected_revision": revision,
+        "expected_revision": None if cross_repository else revisions["fixture-repo"],
+        "expected_repository_revisions": revisions if cross_repository else None,
         "approval_record_path": approval_path,
         "confirm": True,
     }
@@ -466,6 +625,137 @@ def test_real_operation_scope_binds_every_reachable_two_step_manifest(tmp_path: 
         scope_manifest_digest=scope.digest,
     )
     assert approval.scope_manifest == scope
+
+
+@pytest.mark.parametrize("blocked_by", ["dependency", "operator_gate"])
+def test_scope_stops_before_an_unreachable_middle_step(
+    tmp_path: Path,
+    blocked_by: str,
+) -> None:
+    project = create_fixture_project(tmp_path)
+    values = config_values(project)
+    values["permission_policies"]["policies"]["repository"]["actions"]["commit"] = "allow"
+    values["permission_policies"]["policies"]["executor-class"]["actions"]["commit"] = "allow"
+    object.__setattr__(project, "config", write_config(project, values))
+    plan = NormalizedPlan.model_validate(_scope_gap_plan_values(project))
+    record = _record(project, plan)
+    states = {
+        **record.steps,
+        "prepare-fixture": record.steps["prepare-fixture"].model_copy(
+            update={"state": StepStatus.REVIEW_REQUIRED}
+        ),
+    }
+    if blocked_by == "operator_gate":
+        states["prepare-blocked"] = states["prepare-blocked"].model_copy(
+            update={"state": StepStatus.REVIEW_REQUIRED, "operator_gate_resolved": False}
+        )
+    blocked = record.model_copy(update={"steps": states})
+
+    scope = compile_real_operation_scope_manifest(
+        config=project.config,
+        plan=plan,
+        record=blocked,
+        repo_id="fixture-repo",
+    )
+
+    assert [manifest.step_id for manifest in scope.steps] == ["prepare-runnable"]
+
+
+def test_execute_gate_validates_cross_repository_scope_revisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        cross_repository=True,
+    )
+    approval = RealOperationApproval.model_validate_json(
+        Path(kwargs["approval_record_path"]).read_text(encoding="utf-8")
+    )
+    assert approval.repository_revisions is not None
+    assert [(item.repo_id, item.revision) for item in approval.repository_revisions] == [
+        ("fixture-repo", "ab" * 20),
+        ("sibling-repo", "cd" * 20),
+    ]
+    kwargs["stall_policy_digest"] = digest_json(
+        kwargs["config"].execution.stall_policy.model_dump(mode="json")
+    )
+
+    validated = validate_real_operation_prerequisites(**kwargs)
+
+    assert validated["repository_revisions"] == [
+        {"repo_id": "fixture-repo", "revision": "ab" * 20},
+        {"repo_id": "sibling-repo", "revision": "cd" * 20},
+    ]
+    record = kwargs["record"]
+    resumed = record.model_copy(
+        update={
+            "steps": {
+                **record.steps,
+                "prepare-fixture": record.steps["prepare-fixture"].model_copy(
+                    update={"state": StepStatus.ACCEPTED}
+                ),
+            }
+        }
+    )
+    kwargs["record"] = resumed
+    kwargs["permission_digests"] = _permission_digests(
+        kwargs["config"],
+        resumed,
+        resumed.plan,
+        "sibling-repo",
+    )
+    assert validate_real_operation_prerequisites(**kwargs)["step_id"] == "prepare-second"
+    incomplete = {**kwargs, "expected_repository_revisions": {"fixture-repo": "ab" * 20}}
+    with pytest.raises(RealOperationError, match="missing: sibling-repo"):
+        validate_real_operation_prerequisites(**incomplete)
+
+
+@pytest.mark.parametrize("failure", ["dirty", "revision"])
+def test_execute_gate_rejects_later_cross_repository_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        cross_repository=True,
+    )
+    kwargs["stall_policy_digest"] = digest_json(
+        kwargs["config"].execution.stall_policy.model_dump(mode="json")
+    )
+
+    def snapshot(repo_id: str) -> RepositorySnapshot:
+        sibling = repo_id == "sibling-repo"
+        return RepositorySnapshot(
+            repo_id=repo_id,
+            branch="main",
+            revision=("ef" * 20 if sibling and failure == "revision" else "cd" * 20 if sibling else "ab" * 20),
+            worktree_id="cd" * 32,
+            remote_name="origin",
+            remote_url="https://example.invalid/fixture.git",
+            clean=not (sibling and failure == "dirty"),
+            evidence=(),
+            external=(),
+            changes=(),
+            manifest_sha256="ef" * 32,
+            ignored=(),
+            dirty_patch_sha256="aa" * 32,
+            git_metadata_sha256="ab" * 32,
+            git_refs_sha256="cd" * 32,
+        )
+
+    monkeypatch.setattr(
+        "dispatcher.operation.inspect_repository",
+        lambda _config, repo_id, **_kwargs: snapshot(repo_id),
+    )
+
+    with pytest.raises(RealOperationError, match="(sibling-repo.*not clean|expected revision: sibling-repo)"):
+        validate_real_operation_prerequisites(**kwargs)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "reordered", "extra", "later_role", "writable", "evidence"])
@@ -655,6 +945,17 @@ def test_permission_digest_arguments_reject_malformed_and_duplicate_roles() -> N
         parse_permission_digest_args(["terra=bad"])
     with pytest.raises(RealOperationError, match="duplicate.*terra"):
         parse_permission_digest_args([f"terra={'0' * 64}", f"terra={'1' * 64}"])
+
+
+def test_repository_revision_arguments_reject_malformed_and_duplicate_repositories() -> None:
+    with pytest.raises(RealOperationError, match="REPOSITORY=REVISION"):
+        parse_repository_revision_args(["not-a-pair"])
+    with pytest.raises(RealOperationError, match="full lowercase Git object ID"):
+        parse_repository_revision_args(["fixture-repo=bad"])
+    with pytest.raises(RealOperationError, match="duplicate repository"):
+        parse_repository_revision_args(
+            [f"fixture-repo={'0' * 40}", f"fixture-repo={'1' * 40}"]
+        )
 
 
 def test_permission_manifest_covers_supervisor_all_executors_and_required_reviewers(
