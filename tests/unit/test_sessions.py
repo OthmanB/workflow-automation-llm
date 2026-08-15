@@ -42,7 +42,7 @@ import os
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    print("opencode 1.18.11")
+    print("opencode 1.18.18")
 elif sys.argv[1:3] == ["session", "list"]:
     print({session_list_json!r})
 elif len(sys.argv) > 1 and sys.argv[1] == "run":
@@ -523,7 +523,7 @@ def test_run_session_rejects_an_unsupported_binary_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     binary = _write_fake_opencode(tmp_path, _success_body())
-    contents = binary.read_text(encoding="utf-8").replace("opencode 1.18.11", "opencode 9.9.9")
+    contents = binary.read_text(encoding="utf-8").replace("opencode 1.18.18", "opencode 9.9.9")
     binary.write_text(contents, encoding="utf-8")
     monkeypatch.setattr(sessions, "OPENCODE_BIN", str(binary))
 

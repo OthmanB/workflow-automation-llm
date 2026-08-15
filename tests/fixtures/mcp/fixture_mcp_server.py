@@ -6,8 +6,8 @@ Exposes exactly two tools:
 - ``fixture_echo``: returns the provided text argument.
 - ``fixture_probe``: returns a marker; used to prove exact tool deny rules.
 
-Capture provenance: this file is paired with the pinned OpenCode 1.18.11
-compatibility fixtures under tests/fixtures/opencode/1.18.11/.
+Capture provenance: this file is paired with the pinned OpenCode 1.18.18
+compatibility fixtures under tests/fixtures/opencode/1.18.18/.
 """
 
 from __future__ import annotations

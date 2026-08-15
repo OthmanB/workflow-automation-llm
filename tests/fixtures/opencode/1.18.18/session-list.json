@@ -1,0 +1,10 @@
+[
+  {
+    "id": "ses_fixture_list",
+    "title": "Fixture Session",
+    "updated": 1700000000600,
+    "created": 1700000000000,
+    "projectId": "project_fixture",
+    "directory": "/fixture/project"
+  }
+]

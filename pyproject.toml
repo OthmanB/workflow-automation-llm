@@ -64,6 +64,6 @@ warn_unused_configs = true
 warn_unused_ignores = true
 
 [tool.dispatcher.opencode]
-supported-version = "1.18.11"
-fixture-path = "tests/fixtures/opencode/1.18.11"
-source-tag = "v1.18.11"
+supported-version = "1.18.18"
+fixture-path = "tests/fixtures/opencode/1.18.18"
+source-tag = "v1.18.18"

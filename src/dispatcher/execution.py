@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -25,6 +26,7 @@ from .permissions import (
     role_scoped_authorized_actions,
     should_auto_approve,
 )
+from .plan import PlanError, verify_plan_sources
 from .repository import RepositoryValidationError
 from .results import ResultError, parse_executor_proposal, parse_reviewer_result
 from .security import redact_text
@@ -35,6 +37,8 @@ from .sequential import (
     SequentialWorkflow,
     SequentialWorkflowError,
     WorkerResultValidationError,
+    _authoritative_sources,
+    _source_roots,
     session_registry_identity,
 )
 from .sessions import (
@@ -240,6 +244,21 @@ class SequentialExecutionCoordinator:
     def execute_worker(self, prepared: PreparedDispatch) -> WorkerOutcome:
         """Execute one prepared worker with synchronous lifecycle transactions."""
         current = prepared
+        try:
+            self._validate_persisted_worker_prompt(current)
+        except ExecutionCoordinatorError as exc:
+            try:
+                self.workflow.recover_interrupted_dispatch(
+                    current.run_id,
+                    current.dispatch.dispatch_id,
+                    recovery_reason=str(exc),
+                )
+            finally:
+                self.store.release_leases(
+                    owner_id=current.lease_owner_id,
+                    resource_keys=current.lease_keys,
+                )
+            raise
         invocation_id = f"dispatch:{prepared.run_id}:{prepared.dispatch.dispatch_id}"
         invocation_finalized = False
 
@@ -503,6 +522,40 @@ class SequentialExecutionCoordinator:
         results = self._verification_runner(step, Path(prepared.workdir))
         self.heartbeat()
         return results
+
+    def _validate_persisted_worker_prompt(self, prepared: PreparedDispatch) -> None:
+        """Reject a legacy or altered durable worker context before any OpenCode launch."""
+        try:
+            record, _generation = self.store.load_run(prepared.run_id)
+            dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+            stored = self.store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id)
+        except (KeyError, StateStoreError) as exc:
+            raise ExecutionCoordinatorError(
+                f"cannot load persisted worker prompt for dispatch {prepared.dispatch.dispatch_id}"
+            ) from exc
+        try:
+            verify_plan_sources(record.plan, self.config)
+        except PlanError as exc:
+            raise ExecutionCoordinatorError(
+                f"immutable plan source verification failed: {exc}"
+            ) from exc
+        if hashlib.sha256(stored.prompt.encode("utf-8")).hexdigest() != dispatch.intent.prompt_sha256:
+            raise ExecutionCoordinatorError(
+                "persisted worker prompt does not match its immutable dispatch intent"
+            )
+        context = _strict_json_object(
+            stored.prompt,
+            description=f"persisted worker prompt for dispatch {prepared.dispatch.dispatch_id}",
+        )
+        expected_sources = _authoritative_sources(record.plan.sources, _source_roots(self.config))
+        if context.get("authoritative_sources") != expected_sources:
+            raise ExecutionCoordinatorError(
+                "persisted worker prompt lacks a valid authoritative-source ledger"
+            )
+        if stored.prompt != prepared.prompt:
+            raise ExecutionCoordinatorError(
+                "persisted worker prompt does not match the launchable worker context"
+            )
 
     def execute_batch(self, prepared: PreparedBatch) -> BatchOutcome:
         """Run all atomically prepared children within the configured global bound."""

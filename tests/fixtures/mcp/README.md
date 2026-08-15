@@ -6,8 +6,8 @@ Step 21-lite compatibility and compiler tests. It exposes exactly two methods:
 
 ## Capture provenance
 
-- Tool naming convention verified against the pinned OpenCode `1.18.11`
-  binary on the operator machine: MCP tools are exposed as
+- The pinned OpenCode `1.18.18` compatibility fixture preserves the expected
+  MCP tool naming convention: tools are exposed as
   `<server>_<method>` after name sanitization (for example a server named
   `fixture` exposes `fixture_echo` and `fixture_probe`).
 - Dispatcher code emits inline OpenCode configuration through
@@ -21,4 +21,3 @@ Step 21-lite compatibility and compiler tests. It exposes exactly two methods:
 
 The unit test `tests/unit/test_mcp.py::test_fixture_mcp_server_speaks_json_rpc`
 exercises the fixture's initialize/tools/list/tools/call exchange directly.
-

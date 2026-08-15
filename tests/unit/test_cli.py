@@ -86,7 +86,7 @@ def test_smoke_proof_command_writes_successful_proof(
             exit_code=0,
             chat_response="  LIVE_SMOKE_OK\n",
             evidence_written=[],
-            opencode_version="1.18.11",
+            opencode_version="1.18.18",
         )
 
     monkeypatch.setattr(cli, "refresh_opencode_credentials", lambda state_dir: None)
@@ -101,7 +101,7 @@ def test_smoke_proof_command_writes_successful_proof(
     assert proof.passed is True
     assert proof.config_digest == project.config.config_digest
     assert proof.model == "fixture/model"
-    assert proof.opencode_version == "1.18.11"
+    assert proof.opencode_version == "1.18.18"
     assert proof.session_id_present is True
     assert proof.workdir_clean is True
     assert proof.evidence_written == []
@@ -125,7 +125,7 @@ def test_smoke_proof_command_rejects_nonmatching_result(
             exit_code=0,
             chat_response="NOT_OK",
             evidence_written=[],
-            opencode_version="1.18.11",
+            opencode_version="1.18.18",
         )
 
     result = cli._cmd_smoke_proof(

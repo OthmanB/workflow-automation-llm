@@ -1,0 +1,33 @@
+{
+  "info": {
+    "id": "ses_fixture_export",
+    "projectID": "project_fixture",
+    "directory": "[redacted:session-directory:ses_fixture_export]",
+    "title": "[redacted:session-title:ses_fixture_export]",
+    "time": {
+      "created": 1700000000000,
+      "updated": 1700000000700
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg_fixture_export",
+        "sessionID": "ses_fixture_export",
+        "role": "user",
+        "time": {
+          "created": 1700000000000
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_fixture_export",
+          "sessionID": "ses_fixture_export",
+          "messageID": "msg_fixture_export",
+          "type": "text",
+          "text": "[redacted:text:prt_fixture_export]"
+        }
+      ]
+    }
+  ]
+}

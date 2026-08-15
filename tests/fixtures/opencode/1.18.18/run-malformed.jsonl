@@ -1,0 +1,2 @@
+this is intentionally not json
+{"type":"text","timestamp":1700000000500,"sessionID":"ses_fixture_malformed","part":{"id":"prt_fixture_after_malformed","sessionID":"ses_fixture_malformed","messageID":"msg_fixture_malformed","type":"text","text":"FIXTURE_AFTER_MALFORMED","time":{"start":1700000000499,"end":1700000000500}}}

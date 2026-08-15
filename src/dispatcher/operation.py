@@ -45,7 +45,7 @@ class LiveSmokeProof(ContractModel):
     proof_version: int = Field(strict=True, ge=1, le=1)
     config_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     model: str = Field(min_length=1)
-    opencode_version: str = Field(pattern=r"^1\.18\.11$")
+    opencode_version: str = Field(pattern=r"^1\.18\.18$")
     passed: bool
     session_id_present: bool
     workdir_clean: bool

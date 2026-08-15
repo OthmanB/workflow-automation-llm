@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +17,7 @@ from dispatcher.execution import (
     SupervisorOutcome,
     WorkerOutcome,
     _adapter_error_usage,
+    _refresh_prepared,
     _session_usage,
     _worker_failure,
     _worker_json_object,
@@ -1235,6 +1237,193 @@ def test_duplicate_worker_invocation_is_not_relaunched(tmp_path: Path) -> None:
     assert calls == 1
     assert len(invocations) == 1
     assert invocations[0]["usage_status"] == "COMPLETE"
+
+
+def test_legacy_persisted_worker_prompt_is_reconciled_before_refresh_relaunch(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def runner(**_kwargs: Any) -> SessionResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("legacy worker prompt must not launch OpenCode")
+
+    coordinator, store, prepared = _prepared_coordinator(tmp_path, session_runner=runner)
+    try:
+        record, generation = store.load_run(prepared.run_id)
+        payload = store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id)
+        legacy_context = json.loads(payload.prompt)
+        legacy_context.pop("authoritative_sources")
+        legacy_context.pop("authoritative_sources_rule")
+        legacy_prompt = json.dumps(legacy_context, sort_keys=True)
+        legacy_dispatch = prepared.dispatch.model_copy(
+            update={
+                "intent": prepared.dispatch.intent.model_copy(
+                    update={"prompt_sha256": hashlib.sha256(legacy_prompt.encode("utf-8")).hexdigest()}
+                )
+            }
+        )
+        legacy_record = record.model_copy(
+            update={
+                "dispatches": {
+                    **record.dispatches,
+                    legacy_dispatch.dispatch_id: legacy_dispatch,
+                }
+            }
+        )
+        generation = store.save_run(
+            legacy_record,
+            expected_generation=generation,
+            dispatch_payloads={
+                legacy_dispatch.dispatch_id: DispatchPayload(
+                    prompt=legacy_prompt,
+                    policy=payload.policy,
+                    result=payload.result,
+                    authoritative_verification=payload.authoritative_verification,
+                    forwarding_payload=payload.forwarding_payload,
+                    process_id=payload.process_id,
+                    session_metadata=payload.session_metadata,
+                    repository_before=payload.repository_before,
+                    repository_after=payload.repository_after,
+                )
+            },
+        )
+        refreshed = _refresh_prepared(
+            replace(prepared, dispatch=legacy_dispatch),
+            legacy_record,
+            generation,
+        )
+
+        with pytest.raises(ExecutionCoordinatorError, match="authoritative-source ledger"):
+            coordinator.execute_worker(refreshed)
+    finally:
+        coordinator.release_run()
+
+    persisted, _generation = store.load_run(prepared.run_id)
+    assert calls == 0
+    assert store.opencode_invocations_for_run(prepared.run_id) == ()
+    assert persisted.dispatches[prepared.dispatch.dispatch_id].state is DispatchStatus.ABANDONED
+    assert persisted.dispatches[prepared.dispatch.dispatch_id].failure_category == "invalid_persisted_prompt"
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert persisted.operator_request is not None
+    assert persisted.operator_request.kind == "reconciliation"
+    assert "cannot be safely replayed" in persisted.operator_request.question
+    assert not store.leases_for_run(prepared.run_id)
+    assert store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id).prompt == legacy_prompt
+
+
+def test_malformed_running_worker_prompt_is_reconciled_without_relaunch(tmp_path: Path) -> None:
+    calls = 0
+
+    def runner(**_kwargs: Any) -> SessionResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("malformed worker prompt must not launch OpenCode")
+
+    coordinator, store, prepared = _prepared_coordinator(tmp_path, session_runner=runner)
+    try:
+        running = coordinator.workflow.mark_running(
+            prepared,
+            process_id=999_999_999,
+            process_create_time=1.0,
+        )
+        record, generation = store.load_run(running.run_id)
+        payload = store.load_dispatch_payload(running.run_id, running.dispatch.dispatch_id)
+        legacy_prompt = "legacy worker prompt"
+        legacy_dispatch = running.dispatch.model_copy(
+            update={
+                "intent": running.dispatch.intent.model_copy(
+                    update={"prompt_sha256": hashlib.sha256(legacy_prompt.encode("utf-8")).hexdigest()}
+                )
+            }
+        )
+        legacy_record = record.model_copy(
+            update={
+                "dispatches": {
+                    **record.dispatches,
+                    legacy_dispatch.dispatch_id: legacy_dispatch,
+                }
+            }
+        )
+        generation = store.save_run(
+            legacy_record,
+            expected_generation=generation,
+            dispatch_payloads={
+                legacy_dispatch.dispatch_id: DispatchPayload(
+                    prompt=legacy_prompt,
+                    policy=payload.policy,
+                    result=payload.result,
+                    authoritative_verification=payload.authoritative_verification,
+                    forwarding_payload=payload.forwarding_payload,
+                    process_id=payload.process_id,
+                    session_metadata=payload.session_metadata,
+                    repository_before=payload.repository_before,
+                    repository_after=payload.repository_after,
+                )
+            },
+        )
+        refreshed = _refresh_prepared(
+            replace(running, dispatch=legacy_dispatch),
+            legacy_record,
+            generation,
+        )
+
+        with pytest.raises(ExecutionCoordinatorError, match="not one strict JSON object"):
+            coordinator.execute_worker(refreshed)
+
+        persisted, _generation = store.load_run(prepared.run_id)
+        dispatch = persisted.dispatches[prepared.dispatch.dispatch_id]
+        assert calls == 0
+        assert store.opencode_invocations_for_run(prepared.run_id) == ()
+        assert dispatch.state is DispatchStatus.FAILED
+        assert dispatch.failure_category == "invalid_persisted_prompt"
+        assert persisted.state is RunStatus.WAITING_OPERATOR
+        assert persisted.operator_request is not None
+        assert persisted.operator_request.kind == "reconciliation"
+        assert not [
+            lease
+            for lease in store.leases_for_run(prepared.run_id)
+            if lease.resource_key != f"run:{persisted.project_id}"
+        ]
+        assert store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id).prompt == legacy_prompt
+    finally:
+        coordinator.release_run()
+
+    assert not store.leases_for_run(prepared.run_id)
+
+
+def test_source_changed_after_preparation_is_reconciled_before_worker_launch(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def runner(**_kwargs: Any) -> SessionResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("changed source must not launch OpenCode")
+
+    coordinator, store, prepared = _prepared_coordinator(tmp_path, session_runner=runner)
+    original_prompt = store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id).prompt
+    plan_path = Path(coordinator.config.model.sources.plans_dir) / "plan.md"
+    plan_path.write_text("changed after preparation\n", encoding="utf-8")
+    try:
+        with pytest.raises(ExecutionCoordinatorError, match="plan source hash mismatch"):
+            coordinator.execute_worker(prepared)
+    finally:
+        coordinator.release_run()
+
+    persisted, _generation = store.load_run(prepared.run_id)
+    assert calls == 0
+    assert store.opencode_invocations_for_run(prepared.run_id) == ()
+    assert persisted.dispatches[prepared.dispatch.dispatch_id].state is DispatchStatus.ABANDONED
+    assert persisted.dispatches[prepared.dispatch.dispatch_id].failure_category == "invalid_persisted_prompt"
+    assert persisted.state is RunStatus.WAITING_OPERATOR
+    assert persisted.operator_request is not None
+    assert persisted.operator_request.kind == "reconciliation"
+    assert "plan source hash mismatch" in persisted.operator_request.question
+    assert not store.leases_for_run(prepared.run_id)
+    assert store.load_dispatch_payload(prepared.run_id, prepared.dispatch.dispatch_id).prompt == original_prompt
 
 
 def test_non_retryable_adapter_failure_persists_provider_category_and_redacted_detail(

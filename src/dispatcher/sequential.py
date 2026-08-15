@@ -34,7 +34,7 @@ from .permissions import (
     role_scoped_authorized_actions,
     should_auto_approve,
 )
-from .plan import PlanError, PlanStep, validate_plan_approval, verify_plan_sources
+from .plan import PlanError, PlanSource, PlanStep, validate_plan_approval, verify_plan_sources
 from .policy import PolicyError, compile_run_policy
 from .protocol import (
     AskOperatorCommand,
@@ -369,6 +369,7 @@ class SequentialWorkflow:
         """Commit a fully validated PREPARED dispatch before any worker launch."""
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a dispatch")
+        self._verify_dispatch_sources(record)
         if self.config.execution.scheduling == "sequential" and any(
             dispatch.state
             in {
@@ -472,6 +473,8 @@ class SequentialWorkflow:
             role_kind=role_kind,
             step=step,
             task=command.prompt,
+            authoritative_sources=record.plan.sources,
+            source_roots=_source_roots(self.config),
             repository=repository_before.dispatch_coordinate(
                 base_branch=workspace_group.base_branch if workspace_group is not None else None
             ),
@@ -742,6 +745,7 @@ class SequentialWorkflow:
             children = validate_workspace_batch(self.config, record, tuple(command.children))
         except SchedulingError as exc:
             raise SequentialWorkflowError(f"workspace batch is not schedulable: {exc}") from exc
+        self._verify_dispatch_sources(record)
         repo_id = _plan_step(record, children[0].step_id).repo_id
         try:
             outcome = self.workspace_coordinator.prepare(
@@ -755,6 +759,7 @@ class SequentialWorkflow:
                 outcome.generation,
                 command,
                 workspace_group=outcome.group,
+                sources_verified=True,
             )
         except Exception as exc:
             if "outcome" in locals():
@@ -778,10 +783,13 @@ class SequentialWorkflow:
         command: BatchDispatchCommand,
         *,
         workspace_group: WorkspaceGroup | None = None,
+        sources_verified: bool = False,
     ) -> PreparedBatch:
         """Atomically prepare every independently valid child in a protocol-v2 batch."""
         if record.state is not RunStatus.RUNNING:
             raise SequentialWorkflowError("only RUNNING runs may prepare a batch")
+        if not sources_verified:
+            self._verify_dispatch_sources(record)
         if workspace_group is None:
             try:
                 children = validate_batch(self.config, record, tuple(command.children))
@@ -858,6 +866,8 @@ class SequentialWorkflow:
                 role_kind=role_kind,
                 step=step,
                 task=child.prompt,
+                authoritative_sources=working.plan.sources,
+                source_roots=_source_roots(self.config),
                 repository=repository_before.dispatch_coordinate(
                     base_branch=workspace_group.base_branch if workspace_group is not None else None
                 ),
@@ -2850,6 +2860,8 @@ class SequentialWorkflow:
         self,
         run_id: str,
         dispatch_id: str,
+        *,
+        recovery_reason: str | None = None,
     ) -> tuple[RunRecord, int]:
         """Convert an abandoned active dispatch into an explicit operator reconciliation."""
         record, generation = self.store.load_run(run_id)
@@ -2863,19 +2875,25 @@ class SequentialWorkflow:
             raise SequentialWorkflowError(
                 f"interrupted dispatch {dispatch_id} may still have an active process; cancel it before recovery"
             )
+        invalid_prompt = recovery_reason is not None
+        failure_detail = recovery_reason or "OpenCode invocation did not durably apply a worker result"
         target = DispatchStatus.ABANDONED if dispatch.state is DispatchStatus.PREPARED else DispatchStatus.FAILED
         dispatch_event = self._event(
             record,
             "dispatcher",
-            "interrupted OpenCode invocation requires operator reconciliation",
+            (
+                "invalid persisted worker prompt requires operator reconciliation"
+                if invalid_prompt
+                else "interrupted OpenCode invocation requires operator reconciliation"
+            ),
             dispatch_id,
         )
         recovered_dispatch = transition_dispatch(
             dispatch,
             target,
             dispatch_event,
-            failure_category="interrupted",
-            failure_detail="OpenCode invocation did not durably apply a worker result",
+            failure_category="invalid_persisted_prompt" if invalid_prompt else "interrupted",
+            failure_detail=failure_detail,
         )
         dispatches = dict(record.dispatches)
         dispatches[dispatch_id] = recovered_dispatch
@@ -2890,7 +2908,11 @@ class SequentialWorkflow:
         step_event = self._event(
             record,
             "dispatcher",
-            "interrupted worker requires operator reconciliation",
+            (
+                "invalid persisted worker prompt requires operator reconciliation"
+                if invalid_prompt
+                else "interrupted worker requires operator reconciliation"
+            ),
             dispatch_id,
         )
         if step.state is StepStatus.EXECUTING:
@@ -2908,13 +2930,21 @@ class SequentialWorkflow:
         request_event = self._event(
             record,
             "dispatcher",
-            "interrupted worker requires operator reconciliation",
+            (
+                "invalid persisted worker prompt requires operator reconciliation"
+                if invalid_prompt
+                else "interrupted worker requires operator reconciliation"
+            ),
             dispatch_id,
         )
         request = OperatorRequest(
             request_id=f"request-{uuid.uuid4().hex}",
             question=(
-                "An interrupted OpenCode worker may have made external changes without a durable result. "
+                "The persisted worker prompt cannot be safely replayed: "
+                f"{redact_text(failure_detail)[:5000]}. "
+                "It was not launched. Reconcile the dispatch record or halt."
+                if invalid_prompt
+                else "An interrupted OpenCode worker may have made external changes without a durable result. "
                 "Reconcile repository and session state before any retry."
             ),
             allowed_answers=["reconcile", "halt"],
@@ -3700,6 +3730,13 @@ class SequentialWorkflow:
         except PlanError as exc:
             raise SequentialWorkflowError(f"cannot render bootstrap: {exc}") from exc
 
+    def _verify_dispatch_sources(self, record: RunRecord) -> None:
+        """Recheck the immutable source ledger immediately before prompt preparation."""
+        try:
+            verify_plan_sources(record.plan, self.config)
+        except PlanError as exc:
+            raise SequentialWorkflowError(f"cannot prepare worker dispatch: {exc}") from exc
+
     def _compile_run_policy(self, record: RunRecord, generation: int) -> tuple[RunRecord, int]:
         """Persist exactly one selected-profile policy before activating any run."""
         try:
@@ -4131,6 +4168,8 @@ def _worker_prompt(
     role_kind: Literal["executor", "reviewer"],
     step: PlanStep,
     task: str,
+    authoritative_sources: tuple[PlanSource, ...],
+    source_roots: Mapping[str, Path],
     repository: DispatchRepositoryCoordinate,
     evidence_roots: list[str],
     review_target: ReviewTarget | None,
@@ -4159,6 +4198,12 @@ def _worker_prompt(
             "remote_name": repository.remote_name,
             "remote_url": repository.remote_url,
             "task": task,
+            "authoritative_sources": _authoritative_sources(authoritative_sources, source_roots),
+            "authoritative_sources_rule": (
+                "Read the exact listed path entries as normative. You must not substitute similarly named "
+                "files. Do not calculate hashes or treat Bash, tests, or Git output as source authority; "
+                "dispatcher source verification is authoritative."
+            ),
             **(
                 {
                     "role_instruction": (
@@ -4355,6 +4400,31 @@ def _worker_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _source_roots(config: Config) -> dict[str, Path]:
+    """Return the normalized configured roots for immutable plan sources."""
+    return {
+        "plans": Path(config.model.sources.plans_dir).resolve(),
+        "specifications": Path(config.model.sources.specifications_dir).resolve(),
+    }
+
+
+def _authoritative_sources(
+    sources: tuple[PlanSource, ...],
+    source_roots: Mapping[str, Path],
+) -> list[dict[str, str]]:
+    """Render the approved source ledger without consulting mutable source selections."""
+    return [
+        {
+            "source_id": source.source_id,
+            "root": source.root,
+            "relative_path": source.relative_path,
+            "sha256": source.sha256,
+            "path": str((source_roots[source.root] / source.relative_path).resolve()),
+        }
+        for source in sources
+    ]
 
 
 def _worker_response_template(

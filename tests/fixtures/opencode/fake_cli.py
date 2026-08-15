@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic OpenCode 1.18.11 stand-in for disposable integration tests."""
+"""Deterministic OpenCode 1.18.18 stand-in for disposable integration tests."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ _DENIED_REVIEWER_COMMANDS = (
 
 def main() -> int:
     if sys.argv[1:] == ["--version"]:
-        print("opencode 1.18.11")
+        print("opencode 1.18.18")
         return 0
     if sys.argv[1:3] == ["session", "list"]:
         state = _load_state()

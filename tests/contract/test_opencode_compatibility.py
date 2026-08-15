@@ -43,8 +43,8 @@ def _jsonl_events(path: Path) -> list[dict[str, Any]]:
 def test_supported_version_matches_fixture_directory() -> None:
     config = _compatibility_config()
 
-    assert config["supported-version"] == "1.18.11"
-    assert config["source-tag"] == "v1.18.11"
+    assert config["supported-version"] == "1.18.18"
+    assert config["source-tag"] == "v1.18.18"
     assert _fixture_dir().name == config["supported-version"]
 
 

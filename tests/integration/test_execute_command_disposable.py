@@ -248,7 +248,7 @@ def _prepare_execute_fixture(tmp_path: Path) -> ExecuteFixture:
             proof_version=1,
             config_digest=project.config.config_digest,
             model="fixture/executor",
-            opencode_version="1.18.11",
+            opencode_version="1.18.18",
             passed=True,
             session_id_present=True,
             workdir_clean=True,

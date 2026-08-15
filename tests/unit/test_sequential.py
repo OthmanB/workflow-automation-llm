@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -105,8 +106,11 @@ def _record(
     max_executor_attempts: int | None = None,
     criterion_ids: tuple[str, ...] = ("fixture-check",),
     authorized_actions: tuple[str, ...] = ("inspect",),
+    sources: list[dict[str, str]] | None = None,
 ) -> RunRecord:
     values = valid_plan_values(project)
+    if sources is not None:
+        values["sources"] = sources
     values["steps"][0]["authorization"]["authorized_actions"] = list(authorized_actions)
     values["steps"][0]["authorization"]["writable_paths"] = (
         ["evidence/"] if "modify" in authorized_actions else []
@@ -351,6 +355,7 @@ def _activate_ready_run(
     max_executor_attempts: int | None = None,
     criterion_ids: tuple[str, ...] = ("fixture-check",),
     authorized_actions: tuple[str, ...] = ("inspect",),
+    sources: list[dict[str, str]] | None = None,
 ) -> tuple[StateStore, SequentialWorkflow, RunRecord, int]:
     store = _store(project)
     record = _record(
@@ -360,6 +365,7 @@ def _activate_ready_run(
         max_executor_attempts=max_executor_attempts,
         criterion_ids=criterion_ids,
         authorized_actions=authorized_actions,
+        sources=sources,
     )
     generation = store.create_run(record)
     workflow = _workflow(project, store)
@@ -375,6 +381,7 @@ def _prepare_executor(
     max_executor_attempts: int | None = None,
     criterion_ids: tuple[str, ...] = ("fixture-check",),
     authorized_actions: tuple[str, ...] = ("inspect",),
+    sources: list[dict[str, str]] | None = None,
 ) -> tuple[StateStore, SequentialWorkflow, PreparedDispatch]:
     _store_value, workflow, record, generation = _activate_ready_run(
         project,
@@ -383,6 +390,7 @@ def _prepare_executor(
         max_executor_attempts=max_executor_attempts,
         criterion_ids=criterion_ids,
         authorized_actions=authorized_actions,
+        sources=sources,
     )
     prepared = workflow.prepare_from_supervisor(
         record.run_id,
@@ -399,11 +407,13 @@ def _worker_contexts(
     project: FixtureProject,
     *,
     criterion_ids: tuple[str, ...] = ("fixture-check",),
+    sources: list[dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     _store_value, workflow, executor = _prepare_executor(
         project,
         review_required=True,
         criterion_ids=criterion_ids,
+        sources=sources,
     )
     executor_context = json.loads(executor.prompt)
     record, generation, _forwarding = workflow.apply_executor_result(
@@ -571,7 +581,105 @@ def test_bootstrap_is_self_contained_and_persisted(project: FixtureProject) -> N
     assert "Do not create, edit, stage, commit, delete" in bootstrap
     assert "Reply with exactly one schema-v1 JSON command object" in bootstrap
     assert "name the exact bounded" in bootstrap
-    assert "normative source files or source IDs" in bootstrap
+    assert "dispatcher adds the approved normative source ledger" in bootstrap
+
+
+def test_worker_prompts_bind_ordered_authoritative_sources_without_task_mentions(
+    project: FixtureProject,
+) -> None:
+    sources = [
+        {
+            "source_id": "fixture-specification-source",
+            "root": "specifications",
+            "relative_path": "specification.md",
+            "sha256": hashlib.sha256(
+                (project.specifications / "specification.md").read_bytes()
+            ).hexdigest(),
+            "media_type": "text/markdown",
+        },
+        {
+            "source_id": "fixture-plan-source",
+            "root": "plans",
+            "relative_path": "plan.md",
+            "sha256": hashlib.sha256((project.plans / "plan.md").read_bytes()).hexdigest(),
+            "media_type": "text/markdown",
+        },
+    ]
+    executor_context, reviewer_context = _worker_contexts(project, sources=sources)
+    source_roots = {
+        "plans": Path(project.config.model.sources.plans_dir),
+        "specifications": Path(project.config.model.sources.specifications_dir),
+    }
+    expected_ledger = [
+        {
+            "source_id": source["source_id"],
+            "root": source["root"],
+            "relative_path": source["relative_path"],
+            "sha256": source["sha256"],
+            "path": str((source_roots[source["root"]] / source["relative_path"]).resolve()),
+        }
+        for source in sources
+    ]
+
+    for context in (executor_context, reviewer_context):
+        assert context["task"] == "Perform the approved fixture work."
+        assert "plan.md" not in context["task"]
+        assert "specification.md" not in context["task"]
+        assert context["authoritative_sources"] == expected_ledger
+        assert "exact listed path entries as normative" in context["authoritative_sources_rule"]
+        assert "must not substitute similarly named files" in context["authoritative_sources_rule"]
+        assert "dispatcher source verification is authoritative" in context[
+            "authoritative_sources_rule"
+        ]
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["ordinary", "batch"])
+def test_dispatch_preparation_rechecks_immutable_sources_before_persisting(
+    tmp_path: Path,
+    batch: bool,
+) -> None:
+    project = (
+        _role_scope_project(tmp_path, scheduling="bounded_parallel")
+        if batch
+        else create_fixture_project(tmp_path)
+    )
+    store = _store(project)
+    record = _record(project)
+    generation = store.create_run(record)
+    workflow = _workflow(project, store)
+    active, generation = workflow.activate(record.run_id, expected_generation=generation)
+    workflow.render_bootstrap(active.run_id)
+
+    (project.plans / "plan.md").unlink()
+    supervisor_text = (
+        json.dumps(
+            {
+                "protocol_version": 2,
+                "action": "dispatch_batch",
+                "children": [
+                    {
+                        "step_id": "prepare-fixture",
+                        "target_role": "terra",
+                        "session_mode": "new",
+                        "prompt": "Perform the approved fixture work.",
+                    }
+                ],
+            }
+        )
+        if batch
+        else _dispatch_command()
+    )
+
+    with pytest.raises(SequentialWorkflowError, match="plan source does not exist"):
+        workflow.prepare_from_supervisor(
+            active.run_id,
+            expected_generation=generation,
+            supervisor_text=supervisor_text,
+        )
+
+    persisted, _generation = store.load_run(active.run_id)
+    assert persisted.dispatches == {}
+    assert store.opencode_invocations_for_run(active.run_id) == ()
 
 
 def test_worker_prompt_lists_exact_schema_discriminator_options(project: FixtureProject) -> None:
@@ -724,9 +832,29 @@ def test_single_and_batch_dispatches_apply_identical_reviewer_role_ceiling(
     assert isinstance(batch, PreparedBatch)
     batch_reviewer = batch.dispatches[0]
 
-    for executor in (single_executor, batch_executor):
+    def expected_sources(fixture: FixtureProject) -> list[dict[str, str]]:
+        roots = {
+            "plans": Path(fixture.config.model.sources.plans_dir),
+            "specifications": Path(fixture.config.model.sources.specifications_dir),
+        }
+        return [
+            {
+                "source_id": source["source_id"],
+                "root": source["root"],
+                "relative_path": source["relative_path"],
+                "sha256": source["sha256"],
+                "path": str((roots[source["root"]] / source["relative_path"]).resolve()),
+            }
+            for source in valid_plan_values(fixture)["sources"]
+        ]
+
+    single_ledger = expected_sources(single_project)
+    batch_ledger = expected_sources(batch_project)
+
+    for executor, ledger in ((single_executor, single_ledger), (batch_executor, batch_ledger)):
         executor_context = json.loads(executor.prompt)
         executor_permission = executor.permission_config["permission"]
+        assert executor_context["authoritative_sources"] == ledger
         assert executor_context["authorized_actions"] == [
             action for action in _ALL_ACTIONS if action in {"inspect", "modify"}
         ]
@@ -747,12 +875,13 @@ def test_single_and_batch_dispatches_apply_identical_reviewer_role_ceiling(
     assert single_reviewer.permission_config["permission"]["bash"] == (
         read_only_diagnostic_bash_rules()
     )
-    for store, reviewer in (
-        (single_store, single_reviewer),
-        (batch_store, batch_reviewer),
+    for store, reviewer, ledger in (
+        (single_store, single_reviewer, single_ledger),
+        (batch_store, batch_reviewer, batch_ledger),
     ):
         context = json.loads(reviewer.prompt)
         persisted = store.load_dispatch_payload(reviewer.run_id, reviewer.dispatch.dispatch_id)
+        assert context["authoritative_sources"] == ledger
         assert context["authorized_actions"] == ["inspect"]
         assert context["observation_tools"] == {
             "native": list(READ_ONLY_NATIVE_TOOLS),
@@ -929,7 +1058,52 @@ def test_failed_authoritative_verification_resumes_same_executor_with_feedback(
     assert retry_context["verification_feedback"] == [
         item.model_dump(mode="json") for item in verification
     ]
+    assert retry_context["authoritative_sources"] == [
+        {
+            "source_id": "fixture-plan-source",
+            "root": "plans",
+            "relative_path": "plan.md",
+            "sha256": hashlib.sha256((project.plans / "plan.md").read_bytes()).hexdigest(),
+            "path": str(
+                (Path(project.config.model.sources.plans_dir) / "plan.md").resolve()
+            ),
+        }
+    ]
     assert "dispatcher.executor_proposal.v2" in retry_context["task"]
+
+
+def test_durable_verification_retry_rechecks_sources_before_preparing_prompt(
+    project: FixtureProject,
+) -> None:
+    store, workflow, prepared, _clean, _current = _prepare_verification_feedback_executor(
+        project,
+        max_executor_attempts=2,
+    )
+    proposal = parse_executor_proposal(json.loads(prepared.prompt)["response_template"])
+    snapshot = workflow.record_executor_proposal(prepared, proposal)
+    failed, generation = workflow.record_executor_verification_failure(
+        prepared,
+        proposal,
+        authoritative_verification=_failed_authoritative_verification(),
+        usage=None,
+        verified_snapshot=snapshot,
+    )
+    original_prompt = store.load_dispatch_payload(
+        failed.run_id, prepared.dispatch.dispatch_id
+    ).prompt
+    (project.plans / "plan.md").write_text("changed after activation\n", encoding="utf-8")
+
+    retry = workflow.prepare_pending_verification_retry(failed, generation)
+
+    assert isinstance(retry, tuple)
+    waiting, _waiting_generation = retry
+    assert waiting.state is RunStatus.WAITING_OPERATOR
+    assert waiting.operator_request is not None
+    assert "plan source hash mismatch" in waiting.operator_request.question
+    assert len(waiting.dispatches) == 1
+    assert store.load_dispatch_payload(
+        failed.run_id, prepared.dispatch.dispatch_id
+    ).prompt == original_prompt
 
 
 def test_batch_verification_failure_persists_authoritative_evidence_without_rework(

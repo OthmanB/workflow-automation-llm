@@ -1,0 +1,7 @@
+{
+  "scenario": "dispatcher_timeout",
+  "timeout_seconds": 1,
+  "expected_exit_kind": "timeout",
+  "stdout": "",
+  "stderr": "fixture process exceeded the configured timeout"
+}

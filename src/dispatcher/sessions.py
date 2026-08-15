@@ -1,4 +1,4 @@
-"""Pinned OpenCode 1.18.11 adapter with bounded streaming process management."""
+"""Pinned OpenCode 1.18.18 adapter with bounded streaming process management."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from .security import ensure_private_directory, open_private_text, redact_text, 
 logger = logging.getLogger(__name__)
 
 OPENCODE_BIN = "opencode"
-SUPPORTED_OPENCODE_VERSION = "1.18.11"
+SUPPORTED_OPENCODE_VERSION = "1.18.18"
 FailureCategory = Literal[
     "timeout",
     "interrupted",
@@ -176,7 +176,7 @@ class SessionResult:
 
 
 class OpenCodeJsonlDecoder:
-    """Incrementally decode the exact JSONL events emitted by OpenCode 1.18.11."""
+    """Incrementally decode the exact JSONL events emitted by OpenCode 1.18.18."""
 
     def __init__(
         self,
@@ -211,7 +211,7 @@ class OpenCodeJsonlDecoder:
         event_type = event.get("type")
         if event_type not in _SUPPORTED_EVENT_TYPES:
             raise OpenCodeProtocolError(
-                f"unsupported OpenCode 1.18.11 event type at line {line_number}: {event_type!r}"
+                f"unsupported OpenCode 1.18.18 event type at line {line_number}: {event_type!r}"
             )
 
         session_id = event.get("sessionID")
