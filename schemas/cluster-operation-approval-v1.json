@@ -1,0 +1,159 @@
+{
+  "$defs": {
+    "ActionDigest": {
+      "additionalProperties": false,
+      "description": "One static action position and its canonical manifest digest.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "sha256"
+      ],
+      "title": "ActionDigest",
+      "type": "object"
+    },
+    "AutomaticRollbackIntent": {
+      "additionalProperties": false,
+      "description": "Mandatory future rollback policy, bound to the later approval snapshot.",
+      "properties": {
+        "automatic": {
+          "const": true,
+          "title": "Automatic",
+          "type": "boolean"
+        },
+        "strategy": {
+          "const": "restore_approval_snapshot",
+          "title": "Strategy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "automatic",
+        "strategy"
+      ],
+      "title": "AutomaticRollbackIntent",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Owner or envelope-derived approval tied to one fresh approval-time snapshot.",
+  "properties": {
+    "allowed_actions": {
+      "items": {
+        "$ref": "#/$defs/ActionDigest"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Allowed Actions",
+      "type": "array"
+    },
+    "approval_source": {
+      "default": "owner_snapshot",
+      "enum": [
+        "owner_snapshot",
+        "preauthorized_envelope"
+      ],
+      "title": "Approval Source",
+      "type": "string"
+    },
+    "approval_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Approval Version",
+      "type": "integer"
+    },
+    "envelope_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Envelope Digest"
+    },
+    "expires_at": {
+      "format": "date-time",
+      "title": "Expires At",
+      "type": "string"
+    },
+    "issued_at": {
+      "format": "date-time",
+      "title": "Issued At",
+      "type": "string"
+    },
+    "operation_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "owner_ref": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Owner Ref",
+      "type": "string"
+    },
+    "rollback_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Rollback Digest",
+      "type": "string"
+    },
+    "rollback_intent": {
+      "$ref": "#/$defs/AutomaticRollbackIntent"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "snapshot_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Snapshot Digest"
+    },
+    "source_revision": {
+      "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$",
+      "title": "Source Revision",
+      "type": "string"
+    },
+    "step_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Step Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "owner_ref",
+    "run_id",
+    "step_id",
+    "operation_id",
+    "source_revision",
+    "allowed_actions",
+    "rollback_intent",
+    "rollback_digest",
+    "issued_at",
+    "expires_at"
+  ],
+  "title": "ClusterOperationApproval",
+  "type": "object"
+}

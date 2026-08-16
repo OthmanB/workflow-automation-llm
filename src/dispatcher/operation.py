@@ -9,10 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping, Sequence
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .baseline import BaselineError, validate_approved_baseline
-from .config import Config, ContractModel, Identifier, MCPToolName
+from .config import (
+    Config,
+    ContractModel,
+    Identifier,
+    KubernetesContext,
+    MCPToolName,
+    validate_normalized_relative_path,
+)
 from .mcp import compile_role_mcp_servers, resolve_role_mcp_tools
 from .permissions import (
     PermissionError,
@@ -21,6 +28,7 @@ from .permissions import (
     role_scoped_authorized_actions,
 )
 from .plan import (
+    ClusterOperationActionType,
     NormalizedPlan,
     PlanError,
     PlanStep,
@@ -73,12 +81,108 @@ class RolePermissionManifest(ContractModel):
     structured_git: "StructuredGitCapability"
 
 
+class ClusterOperationEnvelope(ContractModel):
+    """One preauthorized cluster-operation boundary visible before executor work."""
+
+    envelope_version: Literal[1] = 1
+    run_id: Identifier
+    step_id: Identifier
+    repo_id: Identifier
+    target_name: Identifier
+    context: KubernetesContext
+    operation_manifest_path: str = Field(min_length=1, max_length=500)
+    allowed_actions: tuple[ClusterOperationActionType, ...] = Field(min_length=1, max_length=20)
+    automatic_rollback: Literal[True]
+    operation_manifest_roots: tuple[str, ...] = Field(min_length=1, max_length=20)
+    source_file_roots: tuple[str, ...] = Field(min_length=1, max_length=20)
+    max_snapshot_age_seconds: int = Field(ge=1, le=86_400)
+    plan_digest: Sha256
+    config_digest: Sha256
+    digest: Sha256
+
+    @field_validator(
+        "allowed_actions",
+        "operation_manifest_roots",
+        "source_file_roots",
+        mode="before",
+    )
+    @classmethod
+    def freeze_collections(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("operation_manifest_path")
+    @classmethod
+    def validate_operation_manifest_path(cls, value: str) -> str:
+        validate_normalized_relative_path(value, "envelope operation_manifest_path")
+        if not value.endswith((".yaml", ".yml")):
+            raise ValueError("envelope operation_manifest_path must name a YAML file")
+        return value
+
+    @field_validator("automatic_rollback", mode="before")
+    @classmethod
+    def require_automatic_rollback(cls, value: object) -> object:
+        if type(value) is not bool or value is not True:
+            raise ValueError("envelope automatic_rollback must be the boolean true")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "ClusterOperationEnvelope":
+        if len(self.allowed_actions) != len(set(self.allowed_actions)):
+            raise ValueError("envelope allowed_actions must be ordered and unique")
+        if len(self.operation_manifest_roots) != len(set(self.operation_manifest_roots)):
+            raise ValueError("envelope operation_manifest_roots must be unique")
+        if len(self.source_file_roots) != len(set(self.source_file_roots)):
+            raise ValueError("envelope source_file_roots must be unique")
+        for root in (*self.operation_manifest_roots, *self.source_file_roots):
+            validate_normalized_relative_path(root, "envelope root")
+        payload = self.model_dump(mode="json", exclude={"digest"})
+        if self.digest != digest_json(payload):
+            raise ValueError("envelope digest does not match its immutable payload")
+        return self
+
+
 class RealOperationScopeManifest(ContractModel):
     """Ordered set of step permissions approved for one autonomous run segment."""
 
     scope_version: Literal[1]
     steps: tuple[RolePermissionManifest, ...]
+    cluster_operation_envelopes: tuple[ClusterOperationEnvelope, ...] = ()
     digest: Sha256
+
+    @field_validator("cluster_operation_envelopes", mode="before")
+    @classmethod
+    def freeze_cluster_operation_envelopes(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_cluster_operation_envelopes(self) -> "RealOperationScopeManifest":
+        positions = {step.step_id: index for index, step in enumerate(self.steps)}
+        envelope_step_ids = tuple(envelope.step_id for envelope in self.cluster_operation_envelopes)
+        if len(envelope_step_ids) != len(set(envelope_step_ids)):
+            raise ValueError("cluster operation envelopes must contain each step exactly once")
+        if any(step_id not in positions for step_id in envelope_step_ids):
+            raise ValueError("cluster operation envelope is outside the approval scope")
+        if tuple(positions[step_id] for step_id in envelope_step_ids) != tuple(
+            sorted(positions[step_id] for step_id in envelope_step_ids)
+        ):
+            raise ValueError("cluster operation envelopes must retain approval scope order")
+        for envelope in self.cluster_operation_envelopes:
+            scope_step = self.steps[positions[envelope.step_id]]
+            if envelope.repo_id != scope_step.repo_id:
+                raise ValueError("cluster operation envelope repository does not match its scope step")
+        payload = self.model_dump(mode="json", exclude={"digest"})
+        if self.digest != digest_json(payload):
+            legacy_payload = {
+                "scope_version": self.scope_version,
+                "steps": [step.model_dump(mode="json") for step in self.steps],
+            }
+            if (
+                "cluster_operation_envelopes" in self.model_fields_set
+                or self.cluster_operation_envelopes
+                or self.digest != digest_json(legacy_payload)
+            ):
+                raise ValueError("scope manifest digest does not match its immutable payload")
+        return self
 
 
 class RepositoryRevisionExpectation(ContractModel):
@@ -116,8 +220,14 @@ class RealOperationApproval(ContractModel):
     step_id: Identifier
     permission_manifest: RolePermissionManifest
     scope_manifest: RealOperationScopeManifest | None = None
+    cluster_operation_envelopes: tuple[ClusterOperationEnvelope, ...] = ()
     repository_revisions: tuple[RepositoryRevisionExpectation, ...] | None = None
     decided_at: datetime
+
+    @field_validator("cluster_operation_envelopes", mode="before")
+    @classmethod
+    def freeze_cluster_operation_envelopes(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
 
     @model_validator(mode="after")
     def validate_repository_revisions(self) -> "RealOperationApproval":
@@ -125,6 +235,11 @@ class RealOperationApproval(ContractModel):
             repo_ids = [item.repo_id for item in self.repository_revisions]
             if not repo_ids or len(repo_ids) != len(set(repo_ids)):
                 raise ValueError("repository_revisions must contain each repository exactly once")
+        if self.scope_manifest is None:
+            if self.cluster_operation_envelopes:
+                raise ValueError("legacy approval cannot contain cluster operation envelopes")
+        elif self.cluster_operation_envelopes != self.scope_manifest.cluster_operation_envelopes:
+            raise ValueError("approval cluster operation envelopes do not match the approved scope")
         return self
 
 
@@ -350,13 +465,14 @@ def compile_real_operation_scope_manifest(
         raise RealOperationError(
             "the first pending executable step cannot run without an unresolved dependency or operator gate"
         )
-    return _scope_manifest_for_steps(config=config, plan=plan, steps=scoped_steps)
+    return _scope_manifest_for_steps(config=config, plan=plan, record=record, steps=scoped_steps)
 
 
 def _scope_manifest_for_steps(
     *,
     config: Config,
     plan: NormalizedPlan,
+    record: RunRecord,
     steps: tuple[PlanStep, ...],
 ) -> RealOperationScopeManifest:
     """Compile ordered immutable role and structured-Git permissions for known scope steps."""
@@ -364,15 +480,89 @@ def _scope_manifest_for_steps(
         _compile_role_permission_manifest_for_step(config=config, plan=plan, step=step)
         for step in steps
     )
+    cluster_operation_envelopes = _compile_cluster_operation_envelopes(
+        config=config,
+        plan=plan,
+        record=record,
+        steps=steps,
+    )
     payload = {
         "scope_version": 1,
         "steps": [manifest.model_dump(mode="json") for manifest in manifests],
+        "cluster_operation_envelopes": [
+            envelope.model_dump(mode="json") for envelope in cluster_operation_envelopes
+        ],
     }
     return RealOperationScopeManifest(
         scope_version=1,
         steps=manifests,
+        cluster_operation_envelopes=cluster_operation_envelopes,
         digest=digest_json(payload),
     )
+
+
+def _compile_cluster_operation_envelopes(
+    *,
+    config: Config,
+    plan: NormalizedPlan,
+    record: RunRecord,
+    steps: tuple[PlanStep, ...],
+) -> tuple[ClusterOperationEnvelope, ...]:
+    """Compile every declared cluster boundary before any executor can create its manifest."""
+    cluster_steps = tuple(step for step in steps if step.cluster_operation is not None)
+    if not cluster_steps:
+        return ()
+    try:
+        from .cluster_operations import (
+            ClusterOperationError,
+            validate_cluster_operation_references_for_plan,
+        )
+
+        validate_cluster_operation_references_for_plan(config=config, plan=plan)
+    except ClusterOperationError as exc:
+        raise RealOperationError(f"cluster operation reference is not approvable: {exc}") from exc
+    assert config.cluster_mutation is not None
+    envelopes: list[ClusterOperationEnvelope] = []
+    for step in cluster_steps:
+        reference = step.cluster_operation
+        assert reference is not None
+        target = config.cluster_mutation.targets[reference.target_name]
+        payload = {
+            "envelope_version": 1,
+            "run_id": record.run_id,
+            "step_id": step.step_id,
+            "repo_id": step.repo_id,
+            "target_name": reference.target_name,
+            "context": target.context,
+            "operation_manifest_path": reference.operation_manifest_path,
+            "allowed_actions": list(reference.preauthorized_actions),
+            "automatic_rollback": reference.requires_automatic_rollback,
+            "operation_manifest_roots": list(target.operation_manifest_roots),
+            "source_file_roots": list(target.source_file_roots),
+            "max_snapshot_age_seconds": target.max_snapshot_age_seconds,
+            "plan_digest": record.plan_digest,
+            "config_digest": record.config_digest,
+        }
+        envelopes.append(
+            ClusterOperationEnvelope(
+                envelope_version=1,
+                run_id=record.run_id,
+                step_id=step.step_id,
+                repo_id=step.repo_id,
+                target_name=reference.target_name,
+                context=target.context,
+                operation_manifest_path=reference.operation_manifest_path,
+                allowed_actions=reference.preauthorized_actions,
+                automatic_rollback=reference.requires_automatic_rollback,
+                operation_manifest_roots=target.operation_manifest_roots,
+                source_file_roots=target.source_file_roots,
+                max_snapshot_age_seconds=target.max_snapshot_age_seconds,
+                plan_digest=record.plan_digest,
+                config_digest=record.config_digest,
+                digest=digest_json(payload),
+            )
+        )
+    return tuple(envelopes)
 
 
 def _compile_approved_real_operation_scope_manifest(
@@ -396,7 +586,7 @@ def _compile_approved_real_operation_scope_manifest(
         )
     if scoped_steps[0].repo_id != repo_id:
         raise RealOperationError("real operation approval record does not match the current repository")
-    return _scope_manifest_for_steps(config=config, plan=plan, steps=scoped_steps)
+    return _scope_manifest_for_steps(config=config, plan=plan, record=record, steps=scoped_steps)
 
 
 def _first_remaining_scope_manifest(
@@ -458,10 +648,11 @@ def _validate_scope_manifest_digest(
     supplied: str | None,
 ) -> None:
     if supplied is None:
-        if len(scope_manifest.steps) > 1:
+        if len(scope_manifest.steps) > 1 or scope_manifest.cluster_operation_envelopes:
             raise RealOperationError(
-                "multi-step real-operation approval requires --scope-manifest-digest from "
-                "permission-manifest after reviewing every scoped step"
+                "multi-step or cluster-operation real-operation approval requires "
+                "--scope-manifest-digest from permission-manifest after reviewing every scoped step "
+                "and cluster-operation envelope"
             )
         return
     if not re.fullmatch(r"[a-f0-9]{64}", supplied):
@@ -601,6 +792,26 @@ def _execution_repository_revisions(
     return expectations
 
 
+def _scope_manifest_matches(
+    approved: RealOperationScopeManifest,
+    expected: RealOperationScopeManifest,
+) -> bool:
+    """Accept the pre-envelope scope digest only for an otherwise exact non-cluster scope."""
+    if approved.model_dump(mode="json") == expected.model_dump(mode="json"):
+        return True
+    if expected.cluster_operation_envelopes or approved.cluster_operation_envelopes:
+        return False
+    legacy_payload = {
+        "scope_version": approved.scope_version,
+        "steps": [step.model_dump(mode="json") for step in approved.steps],
+    }
+    return (
+        approved.scope_version == expected.scope_version
+        and approved.steps == expected.steps
+        and approved.digest == digest_json(legacy_payload)
+    )
+
+
 def approve_real_operation(
     *,
     config: Config,
@@ -637,6 +848,7 @@ def approve_real_operation(
         step_id=permission_manifest.step_id,
         permission_manifest=permission_manifest,
         scope_manifest=scope_manifest,
+        cluster_operation_envelopes=scope_manifest.cluster_operation_envelopes,
         repository_revisions=repository_revisions,
         decided_at=datetime.now(UTC),
     )
@@ -706,17 +918,25 @@ def validate_real_operation_prerequisites(
         raise RealOperationError(
             "real operation approval record does not match the current role permission manifest"
         )
+    expected_cluster_operation_envelopes = expected_scope_manifest.cluster_operation_envelopes
     if approval.scope_manifest is None:
+        if expected_cluster_operation_envelopes:
+            raise RealOperationError(
+                "legacy single-step real operation approval cannot authorize a cluster-operation step; "
+                "rerun permission-manifest and approve the envelope"
+            )
         if len(expected_scope_manifest.steps) > 1:
             raise RealOperationError(
                 "legacy single-step real operation approval cannot authorize the current multi-step "
                 "scope; rerun permission-manifest and approve the full scope"
             )
-    elif approval.scope_manifest.model_dump(mode="json") != expected_scope_manifest.model_dump(
-        mode="json"
-    ):
+    elif not _scope_manifest_matches(approval.scope_manifest, expected_scope_manifest):
         raise RealOperationError(
             "real operation approval record does not match the current complete approval scope"
+        )
+    if approval.cluster_operation_envelopes != expected_cluster_operation_envelopes:
+        raise RealOperationError(
+            "real operation approval record does not match the current cluster-operation envelopes"
         )
     expected_permission_manifest = _first_remaining_scope_manifest(expected_scope_manifest, record)
     repository_revisions = _execution_repository_revisions(
@@ -757,6 +977,9 @@ def validate_real_operation_prerequisites(
         "step_id": expected_permission_manifest.step_id,
         "permission_manifest": expected_permission_manifest.model_dump(mode="json"),
         "scope_manifest": expected_scope_manifest.model_dump(mode="json"),
+        "cluster_operation_envelopes": [
+            envelope.model_dump(mode="json") for envelope in expected_cluster_operation_envelopes
+        ],
         "repository_revisions": [
             expectation.model_dump(mode="json") for expectation in repository_revisions
         ],

@@ -10,7 +10,7 @@ import re
 import subprocess
 import unicodedata
 import urllib.parse
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
 import yaml
@@ -57,6 +57,29 @@ PERMISSION_ACTIONS: tuple[PermissionAction, ...] = (
     "force_push",
     "create_branch",
 )
+
+
+def validate_normalized_relative_path(value: str, field: str) -> str:
+    """Reject paths that could expand, escape, or select an unbounded file set."""
+    if not value:
+        raise ValueError(f"{field} must not be empty")
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError(f"{field} must not contain control characters")
+    if "\\" in value:
+        raise ValueError(f"{field} must use POSIX separators")
+    if value.startswith("/") or value.endswith("/") or "//" in value:
+        raise ValueError(f"{field} must be a normalized repository-relative path")
+    if any(character in value for character in "$%{}*?[]~"):
+        raise ValueError(f"{field} must not contain expansion or wildcard characters")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{field} must not contain empty, '.', or '..' segments")
+    if ".git" in parts:
+        raise ValueError(f"{field} must not include .git")
+    if any(part.startswith("-") or ":" in part for part in parts):
+        raise ValueError(f"{field} must not contain command options or URLs")
+    PurePosixPath(*parts)
+    return value
 
 
 class ProjectDefinition(ContractModel):
@@ -479,6 +502,215 @@ class PreflightDefinition(ContractModel):
     disk_space_min_mb: Annotated[int, Field(ge=0, le=1_000_000)]
 
 
+KubernetesContext = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$"),
+]
+KubernetesName = Annotated[
+    str,
+    Field(pattern=r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"),
+]
+Sha256Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+KubernetesDiscoveryResource = Annotated[
+    str,
+    Field(pattern=r"^[a-z][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9.-]{0,251})?$"),
+]
+KubernetesAuthResource = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^[a-z][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9.-]{0,251})?"
+            r"(?:/[a-z][a-z0-9-]{0,62})?$"
+        )
+    ),
+]
+SemanticVersion = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+            r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+            r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+        )
+    ),
+]
+KubectlAuthVerb = Literal["get", "list", "watch", "create", "patch", "update", "delete"]
+
+
+class HelmReleaseRequirement(ContractModel):
+    """One deployed Helm release with a chart-version capability floor."""
+
+    release: KubernetesName
+    namespace: KubernetesName
+    chart: KubernetesName
+    minimum_chart_version: SemanticVersion
+
+
+class ApiResourceRequirement(ContractModel):
+    """One exact Kubernetes API resource advertised by discovery."""
+
+    resource: KubernetesDiscoveryResource
+
+
+class KubectlAuthRequirement(ContractModel):
+    """One bounded authorization capability required by a future typed operation."""
+
+    verb: KubectlAuthVerb
+    resource: KubernetesAuthResource
+    namespace: KubernetesName
+
+
+class ClusterPreflightDefinition(ContractModel):
+    """Read-only Kubernetes readiness contract for a named integration cluster."""
+
+    capability_version: Literal[1]
+    target_id: Identifier = "cluster-preflight"
+    kubectl_path: str | None = None
+    context: KubernetesContext
+    minimum_client_version: SemanticVersion
+    minimum_server_version: SemanticVersion
+    request_timeout_seconds: Annotated[int, Field(ge=1, le=30)]
+    required_namespaces: list[KubernetesName] = Field(min_length=1, max_length=20)
+    required_helm_releases: list[HelmReleaseRequirement] = Field(min_length=1, max_length=20)
+    required_api_resources: list[ApiResourceRequirement] = Field(min_length=1, max_length=50)
+    auth_checks: list[KubectlAuthRequirement] = Field(min_length=1, max_length=50)
+
+    @field_validator("kubectl_path")
+    @classmethod
+    def kubectl_path_is_absolute_and_normalized(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not Path(value).is_absolute():
+            raise ValueError("kubectl_path must be an absolute path")
+        if value != os.path.normpath(value):
+            raise ValueError("kubectl_path must be normalized")
+        return value
+
+    @field_validator("required_namespaces")
+    @classmethod
+    def required_namespaces_are_unique(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("required_namespaces must not contain duplicates")
+        return values
+
+    @model_validator(mode="after")
+    def validate_exact_requirements(self) -> Self:
+        release_keys = [(item.namespace, item.release) for item in self.required_helm_releases]
+        if len(release_keys) != len(set(release_keys)):
+            raise ValueError("required_helm_releases must not contain duplicate namespace/release pairs")
+
+        resources = [item.resource for item in self.required_api_resources]
+        if len(resources) != len(set(resources)):
+            raise ValueError("required_api_resources must not contain duplicates")
+
+        namespaces = set(self.required_namespaces)
+        required_resources = set(resources)
+        auth_keys = [(item.verb, item.resource, item.namespace) for item in self.auth_checks]
+        if len(auth_keys) != len(set(auth_keys)):
+            raise ValueError("auth_checks must not contain duplicate verb/resource/namespace checks")
+        for item in self.auth_checks:
+            if item.namespace not in namespaces:
+                raise ValueError("auth_checks namespaces must appear in required_namespaces")
+            parent_resource, _separator, _subresource = item.resource.partition("/")
+            if parent_resource not in required_resources:
+                raise ValueError(
+                    "auth_checks resources or subresource parents must appear in required_api_resources"
+                )
+        return self
+
+
+class ClusterPreflightConfig(ContractModel):
+    """Schema-validated input and identity for one read-only cluster preflight."""
+
+    project_id: Identifier
+    config_digest: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    definition: ClusterPreflightDefinition
+
+
+class ClusterMutationToolDefinition(ContractModel):
+    """One exact dispatcher-owned executable pinned for mutation-time verification."""
+
+    path: str
+    sha256: Sha256Digest
+
+    @field_validator("path")
+    @classmethod
+    def executable_path_is_absolute_and_normalized(cls, value: str) -> str:
+        if not Path(value).is_absolute():
+            raise ValueError("mutation tool path must be an absolute path")
+        if value != os.path.normpath(value):
+            raise ValueError("mutation tool path must be normalized")
+        return value
+
+
+class ClusterMutationToolchainDefinition(ContractModel):
+    """The two binaries whose content is re-verified before every mutation launch."""
+
+    kubectl: ClusterMutationToolDefinition
+    helm: ClusterMutationToolDefinition
+
+    @model_validator(mode="after")
+    def tool_paths_are_distinct(self) -> Self:
+        if self.kubectl.path == self.helm.path:
+            raise ValueError("cluster mutation kubectl and helm paths must be distinct")
+        return self
+
+
+class ClusterMutationTargetDefinition(ContractModel):
+    """Static allowlist for a future dispatcher-owned cluster operation target."""
+
+    context: KubernetesContext
+    toolchain: ClusterMutationToolchainDefinition
+    allowed_repository_ids: tuple[Identifier, ...] = Field(min_length=1, max_length=20)
+    operation_manifest_roots: tuple[str, ...] = Field(min_length=1, max_length=20)
+    source_file_roots: tuple[str, ...] = Field(min_length=1, max_length=20)
+    max_snapshot_age_seconds: Annotated[int, Field(ge=1, le=86_400)]
+    max_action_timeout_seconds: Annotated[int, Field(ge=1, le=3_600)]
+    preflight_target_id: Identifier
+
+    @field_validator(
+        "allowed_repository_ids",
+        "operation_manifest_roots",
+        "source_file_roots",
+        mode="before",
+    )
+    @classmethod
+    def freeze_collections(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("operation_manifest_roots", "source_file_roots")
+    @classmethod
+    def validate_roots(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            validate_normalized_relative_path(value, "cluster mutation root")
+        return values
+
+    @model_validator(mode="after")
+    def validate_unique_allowlists(self) -> Self:
+        for field_name, values in (
+            ("allowed_repository_ids", self.allowed_repository_ids),
+            ("operation_manifest_roots", self.operation_manifest_roots),
+            ("source_file_roots", self.source_file_roots),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must not contain duplicates")
+        return self
+
+
+class ClusterMutationDefinition(ContractModel):
+    """Schema-only cluster mutation capability; it grants no execution authority."""
+
+    capability_version: Literal[1]
+    targets: dict[Identifier, ClusterMutationTargetDefinition]
+
+    @model_validator(mode="after")
+    def require_named_targets(self) -> Self:
+        if not self.targets:
+            raise ValueError("cluster_mutation.targets must define at least one target")
+        return self
+
+
 class ProjectConfigModel(ContractModel):
     """Versioned, project-neutral configuration schema for Phase 1."""
 
@@ -496,6 +728,8 @@ class ProjectConfigModel(ContractModel):
     permission_policies: PermissionPoliciesDefinition
     evidence: EvidencePolicy
     preflight: PreflightDefinition | None = None
+    cluster_preflight: ClusterPreflightDefinition | None = None
+    cluster_mutation: ClusterMutationDefinition | None = None
     mcp: MCPRegistry | None = None
 
     @model_validator(mode="after")
@@ -544,8 +778,34 @@ class ProjectConfigModel(ContractModel):
                     f"{role_kind} policy {policy_id!r} must define every permission action "
                     f"exactly once; missing: {missing}; extra: {extra}"
                 )
+        self._validate_cluster_mutation_targets()
         self._validate_mcp_registry()
         return self
+
+    def _validate_cluster_mutation_targets(self) -> None:
+        """Bind future mutation targets to this config's one read-only preflight target."""
+        if self.cluster_mutation is None:
+            return
+        if self.cluster_preflight is None:
+            raise ValueError("cluster_mutation requires cluster_preflight")
+        preflight = self.cluster_preflight
+        for target_name, target in self.cluster_mutation.targets.items():
+            if target.preflight_target_id != preflight.target_id:
+                raise ValueError(
+                    "cluster_mutation.targets."
+                    f"{target_name}.preflight_target_id must reference cluster_preflight.target_id"
+                )
+            if target.context != preflight.context:
+                raise ValueError(
+                    f"cluster_mutation.targets.{target_name}.context must match cluster_preflight.context"
+                )
+            for repository_id in target.allowed_repository_ids:
+                if repository_id not in self.repositories:
+                    raise ValueError(
+                        "cluster_mutation.targets."
+                        f"{target_name}.allowed_repository_ids must reference repositories"
+                    )
+            validate_cluster_mutation_toolchain(target.toolchain)
 
     def _validate_mcp_registry(self) -> None:
         """Reject MCP assignments that cannot compile to exact OpenCode rules."""
@@ -584,12 +844,7 @@ class Config:
 
     def __init__(self, config_path: str | Path) -> None:
         self.config_path = Path(config_path).expanduser().resolve()
-        raw = _load_yaml_mapping(self.config_path, "project config")
-        resolved = _resolve_config_paths(raw, self.config_path.parent)
-        try:
-            self.model = ProjectConfigModel.model_validate(resolved)
-        except ValidationError as exc:
-            raise ConfigError(_format_validation_error("project config", exc)) from exc
+        self.model = _load_project_config_model(self.config_path)
         self.profiles = self._load_profiles()
         self._validate_environment()
 
@@ -628,6 +883,14 @@ class Config:
     @property
     def preflight(self) -> PreflightDefinition | None:
         return self.model.preflight
+
+    @property
+    def cluster_preflight(self) -> ClusterPreflightDefinition | None:
+        return self.model.cluster_preflight
+
+    @property
+    def cluster_mutation(self) -> ClusterMutationDefinition | None:
+        return self.model.cluster_mutation
 
     @property
     def supervisor_key(self) -> str:
@@ -810,6 +1073,50 @@ def load_config(config_path: str | Path) -> Config:
     return Config(config_path)
 
 
+def load_cluster_preflight_config(config_path: str | Path) -> ClusterPreflightConfig:
+    """Load only the strict project schema required for a read-only cluster check.
+
+    This intentionally does not construct ``Config``: cluster preflight must not
+    create state or run repository/environment probes before its bounded cluster
+    commands start.
+    """
+    path = Path(config_path).expanduser().resolve()
+    model = _load_project_config_model(path)
+    if model.cluster_preflight is None:
+        raise ConfigError("cluster_preflight is required for dispatcher cluster-preflight")
+    validate_cluster_preflight_kubectl_path(model.cluster_preflight)
+    return ClusterPreflightConfig(
+        project_id=model.project.project_id,
+        config_digest=_sha256_json(model.model_dump(mode="json")),
+        definition=model.cluster_preflight,
+    )
+
+
+def validate_cluster_preflight_kubectl_path(definition: ClusterPreflightDefinition) -> None:
+    """Reject configured kubectl clients that cannot be safely executed directly."""
+    if definition.kubectl_path is None:
+        return
+    path = Path(definition.kubectl_path)
+    if not path.is_file():
+        raise ConfigError("cluster_preflight.kubectl_path must be an existing regular file")
+    if not os.access(path, os.X_OK):
+        raise ConfigError("cluster_preflight.kubectl_path must be executable")
+
+
+def validate_cluster_mutation_toolchain(definition: ClusterMutationToolchainDefinition) -> None:
+    """Require configured mutation binaries to be executable before they can be launched.
+
+    This validates only filesystem shape. The dispatcher runner recalculates both
+    configured SHA-256 values at each operation launch before issuing any command.
+    """
+    for name, tool in (("kubectl", definition.kubectl), ("helm", definition.helm)):
+        path = Path(tool.path)
+        if not path.is_file():
+            raise ConfigError(f"cluster_mutation.toolchain.{name}.path must be an existing regular file")
+        if not os.access(path, os.X_OK):
+            raise ConfigError(f"cluster_mutation.toolchain.{name}.path must be executable")
+
+
 def _load_yaml_mapping(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigError(f"{label} file not found: {path}")
@@ -820,6 +1127,16 @@ def _load_yaml_mapping(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"{label} must be a YAML mapping")
     return data
+
+
+def _load_project_config_model(config_path: Path) -> ProjectConfigModel:
+    """Parse and strictly validate a project config without environment side effects."""
+    raw = _load_yaml_mapping(config_path, "project config")
+    resolved = _resolve_config_paths(raw, config_path.parent)
+    try:
+        return ProjectConfigModel.model_validate(resolved)
+    except ValidationError as exc:
+        raise ConfigError(_format_validation_error("project config", exc)) from exc
 
 
 def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:

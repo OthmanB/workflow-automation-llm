@@ -74,6 +74,20 @@ It may inspect and adopt an exact `STAGED` commit only after the worker is known
 to have exited and parent, tree, path set, identity, subject, worktree, clean
 post-state, and durable evidence all match.
 
+## Cluster Operation States
+
+Cluster-operation state is a separate approval-bound SQLite journal, not a run
+or worker state. Its exact states are `DISCOVERED`, `STATIC_VALIDATED`,
+`SNAPSHOT_CAPTURED`, `APPROVED`, `SERVER_DRY_RUN_PASSED`, `MUTATION_STARTED`,
+`MUTATED`, `PROBING`, `SUCCEEDED`, `ROLLBACK_STARTED`, `ROLLED_BACK`, `FAILED`,
+and `RECONCILIATION_REQUIRED`. The complete successor table is normative in
+[`cluster-operation-manifest-schema.md`](cluster-operation-manifest-schema.md).
+The journal is keyed by `(run_id, operation_id, source_revision)`, uses its own
+generation CAS, and accepts no raw command output, manifests, kubeconfig,
+credentials, certificates/keys, or Secret values. Fixed-runner command evidence
+is limited to bounded stdout/stderr hashes, duration, exit status, command kind,
+and static action identity. It does not auto-reconcile a started mutation.
+
 ## Batch states
 
 | State | Allowed next states |

@@ -11,6 +11,12 @@ import yaml
 from helpers import create_fixture_project, valid_plan_values
 
 import dispatcher.cli as cli
+import dispatcher.cluster_operation_adapters as cluster_operation_adapters
+import dispatcher.config as config_mod
+import dispatcher.execution as execution_mod
+import dispatcher.operation as operation_mod
+import dispatcher.preflight as preflight_mod
+import dispatcher.state as state_mod
 from dispatcher.cli import main
 from dispatcher.operation import RealOperationApproval, compile_real_operation_scope_manifest
 from dispatcher.plan import NormalizedPlan, approve_plan
@@ -497,6 +503,82 @@ def test_baseline_approve_rejects_duplicate_decision_keys(tmp_path: Path, capsys
 
     assert result == 2
     assert "duplicate JSON key in decisions file: state" in capsys.readouterr().err
+
+
+def test_execute_without_cluster_envelopes_does_not_instantiate_production_adapters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = create_fixture_project(tmp_path)
+    approval = Namespace(cluster_operation_envelopes=())
+    captured_contexts = []
+
+    class ApprovalParser:
+        @staticmethod
+        def model_validate_json(_value: str) -> Namespace:
+            return approval
+
+    class FakeStore:
+        def load_run(self, _run_id: str):
+            return Namespace(sequence=1), 7
+
+        def append_audit_event_idempotently(self, **_kwargs) -> None:
+            return None
+
+    class FakeCoordinator:
+        def __init__(self, *_args, **kwargs) -> None:
+            captured_contexts.append(kwargs["real_operation_context"])
+
+        def run_to_completion(self, *_args, **_kwargs) -> Namespace:
+            return Namespace(accepted=True, report_path="fixture-report.md")
+
+    def fail_adapter_construction(*_args, **_kwargs) -> None:
+        raise AssertionError("ordinary execute must not create cluster adapters")
+
+    monkeypatch.setattr(config_mod, "load_config", lambda _path: project.config)
+    monkeypatch.setattr(cli, "refresh_opencode_credentials", lambda _state_dir: None)
+    monkeypatch.setattr(state_mod, "open_state_store", lambda _config: FakeStore())
+    monkeypatch.setattr(
+        operation_mod,
+        "validate_real_operation_prerequisites",
+        lambda **_kwargs: {"approval": {"approval_ref": "fixture-approval"}},
+    )
+    monkeypatch.setattr(operation_mod, "RealOperationApproval", ApprovalParser)
+    monkeypatch.setattr(preflight_mod, "run_preflight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(execution_mod, "SequentialExecutionCoordinator", FakeCoordinator)
+    monkeypatch.setattr(
+        cluster_operation_adapters,
+        "ProductionPortForwardProcessAdapter",
+        fail_adapter_construction,
+    )
+    monkeypatch.setattr(
+        cluster_operation_adapters,
+        "ProductionTlsDc8ProbeAdapter",
+        fail_adapter_construction,
+    )
+
+    result = cli._cmd_execute(
+        Namespace(
+            config=str(project.config_path),
+            log_level=None,
+            run_id="fixture-run",
+            plan=str(tmp_path / "plan.yaml"),
+            repo_id="fixture-repo",
+            smoke_proof=str(tmp_path / "smoke.json"),
+            smoke_model="fixture/model",
+            permission_digest=["terra=" + "a" * 64],
+            stall_policy_digest="a" * 64,
+            expected_revision=None,
+            expected_repository_revision=[],
+            approval_record=str(tmp_path / "approval.json"),
+            confirm_real_operation=True,
+            tier1_invariant_snapshot_digest=None,
+            max_turns=1,
+        )
+    )
+
+    assert result == 0
+    assert captured_contexts[0].port_forward_process_adapter is None
+    assert captured_contexts[0].tls_dc8_probe_adapter is None
 
 
 def _commit_baseline_evidence(repository: Path) -> None:

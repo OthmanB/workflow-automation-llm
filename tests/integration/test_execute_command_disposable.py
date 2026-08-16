@@ -187,9 +187,16 @@ def test_execute_command_accepts_complete_two_step_scope_before_worker_launch(
         accepted = True
         report_path = tmp_path / "report.json"
 
+    def complete_without_worker(coordinator, *_args, **_kwargs):
+        context = coordinator._real_operation_context
+        assert context is not None
+        assert context.approval.approval_ref == "decision-execute-run"
+        assert context.cluster_operation_envelopes == ()
+        return CompletedWithoutWorker()
+
     monkeypatch.setattr(
         "dispatcher.execution.SequentialExecutionCoordinator.run_to_completion",
-        lambda *_args, **_kwargs: CompletedWithoutWorker(),
+        complete_without_worker,
     )
 
     assert main(_execute_argv(fixture)) == 0

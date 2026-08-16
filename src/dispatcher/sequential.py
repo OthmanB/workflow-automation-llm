@@ -3286,6 +3286,79 @@ class SequentialWorkflow:
         return waiting, generation
 
     @_serialized_transition
+    def record_cluster_operation_failure(
+        self,
+        prepared: PreparedDispatch,
+        *,
+        reason: str,
+    ) -> tuple[RunRecord, int]:
+        """Block a reviewed cluster step without recording review acceptance or forwarding."""
+        safe_reason = redact_text(reason).strip()[:5000] or "cluster operation lifecycle failed"
+        try:
+            record, generation = self.store.load_run(prepared.run_id)
+            if generation != prepared.generation and self.config.execution.scheduling == "sequential":
+                raise SequentialWorkflowError("cluster operation failure generation is stale")
+            dispatch = record.dispatches[prepared.dispatch.dispatch_id]
+            if dispatch.role_kind != "reviewer" or dispatch.state is not DispatchStatus.RUNNING:
+                raise SequentialWorkflowError("cluster operation failure requires a running reviewer dispatch")
+            step = record.steps[dispatch.step_id]
+            if step.state is not StepStatus.REVIEWING:
+                raise SequentialWorkflowError("cluster operation failure requires a REVIEWING step")
+            dispatch_event = self._event(
+                record,
+                "dispatcher",
+                "cluster operation lifecycle prevented review acceptance",
+                dispatch.dispatch_id,
+            )
+            record, generation = self.store.commit_dispatch_transition(
+                record,
+                expected_generation=generation,
+                dispatch_id=dispatch.dispatch_id,
+                target=DispatchStatus.FAILED,
+                event=dispatch_event,
+                failure_category="cluster_operation",
+                failure_detail=safe_reason,
+            )
+            blocked_event = self._event(
+                record,
+                "dispatcher",
+                "cluster operation lifecycle requires reconciliation",
+                dispatch.dispatch_id,
+            )
+            blocked_step = transition_step(
+                record.steps[dispatch.step_id],
+                StepStatus.BLOCKED,
+                blocked_event,
+            )
+            record, generation = self._replace_step(record, generation, blocked_step)
+            request_event = self._event(
+                record,
+                "dispatcher",
+                "cluster operation reconciliation requested",
+                dispatch.dispatch_id,
+            )
+            request = OperatorRequest(
+                request_id=f"request-{uuid.uuid4().hex}",
+                question=(
+                    "The dispatcher-owned cluster-operation lifecycle did not reach SUCCEEDED. "
+                    "Inspect the preserved cluster-operation journal before authorizing any further work. "
+                    f"Reason: {safe_reason}"
+                ),
+                allowed_answers=["reconcile", "halt"],
+                context_ref=dispatch.dispatch_id,
+                resume_to=RunStatus.RUNNING,
+                expires_at=None,
+                required_role=None,
+                kind="reconciliation",
+                step_id=dispatch.step_id,
+            )
+            waiting = transition_run(record, RunStatus.WAITING_OPERATOR, request_event, operator_request=request)
+            generation = self.store.save_run(waiting, expected_generation=generation)
+            return waiting, generation
+        finally:
+            self.store.release_leases(owner_id=prepared.lease_owner_id, resource_keys=prepared.lease_keys)
+
+    @_serialized_transition
     def fail_dispatch(
         self,
         prepared: PreparedDispatch,

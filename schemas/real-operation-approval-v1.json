@@ -1,0 +1,446 @@
+{
+  "$defs": {
+    "ClusterOperationEnvelope": {
+      "additionalProperties": false,
+      "description": "One preauthorized cluster-operation boundary visible before executor work.",
+      "properties": {
+        "allowed_actions": {
+          "items": {
+            "enum": [
+              "kubectl_server_dry_run",
+              "helm_upgrade_install",
+              "port_forward",
+              "tls_dc8_no_client_certificate_rejection"
+            ],
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Allowed Actions",
+          "type": "array"
+        },
+        "automatic_rollback": {
+          "const": true,
+          "title": "Automatic Rollback",
+          "type": "boolean"
+        },
+        "config_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Config Digest",
+          "type": "string"
+        },
+        "context": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$",
+          "title": "Context",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "envelope_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Envelope Version",
+          "type": "integer"
+        },
+        "max_snapshot_age_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Max Snapshot Age Seconds",
+          "type": "integer"
+        },
+        "operation_manifest_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Operation Manifest Path",
+          "type": "string"
+        },
+        "operation_manifest_roots": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Operation Manifest Roots",
+          "type": "array"
+        },
+        "plan_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Plan Digest",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "source_file_roots": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Source File Roots",
+          "type": "array"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "target_name": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Target Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "step_id",
+        "repo_id",
+        "target_name",
+        "context",
+        "operation_manifest_path",
+        "allowed_actions",
+        "automatic_rollback",
+        "operation_manifest_roots",
+        "source_file_roots",
+        "max_snapshot_age_seconds",
+        "plan_digest",
+        "config_digest",
+        "digest"
+      ],
+      "title": "ClusterOperationEnvelope",
+      "type": "object"
+    },
+    "RealOperationScopeManifest": {
+      "additionalProperties": false,
+      "description": "Ordered set of step permissions approved for one autonomous run segment.",
+      "properties": {
+        "cluster_operation_envelopes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ClusterOperationEnvelope"
+          },
+          "title": "Cluster Operation Envelopes",
+          "type": "array"
+        },
+        "digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "scope_version": {
+          "const": 1,
+          "title": "Scope Version",
+          "type": "integer"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/RolePermissionManifest"
+          },
+          "title": "Steps",
+          "type": "array"
+        }
+      },
+      "required": [
+        "scope_version",
+        "steps",
+        "digest"
+      ],
+      "title": "RealOperationScopeManifest",
+      "type": "object"
+    },
+    "RepositoryRevisionExpectation": {
+      "additionalProperties": false,
+      "description": "One repository revision the operator approved for an autonomous scope.",
+      "properties": {
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "pattern": "^[0-9a-f]{40,64}$",
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision"
+      ],
+      "title": "RepositoryRevisionExpectation",
+      "type": "object"
+    },
+    "RolePermissionEntry": {
+      "additionalProperties": false,
+      "description": "One exact compiled role permission approved for a real operation.",
+      "properties": {
+        "authorized_actions": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Authorized Actions",
+          "type": "array"
+        },
+        "digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "mcp_tools": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9_-]*$",
+            "type": "string"
+          },
+          "title": "Mcp Tools",
+          "type": "array"
+        },
+        "role_kind": {
+          "enum": [
+            "supervisor",
+            "executor",
+            "reviewer"
+          ],
+          "title": "Role Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role_kind",
+        "authorized_actions",
+        "mcp_tools",
+        "digest"
+      ],
+      "title": "RolePermissionEntry",
+      "type": "object"
+    },
+    "RolePermissionManifest": {
+      "additionalProperties": false,
+      "description": "Exact role set and permission digests for one executable step.",
+      "properties": {
+        "manifest_version": {
+          "const": 2,
+          "title": "Manifest Version",
+          "type": "integer"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "roles": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/RolePermissionEntry"
+            }
+          },
+          "title": "Roles",
+          "type": "object"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "structured_git": {
+          "$ref": "#/$defs/StructuredGitCapability"
+        }
+      },
+      "required": [
+        "manifest_version",
+        "repo_id",
+        "step_id",
+        "roles",
+        "structured_git"
+      ],
+      "title": "RolePermissionManifest",
+      "type": "object"
+    },
+    "StructuredGitCapability": {
+      "additionalProperties": false,
+      "description": "Dispatcher-side commit authority bound independently of child permissions.",
+      "properties": {
+        "capability_version": {
+          "const": 1,
+          "title": "Capability Version",
+          "type": "integer"
+        },
+        "commit_authorized": {
+          "title": "Commit Authorized",
+          "type": "boolean"
+        },
+        "commit_policy": {
+          "enum": [
+            "required",
+            "prohibited"
+          ],
+          "title": "Commit Policy",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "evidence_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Paths",
+          "type": "array"
+        },
+        "identity_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Identity Digest",
+          "type": "string"
+        },
+        "message_format": {
+          "const": "dispatcher: <step_id> attempt <n>",
+          "title": "Message Format",
+          "type": "string"
+        },
+        "repo_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "safety_policy_version": {
+          "const": 1,
+          "title": "Safety Policy Version",
+          "type": "integer"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "writable_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Writable Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "capability_version",
+        "safety_policy_version",
+        "repo_id",
+        "step_id",
+        "commit_policy",
+        "commit_authorized",
+        "writable_paths",
+        "evidence_paths",
+        "message_format",
+        "identity_digest",
+        "digest"
+      ],
+      "title": "StructuredGitCapability",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Operator decision bound to an exact autonomous real-operation scope.",
+  "properties": {
+    "approval_ref": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Approval Ref",
+      "type": "string"
+    },
+    "cluster_operation_envelopes": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ClusterOperationEnvelope"
+      },
+      "title": "Cluster Operation Envelopes",
+      "type": "array"
+    },
+    "config_digest": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Config Digest",
+      "type": "string"
+    },
+    "decided_at": {
+      "format": "date-time",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "permission_manifest": {
+      "$ref": "#/$defs/RolePermissionManifest"
+    },
+    "plan_digest": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Plan Digest",
+      "type": "string"
+    },
+    "project_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "repo_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Repo Id",
+      "type": "string"
+    },
+    "repository_revisions": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RepositoryRevisionExpectation"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Repository Revisions"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scope_manifest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RealOperationScopeManifest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "step_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Step Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "approval_ref",
+    "project_id",
+    "config_digest",
+    "plan_digest",
+    "run_id",
+    "repo_id",
+    "step_id",
+    "permission_manifest",
+    "decided_at"
+  ],
+  "title": "RealOperationApproval",
+  "type": "object"
+}

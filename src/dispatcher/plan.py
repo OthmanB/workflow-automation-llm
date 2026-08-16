@@ -12,7 +12,13 @@ from typing import Annotated, Literal, Self
 import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from .config import Config, ConfigError, ContractModel, Identifier
+from .config import (
+    Config,
+    ConfigError,
+    ContractModel,
+    Identifier,
+    validate_normalized_relative_path,
+)
 from .yaml_io import DuplicateYamlKeyError, load_unique_yaml
 
 
@@ -22,6 +28,12 @@ class PlanError(ValueError):
 
 Sha256 = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 RelativePath = Annotated[str, Field(min_length=1, max_length=500)]
+ClusterOperationActionType = Literal[
+    "kubectl_server_dry_run",
+    "helm_upgrade_install",
+    "port_forward",
+    "tls_dc8_no_client_certificate_rejection",
+]
 
 
 class PlanSource(ContractModel):
@@ -208,6 +220,54 @@ class RetryPolicy(ContractModel):
         return self
 
 
+class ClusterOperationReference(ContractModel):
+    """Static reference to a future dispatcher-owned cluster operation manifest."""
+
+    target_name: Identifier
+    operation_manifest_path: RelativePath
+    requires_cluster_approval: Literal[True]
+    preauthorized_actions: tuple[ClusterOperationActionType, ...] = Field(
+        min_length=1, max_length=20
+    )
+    requires_automatic_rollback: Literal[True]
+
+    @field_validator("preauthorized_actions", mode="before")
+    @classmethod
+    def freeze_preauthorized_actions(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("preauthorized_actions")
+    @classmethod
+    def require_unique_preauthorized_actions(
+        cls, value: tuple[ClusterOperationActionType, ...]
+    ) -> tuple[ClusterOperationActionType, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("preauthorized_actions must be ordered and unique")
+        return value
+
+    @field_validator("requires_cluster_approval", mode="before")
+    @classmethod
+    def require_strict_true_approval_marker(cls, value: object) -> object:
+        if type(value) is not bool or value is not True:
+            raise ValueError("requires_cluster_approval must be the boolean true")
+        return value
+
+    @field_validator("requires_automatic_rollback", mode="before")
+    @classmethod
+    def require_strict_true_automatic_rollback(cls, value: object) -> object:
+        if type(value) is not bool or value is not True:
+            raise ValueError("requires_automatic_rollback must be the boolean true")
+        return value
+
+    @field_validator("operation_manifest_path")
+    @classmethod
+    def validate_operation_manifest_path(cls, value: str) -> str:
+        validate_normalized_relative_path(value, "operation_manifest_path")
+        if not value.endswith((".yaml", ".yml")):
+            raise ValueError("operation_manifest_path must name a YAML file")
+        return value
+
+
 class PlanStep(ContractModel):
     """A fully actionable step with dependencies and acceptance obligations."""
 
@@ -225,6 +285,7 @@ class PlanStep(ContractModel):
     evidence_requirements: tuple[EvidenceRequirement, ...]
     review: ReviewObligation
     retry: RetryPolicy
+    cluster_operation: ClusterOperationReference | None = None
 
     @field_validator(
         "depends_on",
@@ -493,6 +554,17 @@ def validate_plan_for_config(plan: NormalizedPlan, config: Config) -> None:
         escalation_role = step.retry.escalation_role_key
         if escalation_role is not None:
             config.role(escalation_role)
+    if any(step.cluster_operation is not None for step in plan.steps):
+        # Admission checks the reference only; executors create the manifest later.
+        from .cluster_operations import (
+            ClusterOperationError,
+            validate_cluster_operation_references_for_plan,
+        )
+
+        try:
+            validate_cluster_operation_references_for_plan(config=config, plan=plan)
+        except ClusterOperationError as exc:
+            raise PlanError(str(exc)) from exc
 
 
 def verify_plan_sources(plan: NormalizedPlan, config: Config) -> None:

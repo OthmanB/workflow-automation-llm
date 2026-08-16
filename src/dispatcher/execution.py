@@ -9,17 +9,42 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from time import sleep
 from typing import Any
 from uuid import uuid4
 
+from .cluster_operation_lifecycle import (
+    ClusterOperationLifecycleError,
+    ClusterOperationLifecycleRecord,
+    ClusterOperationStatus,
+    create_auto_approved_cluster_operation_approval,
+    new_cluster_operation_lifecycle_record,
+)
+from .cluster_operation_runner import (
+    ClusterOperationCommandRunner,
+    ClusterOperationRunner,
+    ClusterOperationRunnerError,
+    PortForwardProcessAdapter,
+    TlsDc8ProbeAdapter,
+)
+from .cluster_operation_snapshot import (
+    ClusterOperationSnapshotCommandRunner,
+    ClusterOperationSnapshotError,
+    capture_cluster_operation_snapshot,
+)
+from .cluster_operations import (
+    ClusterOperationError,
+    validate_cluster_operations_for_plan,
+)
 from .config import Config
 from .mcp import (
     collect_role_mcp_environment,
     compile_role_mcp_servers,
     inherits_global_mcp_config,
 )
+from .operation import ClusterOperationEnvelope, RealOperationApproval
 from .permissions import (
     compile_effective_policy,
     generate_opencode_config,
@@ -75,6 +100,28 @@ class ReviewerResponseValidationError(ExecutionCoordinatorError):
     """A finalized read-only reviewer response did not satisfy its typed contract."""
 
 
+class ClusterOperationExecutionError(ExecutionCoordinatorError):
+    """A dispatcher-owned cluster operation did not reach its successful terminal state."""
+
+
+@dataclass(frozen=True)
+class RealOperationExecutionContext:
+    """Dispatcher-only dependencies for an explicitly approved real-operation run."""
+
+    approval: RealOperationApproval
+    cluster_operation_envelopes: tuple[ClusterOperationEnvelope, ...]
+    tier1_invariant_snapshot_digest: str | None
+    snapshot_command_runner: ClusterOperationSnapshotCommandRunner
+    operation_command_runner: ClusterOperationCommandRunner
+    port_forward_process_adapter: PortForwardProcessAdapter | None = None
+    tls_dc8_probe_adapter: TlsDc8ProbeAdapter | None = None
+    now: Callable[[], datetime] | None = None
+
+    def __post_init__(self) -> None:
+        if self.cluster_operation_envelopes != self.approval.cluster_operation_envelopes:
+            raise ValueError("real-operation context envelopes do not match its approval")
+
+
 @dataclass(frozen=True)
 class WorkerOutcome:
     """One durable worker result ready to be consumed by the supervisor."""
@@ -117,6 +164,7 @@ class SequentialExecutionCoordinator:
         owner_id: str,
         session_runner: SessionRunner = run_session,
         verification_runner: VerificationRunnerFn | None = None,
+        real_operation_context: RealOperationExecutionContext | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -126,6 +174,7 @@ class SequentialExecutionCoordinator:
         self._verification_runner = (
             verification_runner or VerificationRunner.from_config(config).run
         )
+        self._real_operation_context = real_operation_context
         self._run_lease_key = f"run:{config.project_id}"
         self._heartbeat_lock = threading.Lock()
 
@@ -462,12 +511,27 @@ class SequentialExecutionCoordinator:
                                 if item.status != "passed"
                             )
                         )
+                    self._execute_cluster_operation_after_review(
+                        current,
+                        parsed_review,
+                        review_snapshot,
+                    )
                 record, generation, forwarding = self.workflow.apply_reviewer_result(
                     current,
                     parsed_review,
                     authoritative_verification=authoritative_verification,
                     usage=usage,
                 )
+        except ClusterOperationExecutionError as exc:
+            if not invocation_finalized:
+                raise ExecutionCoordinatorError(
+                    "cluster operation execution ran before invocation finalization"
+                ) from exc
+            record, generation = self.workflow.record_cluster_operation_failure(
+                current,
+                reason=str(exc),
+            )
+            return WorkerOutcome(record, generation, current.dispatch.dispatch_id, "")
         except ReviewerResponseValidationError as exc:
             if not invocation_finalized:
                 raise ExecutionCoordinatorError(
@@ -556,6 +620,227 @@ class SequentialExecutionCoordinator:
             raise
         self.heartbeat()
         return WorkerOutcome(record, generation, current.dispatch.dispatch_id, forwarding)
+
+    def _execute_cluster_operation_after_review(
+        self,
+        prepared: PreparedDispatch,
+        reviewer_result: Any,
+        review_snapshot: Any,
+    ) -> None:
+        """Run the approval-bound lifecycle after fresh review checks but before acceptance."""
+        record, _generation = self.store.load_run(prepared.run_id)
+        step = next(step for step in record.plan.steps if step.step_id == prepared.dispatch.step_id)
+        if step.cluster_operation is None:
+            return
+        context = self._real_operation_context
+        if context is None:
+            raise ClusterOperationExecutionError(
+                "cluster operation requires dispatcher real-operation execution context"
+            )
+        if (
+            context.approval.project_id != self.config.project_id
+            or context.approval.run_id != record.run_id
+            or context.approval.plan_digest != record.plan_digest
+            or context.approval.config_digest != self.config.config_digest
+        ):
+            raise ClusterOperationExecutionError(
+                "real-operation approval does not match the active dispatcher run"
+            )
+        if context.tier1_invariant_snapshot_digest is None:
+            raise ClusterOperationExecutionError(
+                "cluster operation requires a Tier-1 invariant snapshot digest"
+            )
+
+        # Re-inspect immediately before lifecycle launch so the source revision remains exact.
+        if self.workflow.inspect_reviewer_result(prepared, reviewer_result) != review_snapshot:
+            raise ClusterOperationExecutionError(
+                "reviewed repository changed before cluster operation execution"
+            )
+        source_revision = reviewer_result.review_target.result_revision
+        if source_revision is None:
+            raise ClusterOperationExecutionError(
+                "cluster operation requires a committed executor source revision"
+            )
+
+        lifecycle_record: ClusterOperationLifecycleRecord | None = None
+        now = context.now or (lambda: datetime.now(UTC))
+        try:
+            operation = validate_cluster_operations_for_plan(config=self.config, plan=record.plan).get(
+                step.step_id
+            )
+            if operation is None:
+                raise ClusterOperationExecutionError(
+                    "cluster operation reference has no post-commit validated operation"
+                )
+            target = self.config.cluster_mutation
+            if target is None:
+                raise ClusterOperationExecutionError("cluster mutation configuration is required")
+            target_definition = target.targets[operation.target_name]
+
+            candidate = new_cluster_operation_lifecycle_record(
+                operation,
+                run_id=record.run_id,
+                source_revision=source_revision,
+                plan_digest=record.plan_digest,
+                config_digest=self.config.config_digest,
+                max_snapshot_age_seconds=target_definition.max_snapshot_age_seconds,
+                now=now(),
+            )
+            try:
+                lifecycle_record = self.store.load_cluster_operation(
+                    run_id=candidate.run_id,
+                    operation_id=candidate.operation_id,
+                    source_revision=candidate.source_revision,
+                )
+            except StateStoreError as exc:
+                if str(exc) != "cluster operation record not found":
+                    raise
+                self.store.create_cluster_operation(candidate)
+                lifecycle_record = self.store.transition_cluster_operation(
+                    run_id=candidate.run_id,
+                    operation_id=candidate.operation_id,
+                    source_revision=candidate.source_revision,
+                    expected_generation=candidate.generation,
+                    target=ClusterOperationStatus.STATIC_VALIDATED,
+                    now=now(),
+                )
+            else:
+                self._validate_existing_cluster_operation(lifecycle_record, candidate)
+
+            # Verify the immutable envelope before any snapshot command can be generated.
+            create_auto_approved_cluster_operation_approval(
+                operation,
+                source_revision,
+                context.approval,
+                now=now(),
+            )
+            if lifecycle_record.status is ClusterOperationStatus.SUCCEEDED:
+                return
+            if lifecycle_record.status is not ClusterOperationStatus.STATIC_VALIDATED:
+                raise ClusterOperationExecutionError(
+                    "cluster operation already has an unresolved lifecycle record"
+                )
+
+            snapshot = capture_cluster_operation_snapshot(
+                config=self.config,
+                operation=operation,
+                source_revision=source_revision,
+                real_operation_approval=context.approval,
+                tier1_invariant_snapshot_digest=context.tier1_invariant_snapshot_digest,
+                command_runner=context.snapshot_command_runner,
+                target=target_definition,
+                now=now(),
+            )
+            lifecycle_record = self.store.attach_cluster_operation_snapshot(
+                run_id=lifecycle_record.run_id,
+                operation_id=lifecycle_record.operation_id,
+                source_revision=lifecycle_record.source_revision,
+                expected_generation=lifecycle_record.generation,
+                snapshot=snapshot,
+                now=now(),
+            )
+            approval = create_auto_approved_cluster_operation_approval(
+                operation,
+                source_revision,
+                context.approval,
+                now=now(),
+            )
+            lifecycle_record = self.store.attach_cluster_operation_approval(
+                run_id=lifecycle_record.run_id,
+                operation_id=lifecycle_record.operation_id,
+                source_revision=lifecycle_record.source_revision,
+                expected_generation=lifecycle_record.generation,
+                approval=approval,
+                now=now(),
+            )
+            result = ClusterOperationRunner(
+                config=self.config,
+                state_store=self.store,
+                command_runner=context.operation_command_runner,
+                port_forward_process_adapter=context.port_forward_process_adapter,
+                tls_dc8_probe_adapter=context.tls_dc8_probe_adapter,
+                now=now,
+            ).execute_record(operation=operation, record=lifecycle_record)
+            lifecycle_record = result.record
+            if result.status is not ClusterOperationStatus.SUCCEEDED:
+                raise ClusterOperationExecutionError(
+                    f"cluster operation finished with {result.status.value}"
+                )
+        except ClusterOperationExecutionError:
+            if lifecycle_record is not None:
+                self._transition_cluster_operation_to_safe_failure(lifecycle_record, now=now)
+            raise
+        except (
+            ClusterOperationError,
+            ClusterOperationLifecycleError,
+            ClusterOperationRunnerError,
+            ClusterOperationSnapshotError,
+            StateStoreError,
+            ValueError,
+        ) as exc:
+            if lifecycle_record is not None:
+                self._transition_cluster_operation_to_safe_failure(lifecycle_record, now=now)
+            detail = redact_text(str(exc)).strip()[:500] or type(exc).__name__
+            raise ClusterOperationExecutionError(f"cluster operation lifecycle failed: {detail}") from None
+
+    def _validate_existing_cluster_operation(
+        self,
+        existing: ClusterOperationLifecycleRecord,
+        expected: ClusterOperationLifecycleRecord,
+    ) -> None:
+        """Reject recovery records whose immutable source or static identity drifted."""
+        if (
+            existing.step_id != expected.step_id
+            or existing.target_name != expected.target_name
+            or existing.plan_digest != expected.plan_digest
+            or existing.config_digest != expected.config_digest
+            or existing.validated_manifest_digest != expected.validated_manifest_digest
+            or existing.static_action_digests != expected.static_action_digests
+            or existing.rollback_digest != expected.rollback_digest
+        ):
+            raise ClusterOperationExecutionError(
+                "existing cluster operation journal does not match the committed operation"
+            )
+
+    def _transition_cluster_operation_to_safe_failure(
+        self,
+        record: ClusterOperationLifecycleRecord,
+        *,
+        now: Callable[[], datetime],
+    ) -> None:
+        """Preserve durable evidence while making incomplete mutation boundaries non-retryable."""
+        ambiguous = {
+            ClusterOperationStatus.MUTATION_STARTED,
+            ClusterOperationStatus.MUTATED,
+            ClusterOperationStatus.PROBING,
+            ClusterOperationStatus.PORT_FORWARD_INTENT,
+            ClusterOperationStatus.PORT_FORWARD_STARTED,
+            ClusterOperationStatus.TLS_DC8_PROBING,
+            ClusterOperationStatus.ROLLBACK_STARTED,
+        }
+        if record.status in ambiguous:
+            target = ClusterOperationStatus.RECONCILIATION_REQUIRED
+        elif record.status in {
+            ClusterOperationStatus.DISCOVERED,
+            ClusterOperationStatus.STATIC_VALIDATED,
+            ClusterOperationStatus.SNAPSHOT_CAPTURED,
+            ClusterOperationStatus.APPROVED,
+            ClusterOperationStatus.SERVER_DRY_RUN_PASSED,
+        }:
+            target = ClusterOperationStatus.FAILED
+        else:
+            return
+        try:
+            self.store.transition_cluster_operation(
+                run_id=record.run_id,
+                operation_id=record.operation_id,
+                source_revision=record.source_revision,
+                expected_generation=record.generation,
+                target=target,
+                now=now(),
+            )
+        except StateStoreError:
+            logger.exception("unable to record safe cluster operation lifecycle disposition")
 
     def _run_authoritative_verification(
         self,

@@ -203,6 +203,12 @@ preflight:
   require_git_remote: true
   disk_space_min_mb: 500
 
+# cluster_preflight is intentionally omitted from this portable public example.
+# A private integration config may add the strict read-only contract documented
+# in docs/config-schema.md, including Kubernetes and Helm capability floors and
+# an optional absolute, normalized executable kubectl_path.
+# It does not authorize deployment or rollback.
+
 # MCP is omitted, so dispatcher workers inherit the operator's OpenCode MCP
 # server configuration and receive the default Context7, Repomix, and Semble
 # research tool catalog. Add an explicit mcp section and per-role mcp_tools to

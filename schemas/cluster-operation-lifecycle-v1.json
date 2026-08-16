@@ -1,0 +1,1094 @@
+{
+  "$defs": {
+    "ActionDigest": {
+      "additionalProperties": false,
+      "description": "One static action position and its canonical manifest digest.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "sha256"
+      ],
+      "title": "ActionDigest",
+      "type": "object"
+    },
+    "ApprovedSourceFileDigest": {
+      "additionalProperties": false,
+      "description": "One exact repository file digest bound into an approval-time snapshot.",
+      "properties": {
+        "path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ApprovedSourceFileDigest",
+      "type": "object"
+    },
+    "AutomaticRollbackIntent": {
+      "additionalProperties": false,
+      "description": "Mandatory future rollback policy, bound to the later approval snapshot.",
+      "properties": {
+        "automatic": {
+          "const": true,
+          "title": "Automatic",
+          "type": "boolean"
+        },
+        "strategy": {
+          "const": "restore_approval_snapshot",
+          "title": "Strategy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "automatic",
+        "strategy"
+      ],
+      "title": "AutomaticRollbackIntent",
+      "type": "object"
+    },
+    "ClusterOperationApproval": {
+      "additionalProperties": false,
+      "description": "Owner or envelope-derived approval tied to one fresh approval-time snapshot.",
+      "properties": {
+        "allowed_actions": {
+          "items": {
+            "$ref": "#/$defs/ActionDigest"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Allowed Actions",
+          "type": "array"
+        },
+        "approval_source": {
+          "default": "owner_snapshot",
+          "enum": [
+            "owner_snapshot",
+            "preauthorized_envelope"
+          ],
+          "title": "Approval Source",
+          "type": "string"
+        },
+        "approval_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Approval Version",
+          "type": "integer"
+        },
+        "envelope_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Envelope Digest"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "issued_at": {
+          "format": "date-time",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "operation_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "owner_ref": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Owner Ref",
+          "type": "string"
+        },
+        "rollback_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Rollback Digest",
+          "type": "string"
+        },
+        "rollback_intent": {
+          "$ref": "#/$defs/AutomaticRollbackIntent"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "snapshot_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snapshot Digest"
+        },
+        "source_revision": {
+          "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$",
+          "title": "Source Revision",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner_ref",
+        "run_id",
+        "step_id",
+        "operation_id",
+        "source_revision",
+        "allowed_actions",
+        "rollback_intent",
+        "rollback_digest",
+        "issued_at",
+        "expires_at"
+      ],
+      "title": "ClusterOperationApproval",
+      "type": "object"
+    },
+    "ClusterOperationApprovalSnapshot": {
+      "additionalProperties": false,
+      "description": "A sanitized approval-time snapshot with digest-only observation bindings.",
+      "properties": {
+        "action_digests": {
+          "items": {
+            "$ref": "#/$defs/ActionDigest"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Action Digests",
+          "type": "array"
+        },
+        "binary_identity_digests": {
+          "items": {
+            "$ref": "#/$defs/NamedDigest"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Binary Identity Digests",
+          "type": "array"
+        },
+        "captured_at": {
+          "format": "date-time",
+          "title": "Captured At",
+          "type": "string"
+        },
+        "cluster_preflight_result_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Cluster Preflight Result Digest",
+          "type": "string"
+        },
+        "config_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Config Digest",
+          "type": "string"
+        },
+        "envelope_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Envelope Digest"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "image_fingerprints": {
+          "items": {
+            "$ref": "#/$defs/ImageFingerprint"
+          },
+          "maxItems": 100,
+          "title": "Image Fingerprints",
+          "type": "array"
+        },
+        "operation_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "plan_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Plan Digest",
+          "type": "string"
+        },
+        "release_fingerprints": {
+          "items": {
+            "$ref": "#/$defs/ReleaseFingerprint"
+          },
+          "maxItems": 100,
+          "title": "Release Fingerprints",
+          "type": "array"
+        },
+        "release_rollback_snapshots": {
+          "items": {
+            "$ref": "#/$defs/HelmReleaseRollbackSnapshot"
+          },
+          "maxItems": 20,
+          "title": "Release Rollback Snapshots",
+          "type": "array"
+        },
+        "resource_fingerprints": {
+          "items": {
+            "$ref": "#/$defs/ClusterResourceFingerprint"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Resource Fingerprints",
+          "type": "array"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "secret_metadata_fingerprints": {
+          "items": {
+            "$ref": "#/$defs/SecretMetadataFingerprint"
+          },
+          "maxItems": 100,
+          "title": "Secret Metadata Fingerprints",
+          "type": "array"
+        },
+        "snapshot_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Snapshot Version",
+          "type": "integer"
+        },
+        "source_file_digests": {
+          "items": {
+            "$ref": "#/$defs/ApprovedSourceFileDigest"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Source File Digests",
+          "type": "array"
+        },
+        "source_revision": {
+          "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$",
+          "title": "Source Revision",
+          "type": "string"
+        },
+        "step_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "tier1_invariant_snapshot_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Tier1 Invariant Snapshot Digest",
+          "type": "string"
+        },
+        "toolchain_identity_digests": {
+          "items": {
+            "$ref": "#/$defs/NamedDigest"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Toolchain Identity Digests",
+          "type": "array"
+        },
+        "validated_manifest_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Validated Manifest Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "step_id",
+        "operation_id",
+        "source_revision",
+        "plan_digest",
+        "config_digest",
+        "validated_manifest_digest",
+        "cluster_preflight_result_digest",
+        "binary_identity_digests",
+        "toolchain_identity_digests",
+        "tier1_invariant_snapshot_digest",
+        "action_digests",
+        "source_file_digests",
+        "resource_fingerprints",
+        "release_fingerprints",
+        "release_rollback_snapshots",
+        "image_fingerprints",
+        "secret_metadata_fingerprints",
+        "captured_at",
+        "expires_at"
+      ],
+      "title": "ClusterOperationApprovalSnapshot",
+      "type": "object"
+    },
+    "ClusterOperationCommandEvidence": {
+      "additionalProperties": false,
+      "description": "Bounded digest-only result metadata for one dispatcher-owned fixed command.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "command_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "duration_milliseconds": {
+          "maximum": 3600000,
+          "minimum": 0,
+          "title": "Duration Milliseconds",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "server_dry_run",
+            "mutation",
+            "readiness_probe",
+            "rollback"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "returncode": {
+          "maximum": 255,
+          "minimum": -255,
+          "title": "Returncode",
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "stderr_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Stderr Sha256",
+          "type": "string"
+        },
+        "stdout_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Stdout Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id",
+        "action_id",
+        "kind",
+        "status",
+        "returncode",
+        "duration_milliseconds",
+        "stdout_sha256",
+        "stderr_sha256"
+      ],
+      "title": "ClusterOperationCommandEvidence",
+      "type": "object"
+    },
+    "ClusterOperationStatus": {
+      "description": "The complete durable lifecycle vocabulary for a cluster operation.",
+      "enum": [
+        "DISCOVERED",
+        "STATIC_VALIDATED",
+        "SNAPSHOT_CAPTURED",
+        "APPROVED",
+        "SERVER_DRY_RUN_PASSED",
+        "PORT_FORWARD_INTENT",
+        "PORT_FORWARD_STARTED",
+        "TLS_DC8_PROBING",
+        "MUTATION_STARTED",
+        "MUTATED",
+        "PROBING",
+        "SUCCEEDED",
+        "ROLLBACK_STARTED",
+        "ROLLED_BACK",
+        "FAILED",
+        "RECONCILIATION_REQUIRED"
+      ],
+      "title": "ClusterOperationStatus",
+      "type": "string"
+    },
+    "ClusterResourceFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized observed resource identity represented only by its fingerprint.",
+      "properties": {
+        "resource": {
+          "$ref": "#/$defs/ExpectedResourceIdentity"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource",
+        "sha256"
+      ],
+      "title": "ClusterResourceFingerprint",
+      "type": "object"
+    },
+    "ExpectedResourceIdentity": {
+      "additionalProperties": false,
+      "description": "One exact Kubernetes resource expected from a typed action.",
+      "properties": {
+        "api_version": {
+          "pattern": "^(?:v[1-9][0-9]*|[a-z][a-z0-9.-]{0,251}/v[1-9][0-9]*(?:(?:alpha|beta)[1-9][0-9]*)?)$",
+          "title": "Api Version",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]{0,62}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_version",
+        "kind",
+        "namespace",
+        "name"
+      ],
+      "title": "ExpectedResourceIdentity",
+      "type": "object"
+    },
+    "HelmReleaseRollbackSnapshot": {
+      "additionalProperties": false,
+      "description": "The only approved release state from which deterministic rollback may run.",
+      "properties": {
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "pre_snapshot_revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot Revision"
+        },
+        "pre_snapshot_state": {
+          "enum": [
+            "new",
+            "existing"
+          ],
+          "title": "Pre Snapshot State",
+          "type": "string"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "release",
+        "pre_snapshot_state"
+      ],
+      "title": "HelmReleaseRollbackSnapshot",
+      "type": "object"
+    },
+    "ImageFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized image slot represented only by an exact approval-time digest.",
+      "properties": {
+        "image_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Image Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image_id",
+        "sha256"
+      ],
+      "title": "ImageFingerprint",
+      "type": "object"
+    },
+    "NamedDigest": {
+      "additionalProperties": false,
+      "description": "One named exact identity digest, without retaining the identity value.",
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "title": "NamedDigest",
+      "type": "object"
+    },
+    "PortForwardOwnership": {
+      "additionalProperties": false,
+      "description": "Sanitized identity for one owned loopback port-forward child process.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "argv_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Argv Sha256",
+          "type": "string"
+        },
+        "bind_address": {
+          "const": "127.0.0.1",
+          "title": "Bind Address",
+          "type": "string"
+        },
+        "context": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$",
+          "title": "Context",
+          "type": "string"
+        },
+        "intent_at": {
+          "format": "date-time",
+          "title": "Intent At",
+          "type": "string"
+        },
+        "local_port": {
+          "maximum": 65535,
+          "minimum": 1024,
+          "title": "Local Port",
+          "type": "integer"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pid"
+        },
+        "process_created_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Process Created At"
+        },
+        "remote_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Remote Port",
+          "type": "integer"
+        },
+        "resource": {
+          "$ref": "#/$defs/ExpectedResourceIdentity"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "state": {
+          "$ref": "#/$defs/PortForwardOwnershipState"
+        },
+        "stopped_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stopped At"
+        }
+      },
+      "required": [
+        "action_id",
+        "context",
+        "resource",
+        "bind_address",
+        "local_port",
+        "remote_port",
+        "argv_sha256",
+        "state",
+        "intent_at"
+      ],
+      "title": "PortForwardOwnership",
+      "type": "object"
+    },
+    "PortForwardOwnershipState": {
+      "description": "The durable ownership state of one dispatcher-spawned port-forward child.",
+      "enum": [
+        "INTENT_PERSISTED",
+        "STARTED",
+        "STOPPED",
+        "CLEANUP_AMBIGUOUS"
+      ],
+      "title": "PortForwardOwnershipState",
+      "type": "string"
+    },
+    "ReleaseFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized Helm release identity represented only by its fingerprint.",
+      "properties": {
+        "app_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "App Version"
+        },
+        "chart_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chart Version"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "pre_snapshot_revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot Revision"
+        },
+        "pre_snapshot_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "new",
+                "existing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot State"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "const": "deployed",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "required": [
+        "namespace",
+        "release",
+        "sha256"
+      ],
+      "title": "ReleaseFingerprint",
+      "type": "object"
+    },
+    "SecretMetadataFingerprint": {
+      "additionalProperties": false,
+      "description": "Secret namespace/name/key metadata with no representable Secret value.",
+      "properties": {
+        "keys": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,253}$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Keys",
+          "type": "array"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "name",
+        "keys",
+        "sha256"
+      ],
+      "title": "SecretMetadataFingerprint",
+      "type": "object"
+    },
+    "TlsDc8ProbeEvidence": {
+      "additionalProperties": false,
+      "description": "Digest-only outcome of one fixed no-client-certificate TLS/DC8 probe.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "duration_milliseconds": {
+          "maximum": 600000,
+          "minimum": 0,
+          "title": "Duration Milliseconds",
+          "type": "integer"
+        },
+        "evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "client_certificate_required",
+            "unauthenticated_listener_rejected",
+            "unauthenticated_handshake_succeeded",
+            "unexpected_listener_behavior",
+            "timeout",
+            "ambiguous"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "port_forward_action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Port Forward Action Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "port_forward_action_id",
+        "outcome",
+        "evidence_sha256",
+        "duration_milliseconds"
+      ],
+      "title": "TlsDc8ProbeEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One journal row with immutable identity and its approval-bound lifecycle.",
+  "properties": {
+    "approval": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClusterOperationApproval"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "approval_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approval Digest"
+    },
+    "command_evidence": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ClusterOperationCommandEvidence"
+      },
+      "maxItems": 200,
+      "title": "Command Evidence",
+      "type": "array"
+    },
+    "config_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Digest",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "generation": {
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "lifecycle_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Lifecycle Version",
+      "type": "integer"
+    },
+    "max_snapshot_age_seconds": {
+      "maximum": 86400,
+      "minimum": 1,
+      "title": "Max Snapshot Age Seconds",
+      "type": "integer"
+    },
+    "operation_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "plan_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Digest",
+      "type": "string"
+    },
+    "port_forwards": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/PortForwardOwnership"
+      },
+      "maxItems": 20,
+      "title": "Port Forwards",
+      "type": "array"
+    },
+    "rollback_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Rollback Digest",
+      "type": "string"
+    },
+    "rollback_intent": {
+      "$ref": "#/$defs/AutomaticRollbackIntent"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "snapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClusterOperationApprovalSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "snapshot_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Snapshot Digest"
+    },
+    "source_revision": {
+      "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$",
+      "title": "Source Revision",
+      "type": "string"
+    },
+    "static_action_digests": {
+      "items": {
+        "$ref": "#/$defs/ActionDigest"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Static Action Digests",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/ClusterOperationStatus"
+    },
+    "step_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Step Id",
+      "type": "string"
+    },
+    "target_name": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Target Name",
+      "type": "string"
+    },
+    "tls_dc8_probe_evidence": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TlsDc8ProbeEvidence"
+      },
+      "maxItems": 20,
+      "title": "Tls Dc8 Probe Evidence",
+      "type": "array"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "validated_manifest_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Validated Manifest Digest",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "step_id",
+    "operation_id",
+    "source_revision",
+    "target_name",
+    "plan_digest",
+    "config_digest",
+    "validated_manifest_digest",
+    "static_action_digests",
+    "rollback_intent",
+    "rollback_digest",
+    "max_snapshot_age_seconds",
+    "status",
+    "generation",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "ClusterOperationLifecycleRecord",
+  "type": "object"
+}

@@ -1,0 +1,507 @@
+{
+  "$defs": {
+    "ActionDigest": {
+      "additionalProperties": false,
+      "description": "One static action position and its canonical manifest digest.",
+      "properties": {
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "sha256"
+      ],
+      "title": "ActionDigest",
+      "type": "object"
+    },
+    "ApprovedSourceFileDigest": {
+      "additionalProperties": false,
+      "description": "One exact repository file digest bound into an approval-time snapshot.",
+      "properties": {
+        "path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ApprovedSourceFileDigest",
+      "type": "object"
+    },
+    "ClusterResourceFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized observed resource identity represented only by its fingerprint.",
+      "properties": {
+        "resource": {
+          "$ref": "#/$defs/ExpectedResourceIdentity"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource",
+        "sha256"
+      ],
+      "title": "ClusterResourceFingerprint",
+      "type": "object"
+    },
+    "ExpectedResourceIdentity": {
+      "additionalProperties": false,
+      "description": "One exact Kubernetes resource expected from a typed action.",
+      "properties": {
+        "api_version": {
+          "pattern": "^(?:v[1-9][0-9]*|[a-z][a-z0-9.-]{0,251}/v[1-9][0-9]*(?:(?:alpha|beta)[1-9][0-9]*)?)$",
+          "title": "Api Version",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]{0,62}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_version",
+        "kind",
+        "namespace",
+        "name"
+      ],
+      "title": "ExpectedResourceIdentity",
+      "type": "object"
+    },
+    "HelmReleaseRollbackSnapshot": {
+      "additionalProperties": false,
+      "description": "The only approved release state from which deterministic rollback may run.",
+      "properties": {
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "pre_snapshot_revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot Revision"
+        },
+        "pre_snapshot_state": {
+          "enum": [
+            "new",
+            "existing"
+          ],
+          "title": "Pre Snapshot State",
+          "type": "string"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "release",
+        "pre_snapshot_state"
+      ],
+      "title": "HelmReleaseRollbackSnapshot",
+      "type": "object"
+    },
+    "ImageFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized image slot represented only by an exact approval-time digest.",
+      "properties": {
+        "image_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Image Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image_id",
+        "sha256"
+      ],
+      "title": "ImageFingerprint",
+      "type": "object"
+    },
+    "NamedDigest": {
+      "additionalProperties": false,
+      "description": "One named exact identity digest, without retaining the identity value.",
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "title": "NamedDigest",
+      "type": "object"
+    },
+    "ReleaseFingerprint": {
+      "additionalProperties": false,
+      "description": "A normalized Helm release identity represented only by its fingerprint.",
+      "properties": {
+        "app_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "App Version"
+        },
+        "chart_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chart Version"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "pre_snapshot_revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot Revision"
+        },
+        "pre_snapshot_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "new",
+                "existing"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pre Snapshot State"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "const": "deployed",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "required": [
+        "namespace",
+        "release",
+        "sha256"
+      ],
+      "title": "ReleaseFingerprint",
+      "type": "object"
+    },
+    "SecretMetadataFingerprint": {
+      "additionalProperties": false,
+      "description": "Secret namespace/name/key metadata with no representable Secret value.",
+      "properties": {
+        "keys": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,253}$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Keys",
+          "type": "array"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "name",
+        "keys",
+        "sha256"
+      ],
+      "title": "SecretMetadataFingerprint",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A sanitized approval-time snapshot with digest-only observation bindings.",
+  "properties": {
+    "action_digests": {
+      "items": {
+        "$ref": "#/$defs/ActionDigest"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Action Digests",
+      "type": "array"
+    },
+    "binary_identity_digests": {
+      "items": {
+        "$ref": "#/$defs/NamedDigest"
+      },
+      "maxItems": 50,
+      "minItems": 1,
+      "title": "Binary Identity Digests",
+      "type": "array"
+    },
+    "captured_at": {
+      "format": "date-time",
+      "title": "Captured At",
+      "type": "string"
+    },
+    "cluster_preflight_result_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Cluster Preflight Result Digest",
+      "type": "string"
+    },
+    "config_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Digest",
+      "type": "string"
+    },
+    "envelope_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Envelope Digest"
+    },
+    "expires_at": {
+      "format": "date-time",
+      "title": "Expires At",
+      "type": "string"
+    },
+    "image_fingerprints": {
+      "items": {
+        "$ref": "#/$defs/ImageFingerprint"
+      },
+      "maxItems": 100,
+      "title": "Image Fingerprints",
+      "type": "array"
+    },
+    "operation_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "plan_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Digest",
+      "type": "string"
+    },
+    "release_fingerprints": {
+      "items": {
+        "$ref": "#/$defs/ReleaseFingerprint"
+      },
+      "maxItems": 100,
+      "title": "Release Fingerprints",
+      "type": "array"
+    },
+    "release_rollback_snapshots": {
+      "items": {
+        "$ref": "#/$defs/HelmReleaseRollbackSnapshot"
+      },
+      "maxItems": 20,
+      "title": "Release Rollback Snapshots",
+      "type": "array"
+    },
+    "resource_fingerprints": {
+      "items": {
+        "$ref": "#/$defs/ClusterResourceFingerprint"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Resource Fingerprints",
+      "type": "array"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "secret_metadata_fingerprints": {
+      "items": {
+        "$ref": "#/$defs/SecretMetadataFingerprint"
+      },
+      "maxItems": 100,
+      "title": "Secret Metadata Fingerprints",
+      "type": "array"
+    },
+    "snapshot_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Snapshot Version",
+      "type": "integer"
+    },
+    "source_file_digests": {
+      "items": {
+        "$ref": "#/$defs/ApprovedSourceFileDigest"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Source File Digests",
+      "type": "array"
+    },
+    "source_revision": {
+      "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$",
+      "title": "Source Revision",
+      "type": "string"
+    },
+    "step_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Step Id",
+      "type": "string"
+    },
+    "tier1_invariant_snapshot_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Tier1 Invariant Snapshot Digest",
+      "type": "string"
+    },
+    "toolchain_identity_digests": {
+      "items": {
+        "$ref": "#/$defs/NamedDigest"
+      },
+      "maxItems": 50,
+      "minItems": 1,
+      "title": "Toolchain Identity Digests",
+      "type": "array"
+    },
+    "validated_manifest_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Validated Manifest Digest",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "step_id",
+    "operation_id",
+    "source_revision",
+    "plan_digest",
+    "config_digest",
+    "validated_manifest_digest",
+    "cluster_preflight_result_digest",
+    "binary_identity_digests",
+    "toolchain_identity_digests",
+    "tier1_invariant_snapshot_digest",
+    "action_digests",
+    "source_file_digests",
+    "resource_fingerprints",
+    "release_fingerprints",
+    "release_rollback_snapshots",
+    "image_fingerprints",
+    "secret_metadata_fingerprints",
+    "captured_at",
+    "expires_at"
+  ],
+  "title": "ClusterOperationApprovalSnapshot",
+  "type": "object"
+}

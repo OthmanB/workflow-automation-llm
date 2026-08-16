@@ -517,6 +517,8 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
         connection.execute("DROP TABLE baseline_approvals")
         connection.execute("DROP TABLE structured_git_commits")
         connection.execute("DROP TABLE opencode_invocations")
+        connection.execute("DROP TABLE cluster_operation_audit_events")
+        connection.execute("DROP TABLE cluster_operation_journal")
         connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
 
     migrated = _store(project)
@@ -533,8 +535,11 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
         approval_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'baseline_approvals'"
         ).fetchone()
+        cluster_journal_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cluster_operation_journal'"
+        ).fetchone()
 
-    assert version == 8
+    assert version == 10
     assert table == ("baselines",)
     assert columns >= {
         "repository_before_json",
@@ -543,6 +548,7 @@ def test_workspace_group_table_migrates_existing_phase_three_database(
     }
     assert workspace_table == ("workspace_groups",)
     assert approval_table == ("baseline_approvals",)
+    assert cluster_journal_table == ("cluster_operation_journal",)
 
 
 def test_opencode_invocation_usage_is_incremental_and_idempotent(

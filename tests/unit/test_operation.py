@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -82,7 +83,11 @@ def _write_approval(
         repo_id=repo_id,
         approval_ref="decision-real-operation",
         permission_digests=permission_digests,
-        scope_manifest_digest=scope_manifest.digest if len(scope_manifest.steps) > 1 else None,
+        scope_manifest_digest=(
+            scope_manifest.digest
+            if len(scope_manifest.steps) > 1 or scope_manifest.cluster_operation_envelopes
+            else None
+        ),
         expected_repository_revisions=expected_repository_revisions,
     )
     path.write_text(approval.model_dump_json(), encoding="utf-8")
@@ -243,6 +248,75 @@ def _scope_gap_plan_values(project) -> dict:
     )
     values["steps"] = [first, runnable, blocked, later]
     return values
+
+
+def _add_cluster_operation_config(values: dict, project, repository_ids: list[str]) -> None:
+    tools = project.root / "mutation-tools"
+    tools.mkdir(exist_ok=True)
+    kubectl = tools / "kubectl"
+    helm = tools / "helm"
+    kubectl.write_bytes(b"fixture-kubectl")
+    helm.write_bytes(b"fixture-helm")
+    kubectl.chmod(0o700)
+    helm.chmod(0o700)
+    values["cluster_preflight"] = {
+        "capability_version": 1,
+        "target_id": "fixture-readiness",
+        "context": "fixture-context",
+        "minimum_client_version": "v1.27.0",
+        "minimum_server_version": "v1.27.0",
+        "request_timeout_seconds": 10,
+        "required_namespaces": ["platform"],
+        "required_helm_releases": [
+            {
+                "release": "fixture-app",
+                "namespace": "platform",
+                "chart": "fixture-app",
+                "minimum_chart_version": "1.0.0",
+            }
+        ],
+        "required_api_resources": [{"resource": "deployments.apps"}],
+        "auth_checks": [{"verb": "get", "resource": "deployments.apps", "namespace": "platform"}],
+    }
+    values["cluster_mutation"] = {
+        "capability_version": 1,
+        "targets": {
+            "fixture-target": {
+                "context": "fixture-context",
+                "toolchain": {
+                    "kubectl": {
+                        "path": str(kubectl),
+                        "sha256": hashlib.sha256(kubectl.read_bytes()).hexdigest(),
+                    },
+                    "helm": {
+                        "path": str(helm),
+                        "sha256": hashlib.sha256(helm.read_bytes()).hexdigest(),
+                    },
+                },
+                "allowed_repository_ids": repository_ids,
+                "operation_manifest_roots": ["deploy/operations"],
+                "source_file_roots": ["deploy"],
+                "max_snapshot_age_seconds": 900,
+                "max_action_timeout_seconds": 120,
+                "preflight_target_id": "fixture-readiness",
+            }
+        },
+    }
+
+
+def _add_cluster_operation_references(plan_values: dict) -> None:
+    action_sets = (
+        ["kubectl_server_dry_run", "helm_upgrade_install"],
+        ["port_forward", "tls_dc8_no_client_certificate_rejection"],
+    )
+    for index, step in enumerate(plan_values["steps"]):
+        step["cluster_operation"] = {
+            "target_name": "fixture-target",
+            "operation_manifest_path": f"deploy/operations/{step['step_id']}.yaml",
+            "requires_cluster_approval": True,
+            "preauthorized_actions": action_sets[index],
+            "requires_automatic_rollback": True,
+        }
 
 
 def test_permission_manifest_binds_mcp_tools_and_rejects_drift(tmp_path: Path) -> None:
@@ -424,6 +498,7 @@ def _real_operation_kwargs_with_smoke_proof(
     review_required: bool = False,
     two_steps: bool = False,
     cross_repository: bool = False,
+    cluster_operations: bool = False,
 ) -> dict[str, object]:
     project = create_fixture_project(tmp_path)
     values = config_values(project)
@@ -455,6 +530,12 @@ def _real_operation_kwargs_with_smoke_proof(
             "root": str(sibling),
             "expected_remote": {"name": "origin", "url": "https://example.invalid/sibling.git"},
         }
+    if cluster_operations:
+        _add_cluster_operation_config(
+            values,
+            project,
+            ["fixture-repo", "sibling-repo"] if cross_repository else ["fixture-repo"],
+        )
     config = write_config(project, values)
     plan_path = tmp_path / "plan.yaml"
     plan_values = (
@@ -464,6 +545,8 @@ def _real_operation_kwargs_with_smoke_proof(
         if two_steps
         else valid_plan_values(project)
     )
+    if cluster_operations:
+        _add_cluster_operation_references(plan_values)
     if review_required:
         plan_values["steps"][0]["review"] = {
             "required": True,
@@ -625,6 +708,42 @@ def test_real_operation_scope_binds_every_reachable_two_step_manifest(tmp_path: 
         scope_manifest_digest=scope.digest,
     )
     assert approval.scope_manifest == scope
+
+
+def test_real_operation_scope_compiles_cluster_envelopes_for_ordered_multi_repo_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        cross_repository=True,
+        cluster_operations=True,
+    )
+    approval = RealOperationApproval.model_validate_json(
+        Path(kwargs["approval_record_path"]).read_text(encoding="utf-8")
+    )
+
+    assert approval.scope_manifest is not None
+    assert approval.cluster_operation_envelopes == approval.scope_manifest.cluster_operation_envelopes
+    assert [envelope.step_id for envelope in approval.cluster_operation_envelopes] == [
+        "prepare-fixture",
+        "prepare-second",
+    ]
+    assert [envelope.repo_id for envelope in approval.cluster_operation_envelopes] == [
+        "fixture-repo",
+        "sibling-repo",
+    ]
+    assert approval.cluster_operation_envelopes[0].allowed_actions == (
+        "kubectl_server_dry_run",
+        "helm_upgrade_install",
+    )
+    assert approval.cluster_operation_envelopes[1].allowed_actions == (
+        "port_forward",
+        "tls_dc8_no_client_certificate_rejection",
+    )
+    assert all(envelope.automatic_rollback for envelope in approval.cluster_operation_envelopes)
 
 
 @pytest.mark.parametrize("blocked_by", ["dependency", "operator_gate"])
@@ -795,7 +914,50 @@ def test_execute_gate_rejects_changed_two_step_scope(
         encoding="utf-8",
     )
 
-    with pytest.raises(RealOperationError, match="complete approval scope"):
+    with pytest.raises(RealOperationError, match="(complete approval scope|invalid real operation approval)"):
+        validate_real_operation_prerequisites(**kwargs)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "reordered", "mutated"])
+def test_execute_gate_rejects_missing_extra_reordered_or_mutated_cluster_envelopes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        two_steps=True,
+        cluster_operations=True,
+    )
+    approval_path = Path(kwargs["approval_record_path"])
+    approval = RealOperationApproval.model_validate_json(approval_path.read_text(encoding="utf-8"))
+    assert approval.scope_manifest is not None
+    envelopes = approval.cluster_operation_envelopes
+    if mutation == "missing":
+        changed = (envelopes[0],)
+    elif mutation == "extra":
+        changed = (*envelopes, envelopes[0])
+    elif mutation == "reordered":
+        changed = tuple(reversed(envelopes))
+    else:
+        changed = (
+            envelopes[0].model_copy(update={"context": "changed-context"}),
+            envelopes[1],
+        )
+    changed_scope = approval.scope_manifest.model_copy(update={"cluster_operation_envelopes": changed})
+    approval_path.write_text(
+        approval.model_copy(
+            update={
+                "scope_manifest": changed_scope,
+                "cluster_operation_envelopes": changed,
+            }
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RealOperationError):
         validate_real_operation_prerequisites(**kwargs)
 
 
@@ -831,6 +993,28 @@ def test_execute_gate_rejects_legacy_single_step_approval_for_two_step_scope(
     approval_path.write_text(json.dumps(legacy), encoding="utf-8")
 
     with pytest.raises(RealOperationError, match="legacy single-step"):
+        validate_real_operation_prerequisites(**kwargs)
+
+
+def test_execute_gate_rejects_legacy_single_step_approval_for_cluster_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _real_operation_kwargs_with_smoke_proof(
+        tmp_path,
+        monkeypatch,
+        datetime.now(UTC),
+        cluster_operations=True,
+    )
+    approval_path = Path(kwargs["approval_record_path"])
+    legacy = RealOperationApproval.model_validate_json(approval_path.read_text(encoding="utf-8")).model_dump(
+        mode="json"
+    )
+    legacy.pop("scope_manifest")
+    legacy.pop("cluster_operation_envelopes")
+    approval_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    with pytest.raises(RealOperationError, match="cannot authorize a cluster-operation step"):
         validate_real_operation_prerequisites(**kwargs)
 
 

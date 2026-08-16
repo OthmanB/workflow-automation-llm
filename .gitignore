@@ -1,6 +1,7 @@
 # Runtime state (per-project, not committed)
 state/
 config/projects/local/
+config/tools/
 private-reference/
 
 # Local credentials and databases

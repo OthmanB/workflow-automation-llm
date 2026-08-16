@@ -1,0 +1,491 @@
+{
+  "$defs": {
+    "ApprovalSnapshotFile": {
+      "additionalProperties": false,
+      "description": "One repository file whose digest is bound at later approval snapshot time.",
+      "properties": {
+        "path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "const": "approval_snapshot",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ApprovalSnapshotFile",
+      "type": "object"
+    },
+    "AutomaticRollbackIntent": {
+      "additionalProperties": false,
+      "description": "Mandatory future rollback policy, bound to the later approval snapshot.",
+      "properties": {
+        "automatic": {
+          "const": true,
+          "title": "Automatic",
+          "type": "boolean"
+        },
+        "strategy": {
+          "const": "restore_approval_snapshot",
+          "title": "Strategy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "automatic",
+        "strategy"
+      ],
+      "title": "AutomaticRollbackIntent",
+      "type": "object"
+    },
+    "ExpectedResourceIdentity": {
+      "additionalProperties": false,
+      "description": "One exact Kubernetes resource expected from a typed action.",
+      "properties": {
+        "api_version": {
+          "pattern": "^(?:v[1-9][0-9]*|[a-z][a-z0-9.-]{0,251}/v[1-9][0-9]*(?:(?:alpha|beta)[1-9][0-9]*)?)$",
+          "title": "Api Version",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]{0,62}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_version",
+        "kind",
+        "namespace",
+        "name"
+      ],
+      "title": "ExpectedResourceIdentity",
+      "type": "object"
+    },
+    "HelmUpgradeInstallAction": {
+      "additionalProperties": false,
+      "description": "A future fixed Helm upgrade/install over a local locked chart and values files.",
+      "properties": {
+        "action": {
+          "const": "helm_upgrade_install",
+          "title": "Action",
+          "type": "string"
+        },
+        "chart_lock_file": {
+          "$ref": "#/$defs/ApprovalSnapshotFile"
+        },
+        "chart_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Chart Path",
+          "type": "string"
+        },
+        "expected_resources": {
+          "items": {
+            "$ref": "#/$defs/ExpectedResourceIdentity"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Expected Resources",
+          "type": "array"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "readiness_probes": {
+          "items": {
+            "$ref": "#/$defs/ReadinessProbe"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Readiness Probes",
+          "type": "array"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "maximum": 3600,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "values_files": {
+          "items": {
+            "$ref": "#/$defs/ApprovalSnapshotFile"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Values Files",
+          "type": "array"
+        }
+      },
+      "required": [
+        "namespace",
+        "timeout_seconds",
+        "expected_resources",
+        "readiness_probes",
+        "action",
+        "release",
+        "chart_path",
+        "chart_lock_file",
+        "values_files"
+      ],
+      "title": "HelmUpgradeInstallAction",
+      "type": "object"
+    },
+    "KubectlServerDryRunAction": {
+      "additionalProperties": false,
+      "description": "A future fixed kubectl server-side dry-run over declared manifest files.",
+      "properties": {
+        "action": {
+          "const": "kubectl_server_dry_run",
+          "title": "Action",
+          "type": "string"
+        },
+        "expected_resources": {
+          "items": {
+            "$ref": "#/$defs/ExpectedResourceIdentity"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Expected Resources",
+          "type": "array"
+        },
+        "manifest_files": {
+          "items": {
+            "$ref": "#/$defs/ApprovalSnapshotFile"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Manifest Files",
+          "type": "array"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "readiness_probes": {
+          "items": {
+            "$ref": "#/$defs/ReadinessProbe"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Readiness Probes",
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "maximum": 3600,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "namespace",
+        "timeout_seconds",
+        "expected_resources",
+        "readiness_probes",
+        "action",
+        "manifest_files"
+      ],
+      "title": "KubectlServerDryRunAction",
+      "type": "object"
+    },
+    "PortForwardAction": {
+      "additionalProperties": false,
+      "description": "A bounded dispatcher-owned loopback forward to one exact core Service.",
+      "properties": {
+        "action": {
+          "const": "port_forward",
+          "title": "Action",
+          "type": "string"
+        },
+        "action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Action Id",
+          "type": "string"
+        },
+        "expected_resources": {
+          "items": {
+            "$ref": "#/$defs/ExpectedResourceIdentity"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Expected Resources",
+          "type": "array"
+        },
+        "lifetime_timeout_seconds": {
+          "maximum": 600,
+          "minimum": 1,
+          "title": "Lifetime Timeout Seconds",
+          "type": "integer"
+        },
+        "local_port": {
+          "maximum": 65535,
+          "minimum": 1024,
+          "title": "Local Port",
+          "type": "integer"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "probe_timeout_seconds": {
+          "maximum": 300,
+          "minimum": 1,
+          "title": "Probe Timeout Seconds",
+          "type": "integer"
+        },
+        "remote_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Remote Port",
+          "type": "integer"
+        },
+        "resource": {
+          "$ref": "#/$defs/ExpectedResourceIdentity"
+        },
+        "startup_timeout_seconds": {
+          "maximum": 300,
+          "minimum": 1,
+          "title": "Startup Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "action_id",
+        "namespace",
+        "expected_resources",
+        "resource",
+        "local_port",
+        "remote_port",
+        "startup_timeout_seconds",
+        "probe_timeout_seconds",
+        "lifetime_timeout_seconds"
+      ],
+      "title": "PortForwardAction",
+      "type": "object"
+    },
+    "ReadinessProbe": {
+      "additionalProperties": false,
+      "description": "A finite, typed readiness condition for one expected resource.",
+      "properties": {
+        "probe": {
+          "enum": [
+            "deployment_available",
+            "statefulset_ready",
+            "job_complete"
+          ],
+          "title": "Probe",
+          "type": "string"
+        },
+        "resource": {
+          "$ref": "#/$defs/ExpectedResourceIdentity"
+        }
+      },
+      "required": [
+        "probe",
+        "resource"
+      ],
+      "title": "ReadinessProbe",
+      "type": "object"
+    },
+    "SecretRequirement": {
+      "additionalProperties": false,
+      "description": "A secret metadata/key requirement; secret values are intentionally unrepresentable.",
+      "properties": {
+        "keys": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,253}$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Keys",
+          "type": "array"
+        },
+        "name": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "name",
+        "keys"
+      ],
+      "title": "SecretRequirement",
+      "type": "object"
+    },
+    "SourceIdentityBinding": {
+      "additionalProperties": false,
+      "description": "Repository identity with an explicit later approval-time revision binding.",
+      "properties": {
+        "repository_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Repository Id",
+          "type": "string"
+        },
+        "revision": {
+          "const": "approval_snapshot",
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "revision"
+      ],
+      "title": "SourceIdentityBinding",
+      "type": "object"
+    },
+    "TlsDc8NoClientCertificateProbeAction": {
+      "additionalProperties": false,
+      "description": "Require direct loopback TLS rejection when no client certificate is presented.",
+      "properties": {
+        "action": {
+          "const": "tls_dc8_no_client_certificate_rejection",
+          "title": "Action",
+          "type": "string"
+        },
+        "port_forward_action_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Port Forward Action Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "port_forward_action_id"
+      ],
+      "title": "TlsDc8NoClientCertificateProbeAction",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Strict, static, repository-owned declaration of future cluster operations.",
+  "properties": {
+    "actions": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "helm_upgrade_install": "#/$defs/HelmUpgradeInstallAction",
+            "kubectl_server_dry_run": "#/$defs/KubectlServerDryRunAction",
+            "port_forward": "#/$defs/PortForwardAction",
+            "tls_dc8_no_client_certificate_rejection": "#/$defs/TlsDc8NoClientCertificateProbeAction"
+          },
+          "propertyName": "action"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/KubectlServerDryRunAction"
+          },
+          {
+            "$ref": "#/$defs/HelmUpgradeInstallAction"
+          },
+          {
+            "$ref": "#/$defs/PortForwardAction"
+          },
+          {
+            "$ref": "#/$defs/TlsDc8NoClientCertificateProbeAction"
+          }
+        ]
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Actions",
+      "type": "array"
+    },
+    "allowed_files": {
+      "items": {
+        "$ref": "#/$defs/ApprovalSnapshotFile"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Allowed Files",
+      "type": "array"
+    },
+    "allowed_namespaces": {
+      "items": {
+        "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+        "type": "string"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Allowed Namespaces",
+      "type": "array"
+    },
+    "context": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$",
+      "title": "Context",
+      "type": "string"
+    },
+    "operation_id": {
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "rollback": {
+      "$ref": "#/$defs/AutomaticRollbackIntent"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "secret_requirements": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SecretRequirement"
+      },
+      "title": "Secret Requirements",
+      "type": "array"
+    },
+    "source_identity": {
+      "$ref": "#/$defs/SourceIdentityBinding"
+    }
+  },
+  "required": [
+    "schema_version",
+    "operation_id",
+    "context",
+    "source_identity",
+    "allowed_namespaces",
+    "allowed_files",
+    "actions",
+    "rollback"
+  ],
+  "title": "ClusterOperationManifest",
+  "type": "object"
+}

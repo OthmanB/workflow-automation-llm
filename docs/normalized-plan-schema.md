@@ -46,6 +46,28 @@ Every step explicitly declares:
 - a typed `review` obligation; and
 - an explicit `retry` policy.
 
+A step may additionally declare `cluster_operation` only as a static reference
+to a repository-owned operation manifest:
+
+```yaml
+cluster_operation:
+  target_name: integration-deploy
+  operation_manifest_path: deploy/operations/sample.yaml
+  requires_cluster_approval: true
+  preauthorized_actions: [kubectl_server_dry_run, helm_upgrade_install]
+  requires_automatic_rollback: true
+```
+
+The path is a normalized repository-relative YAML file, and the approval marker
+and automatic rollback marker must be literal boolean `true`. `preauthorized_actions`
+is a nonempty, ordered, duplicate-free subset of
+`kubectl_server_dry_run`, `helm_upgrade_install`, `port_forward`, and
+`tls_dc8_no_client_certificate_rejection`. It is the
+action order the executor is authorized to create, not a later manifest hint.
+`PlanStep` is the executable normalized plan node, so this reference cannot
+appear on plan sources, artifacts, or other non-step metadata. Existing schema-v2
+plans without the optional field are unchanged.
+
 Empty lists are valid only when a field is structurally optional for the step,
 such as `depends_on` on an initial step. Authorization, acceptance, and evidence
 cannot be omitted or inferred from prose.
@@ -74,7 +96,16 @@ The YAML sidecar loader rejects duplicate mapping keys before normalization.
 `validate_plan_for_config()` additionally rejects unknown repository IDs,
 reviewer keys that are not configured reviewers, authorization actions that
 exceed the selected repository permission policy, and concurrency/retry
-contracts that cannot be satisfied by configured roles.
+contracts that cannot be satisfied by configured roles. When a step has
+`cluster_operation`, this public library validation admits only its static
+reference: target/preflight binding, allowed repository, normalized path,
+operation-manifest root, declared action tuple, and automatic rollback intent. It
+deliberately does not require the manifest or files that the executor will create
+and dispatcher structured Git will commit. The separate post-commit
+`validate_cluster_operations_for_plan()` API must validate the complete manifest,
+declared files, symlink containment, exact action order, and automatic rollback
+against the exact committed revision before any future cluster snapshot, approval,
+or mutation; there is no fallback that skips it.
 
 ## Import adapters
 

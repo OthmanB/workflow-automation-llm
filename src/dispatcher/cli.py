@@ -3,6 +3,10 @@
 Usage:
     dispatcher run --config config/projects/<name>.yaml  [--resume]  [--mock]  [--skip-smoke]
     dispatcher preflight --config config/projects/<name>.yaml  [--skip-smoke]
+    dispatcher cluster-preflight --config config/projects/<name>.yaml
+    dispatcher cluster-operation status --config <project.yaml> --run-id <run-id> --operation-id <id> --source-revision <sha>
+    dispatcher cluster-operation snapshot --config <project.yaml> --run-id <run-id> --step-id <id> --operation-id <id> --source-revision <sha> --plan <plan.yaml> --real-operation-approval <approval.json> --tier1-invariant-snapshot-digest <sha256> --output <snapshot.json>
+    dispatcher cluster-operation approve --config <project.yaml> --run-id <run-id> --operation-id <id> --source-revision <sha> --snapshot <snapshot.json> ...
     dispatcher smoke-proof --config <project.yaml> --model <model-id> --output <path>
     dispatcher status --config config/projects/<name>.yaml
     dispatcher start --config config/projects/<name>.yaml --run-record <record.json>
@@ -104,7 +108,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     approval_parser.add_argument(
         "--scope-manifest-digest",
         metavar="SHA256",
-        help="required for multi-step scopes; digest from permission-manifest after full review",
+        help="required for multi-step or cluster-operation scopes; digest from permission-manifest after full review",
     )
     approval_parser.add_argument(
         "--expected-repository-revision",
@@ -115,7 +119,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     approval_parser.add_argument("--output", required=True)
 
     manifest_parser = sub.add_parser(
-        "permission-manifest", help="write the exact ordered real-operation approval scope"
+        "permission-manifest",
+        help="write the exact ordered real-operation scope and preauthorized cluster envelopes",
     )
     manifest_parser.add_argument("--config", required=True)
     manifest_parser.add_argument("--run-id", required=True)
@@ -145,6 +150,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="required for multi-repository scopes; one clean expected revision per scoped repository",
     )
     execute_parser.add_argument("--approval-record", required=True)
+    execute_parser.add_argument(
+        "--tier1-invariant-snapshot-digest",
+        help="required only when the approved scope contains a cluster-operation envelope",
+    )
     execute_parser.add_argument("--confirm-real-operation", action="store_true")
     execute_parser.add_argument("--max-turns", type=int, default=20)
     execute_parser.add_argument(
@@ -158,6 +167,69 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pf_parser.add_argument(
         "--log-level", default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    cluster_pf_parser = sub.add_parser(
+        "cluster-preflight", help="verify configured Kubernetes readiness without mutation"
+    )
+    cluster_pf_parser.add_argument("--config", required=True)
+    cluster_pf_parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    cluster_operation_parser = sub.add_parser(
+        "cluster-operation", help="inspect or owner-approve a sanitized cluster operation snapshot"
+    )
+    cluster_operation_sub = cluster_operation_parser.add_subparsers(
+        dest="cluster_operation_command", required=True
+    )
+    cluster_operation_status = cluster_operation_sub.add_parser(
+        "status", help="show one durable cluster operation lifecycle record"
+    )
+    cluster_operation_status.add_argument("--config", required=True)
+    cluster_operation_status.add_argument("--run-id", required=True)
+    cluster_operation_status.add_argument("--operation-id", required=True)
+    cluster_operation_status.add_argument("--source-revision", required=True)
+    cluster_operation_status.add_argument("--format", choices=["text", "json"], default="text")
+    cluster_operation_status.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+    cluster_operation_snapshot = cluster_operation_sub.add_parser(
+        "snapshot", help="capture one local sanitized read-only approval snapshot"
+    )
+    cluster_operation_snapshot.add_argument("--config", required=True)
+    cluster_operation_snapshot.add_argument("--run-id", required=True)
+    cluster_operation_snapshot.add_argument("--step-id", required=True)
+    cluster_operation_snapshot.add_argument("--operation-id", required=True)
+    cluster_operation_snapshot.add_argument("--source-revision", required=True)
+    cluster_operation_snapshot.add_argument("--plan", required=True)
+    cluster_operation_snapshot.add_argument("--real-operation-approval", required=True)
+    cluster_operation_snapshot.add_argument("--tier1-invariant-snapshot-digest", required=True)
+    cluster_operation_snapshot.add_argument("--output", required=True)
+    cluster_operation_snapshot.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+    cluster_operation_approve = cluster_operation_sub.add_parser(
+        "approve", help="attach one pre-created sanitized snapshot and owner approval"
+    )
+    cluster_operation_approve.add_argument("--config", required=True)
+    cluster_operation_approve.add_argument("--run-id", required=True)
+    cluster_operation_approve.add_argument("--operation-id", required=True)
+    cluster_operation_approve.add_argument("--source-revision", required=True)
+    cluster_operation_approve.add_argument("--snapshot", required=True)
+    cluster_operation_approve.add_argument("--owner-ref", required=True)
+    cluster_operation_approve.add_argument(
+        "--allowed-action",
+        action="append",
+        required=True,
+        metavar="ACTION_ID=SHA256",
+    )
+    cluster_operation_approve.add_argument("--rollback-digest", required=True, metavar="SHA256")
+    cluster_operation_approve.add_argument("--expires-at", required=True, metavar="UTC_ISO8601")
+    cluster_operation_approve.add_argument(
+        "--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
 
     smoke_parser = sub.add_parser(
@@ -302,9 +374,12 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     import os
 
     from . import state as state_mod
+    from .cluster_operation_runner import ClusterOperationCommandResult
+    from .cluster_operation_snapshot import run_cluster_operation_snapshot_subprocess
     from .config import load_config
-    from .execution import SequentialExecutionCoordinator
+    from .execution import RealOperationExecutionContext, SequentialExecutionCoordinator
     from .operation import (
+        RealOperationApproval,
         RealOperationError,
         digest_json,
         parse_permission_digest_args,
@@ -345,6 +420,7 @@ def _cmd_execute(args: argparse.Namespace) -> int:
         run_preflight(cfg, cfg.state_dir, run_session=run_session, skip_smoke=False)
         approval = details["approval"]
         assert isinstance(approval, dict)
+        real_operation_approval = RealOperationApproval.model_validate_json(json.dumps(approval))
         details = {**details, "approval_identity_sha256": digest_json(approval)}
         store.append_audit_event_idempotently(
             run_id=args.run_id,
@@ -356,11 +432,42 @@ def _cmd_execute(args: argparse.Namespace) -> int:
             payload=details,
         )
         workflow = SequentialWorkflow(cfg, store, owner_id=f"real-operation-{os.getpid()}")
+
+        def operation_command_runner(
+            argv: tuple[str, ...], timeout_seconds: int
+        ) -> ClusterOperationCommandResult:
+            result = run_cluster_operation_snapshot_subprocess(argv, timeout_seconds)
+            return ClusterOperationCommandResult(
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+
+        port_forward_process_adapter = None
+        tls_dc8_probe_adapter = None
+        if real_operation_approval.cluster_operation_envelopes:
+            from .cluster_operation_adapters import (
+                ProductionPortForwardProcessAdapter,
+                ProductionTlsDc8ProbeAdapter,
+            )
+
+            port_forward_process_adapter = ProductionPortForwardProcessAdapter(cfg)
+            tls_dc8_probe_adapter = ProductionTlsDc8ProbeAdapter()
+
         coordinator = SequentialExecutionCoordinator(
             cfg,
             store,
             workflow,
             owner_id=f"real-operation-{os.getpid()}",
+            real_operation_context=RealOperationExecutionContext(
+                approval=real_operation_approval,
+                cluster_operation_envelopes=real_operation_approval.cluster_operation_envelopes,
+                tier1_invariant_snapshot_digest=args.tier1_invariant_snapshot_digest,
+                snapshot_command_runner=run_cluster_operation_snapshot_subprocess,
+                operation_command_runner=operation_command_runner,
+                port_forward_process_adapter=port_forward_process_adapter,
+                tls_dc8_probe_adapter=tls_dc8_probe_adapter,
+            ),
         )
         outcome = coordinator.run_to_completion(
             args.run_id,
@@ -420,7 +527,9 @@ def _cmd_approve_real_operation(args: argparse.Namespace) -> int:
     print(
         "approve-real-operation: written "
         f"{args.output} run={approval.run_id} repo={approval.repo_id} "
-        f"steps={','.join(step.step_id for step in approval.scope_manifest.steps)}"
+        f"steps={','.join(step.step_id for step in approval.scope_manifest.steps)} "
+        "cluster_envelopes="
+        f"{','.join(envelope.step_id for envelope in approval.cluster_operation_envelopes) or 'none'}"
     )
     return 0
 
@@ -451,6 +560,7 @@ def _cmd_permission_manifest(args: argparse.Namespace) -> int:
     print(
         "permission-manifest: written "
         f"{args.output} repo={args.repo_id} steps={','.join(step.step_id for step in manifest.steps)} "
+        f"cluster_envelopes={','.join(envelope.step_id for envelope in manifest.cluster_operation_envelopes) or 'none'} "
         f"digest={manifest.digest}"
     )
     return 0
@@ -476,6 +586,208 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"pre-flight: FAILED — {exc}", file=sys.stderr)
         return 1
+
+
+def _cmd_cluster_preflight(args: argparse.Namespace) -> int:
+    from .cluster_preflight import ClusterPreflightError, run_cluster_preflight
+    from .config import ConfigError, load_cluster_preflight_config
+
+    try:
+        config = load_cluster_preflight_config(args.config)
+        _setup_logging(args.log_level or "INFO")
+        result = run_cluster_preflight(config)
+    except ClusterPreflightError as exc:
+        print(exc.result.model_dump_json(indent=2))
+        print(f"cluster-preflight: FAILED - {exc}", file=sys.stderr)
+        return 1
+    except (ConfigError, OSError, ValueError) as exc:
+        print(f"cluster-preflight: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+def _cmd_cluster_operation(args: argparse.Namespace) -> int:
+    """Inspect, collect, or approve lifecycle state through explicit local boundaries."""
+    from . import state as state_mod
+    from .cluster_operation_lifecycle import (
+        ClusterOperationApproval,
+        ClusterOperationLifecycleError,
+        ClusterOperationStatus,
+        attach_cluster_operation_approval,
+        attach_cluster_operation_snapshot,
+        load_sanitized_cluster_operation_snapshot,
+    )
+    from .cluster_operation_snapshot import ClusterOperationSnapshotError
+    from .config import ConfigError, load_config
+    from .state_store import StateStoreError
+
+    try:
+        config = load_config(args.config)
+        _setup_logging(args.log_level or config.observability.log_level)
+        database_path = Path(config.state_dir) / "dispatcher.sqlite3"
+        if not database_path.exists():
+            raise StateStoreError("cluster operation journal does not exist for this project")
+        store = state_mod.open_state_store(config)
+        record = store.load_cluster_operation(
+            run_id=args.run_id,
+            operation_id=args.operation_id,
+            source_revision=args.source_revision,
+        )
+        if args.cluster_operation_command == "status":
+            if args.format == "json":
+                print(record.model_dump_json(indent=2))
+            else:
+                print(
+                    "cluster-operation: "
+                    f"run={record.run_id} step={record.step_id} operation={record.operation_id} "
+                    f"source_revision={record.source_revision} status={record.status.value} "
+                    f"generation={record.generation}"
+                )
+            return 0
+
+        if args.cluster_operation_command == "snapshot":
+            from .cluster_operation_snapshot import (
+                capture_cluster_operation_snapshot,
+                run_cluster_operation_snapshot_subprocess,
+            )
+            from .cluster_operations import (
+                ClusterOperationError,
+                validate_cluster_operations_for_plan,
+            )
+            from .operation import RealOperationApproval
+            from .plan import load_normalized_plan
+
+            if record.status is not ClusterOperationStatus.STATIC_VALIDATED:
+                raise ClusterOperationLifecycleError(
+                    "cluster operation snapshot requires a STATIC_VALIDATED record"
+                )
+            if record.step_id != args.step_id:
+                raise ClusterOperationLifecycleError(
+                    "cluster operation step does not match the journal record"
+                )
+            plan = load_normalized_plan(args.plan, config)
+            try:
+                operation = validate_cluster_operations_for_plan(config=config, plan=plan)[
+                    args.step_id
+                ]
+            except KeyError as exc:
+                raise ClusterOperationError(
+                    "plan has no validated cluster operation for --step-id"
+                ) from exc
+            if operation.manifest.operation_id != record.operation_id:
+                raise ClusterOperationLifecycleError(
+                    "cluster operation id does not match the journal record"
+                )
+            if operation.target_name != record.target_name:
+                raise ClusterOperationLifecycleError(
+                    "cluster operation target does not match the journal record"
+                )
+            real_operation_approval = RealOperationApproval.model_validate_json(
+                Path(args.real_operation_approval).read_text(encoding="utf-8")
+            )
+            snapshot = capture_cluster_operation_snapshot(
+                config=config,
+                operation=operation,
+                source_revision=args.source_revision,
+                real_operation_approval=real_operation_approval,
+                tier1_invariant_snapshot_digest=args.tier1_invariant_snapshot_digest,
+                command_runner=run_cluster_operation_snapshot_subprocess,
+                now=datetime.now(UTC),
+            )
+            # Validate lifecycle identity and freshness without writing the journal.
+            attach_cluster_operation_snapshot(record, snapshot, now=datetime.now(UTC))
+            atomic_write_private_text(args.output, snapshot.model_dump_json(indent=2) + "\n")
+            print(
+                "cluster-operation: snapshot written "
+                f"run={snapshot.run_id} operation={snapshot.operation_id} digest={snapshot.digest}"
+            )
+            return 0
+
+        now = datetime.now(UTC)
+        snapshot = load_sanitized_cluster_operation_snapshot(args.snapshot)
+        if record.status is ClusterOperationStatus.STATIC_VALIDATED:
+            approval_record = attach_cluster_operation_snapshot(record, snapshot, now=now)
+        elif record.status is ClusterOperationStatus.SNAPSHOT_CAPTURED:
+            if record.snapshot_digest != snapshot.digest:
+                raise ClusterOperationLifecycleError(
+                    "provided snapshot does not match the captured snapshot"
+                )
+            approval_record = record
+        else:
+            raise ClusterOperationLifecycleError(
+                "cluster operation approval requires a STATIC_VALIDATED or SNAPSHOT_CAPTURED record"
+            )
+        approval = ClusterOperationApproval(
+            owner_ref=args.owner_ref,
+            run_id=approval_record.run_id,
+            step_id=approval_record.step_id,
+            operation_id=approval_record.operation_id,
+            source_revision=approval_record.source_revision,
+            snapshot_digest=snapshot.digest,
+            allowed_actions=_parse_cluster_action_digests(args.allowed_action),
+            rollback_intent=approval_record.rollback_intent,
+            rollback_digest=args.rollback_digest,
+            issued_at=now,
+            expires_at=_parse_utc_timestamp(args.expires_at),
+        )
+        # Validate both bindings before creating any approval-related durable state.
+        attach_cluster_operation_approval(approval_record, approval, now=now)
+        if record.status is ClusterOperationStatus.STATIC_VALIDATED:
+            record = store.attach_cluster_operation_snapshot(
+                run_id=record.run_id,
+                operation_id=record.operation_id,
+                source_revision=record.source_revision,
+                expected_generation=record.generation,
+                snapshot=snapshot,
+                now=now,
+            )
+        record = store.attach_cluster_operation_approval(
+            run_id=record.run_id,
+            operation_id=record.operation_id,
+            source_revision=record.source_revision,
+            expected_generation=record.generation,
+            approval=approval,
+            now=now,
+        )
+    except (
+        ClusterOperationLifecycleError,
+        ClusterOperationSnapshotError,
+        ConfigError,
+        OSError,
+        StateStoreError,
+        ValueError,
+    ) as exc:
+        print(f"cluster-operation: FAILED - {exc}", file=sys.stderr)
+        return 2
+    print(
+        "cluster-operation: approved "
+        f"run={record.run_id} operation={record.operation_id} status={record.status.value} "
+        f"generation={record.generation}"
+    )
+    return 0
+
+
+def _parse_cluster_action_digests(values: list[str]) -> tuple[Any, ...]:
+    from .cluster_operation_lifecycle import ActionDigest
+
+    actions = []
+    for value in values:
+        action_id, separator, digest = value.partition("=")
+        if not separator or not action_id or not digest:
+            raise ValueError("--allowed-action must be ACTION_ID=SHA256")
+        actions.append(ActionDigest(action_id=action_id, sha256=digest))
+    return tuple(actions)
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("--expires-at must be an ISO-8601 UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError("--expires-at must be a UTC timestamp")
+    return parsed
 
 
 def produce_live_smoke_proof(
@@ -1120,6 +1432,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_execute(args)
     elif args.command == "preflight":
         return _cmd_preflight(args)
+    elif args.command == "cluster-preflight":
+        return _cmd_cluster_preflight(args)
+    elif args.command == "cluster-operation":
+        return _cmd_cluster_operation(args)
     elif args.command == "smoke-proof":
         return _cmd_smoke_proof(args)
     elif args.command == "status":

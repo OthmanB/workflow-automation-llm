@@ -121,6 +121,57 @@
       "title": "BatchStatus",
       "type": "string"
     },
+    "ClusterOperationReference": {
+      "additionalProperties": false,
+      "description": "Static reference to a future dispatcher-owned cluster operation manifest.",
+      "properties": {
+        "operation_manifest_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Operation Manifest Path",
+          "type": "string"
+        },
+        "preauthorized_actions": {
+          "items": {
+            "enum": [
+              "kubectl_server_dry_run",
+              "helm_upgrade_install",
+              "port_forward",
+              "tls_dc8_no_client_certificate_rejection"
+            ],
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Preauthorized Actions",
+          "type": "array"
+        },
+        "requires_automatic_rollback": {
+          "const": true,
+          "title": "Requires Automatic Rollback",
+          "type": "boolean"
+        },
+        "requires_cluster_approval": {
+          "const": true,
+          "title": "Requires Cluster Approval",
+          "type": "boolean"
+        },
+        "target_name": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Target Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_name",
+        "operation_manifest_path",
+        "requires_cluster_approval",
+        "preauthorized_actions",
+        "requires_automatic_rollback"
+      ],
+      "title": "ClusterOperationReference",
+      "type": "object"
+    },
     "CompiledReviewObligation": {
       "additionalProperties": false,
       "description": "Concrete pre-dispatch review policy for one normalized plan step.",
@@ -726,6 +777,17 @@
         },
         "authorization": {
           "$ref": "#/$defs/StepAuthorization"
+        },
+        "cluster_operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClusterOperationReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "depends_on": {
           "items": {

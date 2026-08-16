@@ -23,6 +23,8 @@ or complete work by prose alone.
 | Review profiles, budgets, and operator gates | Implemented | Measured worker usage only; live execution remains disabled |
 | Bounded worktree barriers | Implemented | Same-repository writes require clean `commit_policy: required` repositories; patch-only barriers remain unsupported |
 | Permission compilation | Implemented and fake-child tested | Live enforcement needs the opt-in compatibility suite |
+| Read-only cluster readiness | Implemented | Verifies capability floors and supported relationships; exact mutation revisions and manifests require approval-time rollback evidence |
+| Cluster operation fixed-argv runner | Code-tested only | Dispatcher library with injected fake runners, pinned binary re-hash, typed probes, and rollback; not wired to CLI, workers, or `dispatcher execute` and not authorized for a real cluster |
 | Observability and support export | Implemented | Retention applies only to derived artifacts, never SQLite state |
 | Private reference migration | Deferred | Requires separate authorization; no private project data is present here |
 | Real OpenCode execution | Guarded, not enabled | Requires private schema-v2 config and `dispatcher execute` |
@@ -34,6 +36,7 @@ or complete work by prose alone.
 | [`docs/compatibility.md`](docs/compatibility.md) | Installation, pinned OpenCode contract, and live-smoke gate |
 | [`docs/config-schema.md`](docs/config-schema.md) | Public schema-v1 configuration and policy guidance |
 | [`docs/normalized-plan-schema.md`](docs/normalized-plan-schema.md) | Immutable normalized plan and approval contract |
+| [`docs/cluster-operation-manifest-schema.md`](docs/cluster-operation-manifest-schema.md) | Static manifests and approval-bound, non-executing cluster-operation lifecycle |
 | [`docs/protocol.md`](docs/protocol.md) | Strict supervisor commands and typed worker results |
 | [`docs/workflow-state-schema.md`](docs/workflow-state-schema.md) | Run, step, dispatch, batch, and recovery transitions |
 | [`docs/operations.md`](docs/operations.md) | Safe operational command procedures and exit behavior |
@@ -51,6 +54,7 @@ plan are authoritative for current behavior.
 
 ```text
 dispatcher preflight --config <project.yaml>
+dispatcher cluster-preflight --config <project.yaml>
 dispatcher permission-manifest --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \
    --repo-id <repo> --output <manifest.json>
 dispatcher execute --config <private-v2.yaml> --run-id <id> --plan <plan.yaml> \

@@ -44,6 +44,7 @@ from dispatcher.sessions import (
     run_session,
 )
 from dispatcher.state import open_state_store
+from dispatcher.verification import DirectTestBackend, VerificationRunner
 from dispatcher.workflow import (
     BatchStatus,
     DispatchStatus,
@@ -582,19 +583,21 @@ def _reconcile_disposable_repository(root: Path, initial_revision: str, *, resid
     assert _git(root, "status", "--porcelain") == ""
 
 
-def _configure_real_project(
+def _configure_disposable_project(
     project,
     *,
     scheduling: str,
     same_repository: str = "serialized",
     models: Mapping[str, str] | None = None,
+    mode: str,
+    verification_backend: str,
 ):
     values = config_values(project)
     values["schema_version"] = 2
     values["execution"].update(
         {
-            "mode": "real_operation",
-            "verification_backend": "darwin_seatbelt_v1",
+            "mode": mode,
+            "verification_backend": verification_backend,
             "scheduling": scheduling,
             "concurrency": {
                 **values["execution"]["concurrency"],
@@ -616,6 +619,40 @@ def _configure_real_project(
         "disk_space_min_mb": 1,
     }
     return replace(project, config=write_config(project, values))
+
+
+def _configure_real_project(
+    project,
+    *,
+    scheduling: str,
+    same_repository: str = "serialized",
+    models: Mapping[str, str] | None = None,
+):
+    return _configure_disposable_project(
+        project,
+        scheduling=scheduling,
+        same_repository=same_repository,
+        models=models,
+        mode="real_operation",
+        verification_backend="darwin_seatbelt_v1",
+    )
+
+
+def _configure_fake_runner_project(
+    project,
+    *,
+    scheduling: str,
+    same_repository: str = "serialized",
+    models: Mapping[str, str],
+):
+    return _configure_disposable_project(
+        project,
+        scheduling=scheduling,
+        same_repository=same_repository,
+        models=models,
+        mode="mock_workflow_test",
+        verification_backend="direct_test_v1",
+    )
 
 
 def _real_project(
@@ -2098,8 +2135,35 @@ def _fake_models() -> dict[str, str]:
     }
 
 
+def test_fake_runner_project_uses_test_backend_without_seatbelt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dispatcher.verification.platform.system", lambda: "Linux")
+    project = _configure_fake_runner_project(
+        _non_live_project(tmp_path, "direct-test-backend"),
+        scheduling="sequential",
+        models=_fake_models(),
+    )
+    store = open_state_store(project.config)
+    workflow = SequentialWorkflow(project.config, store, owner_id="fake-runner-test-backend")
+    coordinator = SequentialExecutionCoordinator(
+        project.config,
+        store,
+        workflow,
+        owner_id="fake-runner-test-backend",
+    )
+
+    runner = coordinator._verification_runner.__self__
+
+    assert project.config.execution.mode == "mock_workflow_test"
+    assert project.config.execution.verification_backend == "direct_test_v1"
+    assert isinstance(runner, VerificationRunner)
+    assert isinstance(runner.backend, DirectTestBackend)
+
+
 def test_solo_reconciliation_full_loop_with_fake_runner(tmp_path: Path) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "solo"),
         scheduling="sequential",
         models=_fake_models(),
@@ -2156,7 +2220,7 @@ def test_solo_reconciliation_full_loop_with_fake_runner(tmp_path: Path) -> None:
 
 
 def test_halt_full_loop_with_fake_runner(tmp_path: Path) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "halt"),
         scheduling="sequential",
         models=_fake_models(),
@@ -2200,7 +2264,7 @@ def test_halt_full_loop_with_fake_runner(tmp_path: Path) -> None:
 
 
 def test_review_rework_resume_full_loop_with_fake_runner(tmp_path: Path) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "rework"),
         scheduling="sequential",
         models=_fake_models(),
@@ -2263,7 +2327,7 @@ def test_review_rework_resume_full_loop_with_fake_runner(tmp_path: Path) -> None
 def test_verification_failure_resume_commit_review_full_loop_with_fake_runner(
     tmp_path: Path,
 ) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "verification-feedback"),
         scheduling="sequential",
         models=_fake_models(),
@@ -2376,7 +2440,7 @@ def test_verification_failure_resume_commit_review_full_loop_with_fake_runner(
         first_payload.authoritative_verification[0]["backend"],
         repaired_payload.authoritative_verification[0]["backend"],
         review_payload.authoritative_verification[0]["backend"],
-    } <= {"darwin-seatbelt-v1", "linux-bwrap-v1"}
+    } == {"direct-test-v1"}
     assert int(_git(project.repository, "rev-list", "--all", "--count")) == 2
     assert handle.completion.report_path is not None
     report = handle.completion.report_path.read_text(encoding="utf-8")
@@ -2392,7 +2456,7 @@ def test_verification_failure_resume_commit_review_full_loop_with_fake_runner(
 def test_controlled_reviewer_mutation_attempts_are_denied_before_execution(
     tmp_path: Path,
 ) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "reviewer-permission-ceiling"),
         scheduling="sequential",
         models=_fake_models(),
@@ -2448,7 +2512,7 @@ def test_controlled_reviewer_mutation_attempts_are_denied_before_execution(
 
 
 def test_batch_reconciliation_full_loop_with_fake_runner(tmp_path: Path) -> None:
-    project = _configure_real_project(
+    project = _configure_fake_runner_project(
         _non_live_project(tmp_path, "batch"),
         scheduling="bounded_parallel",
         models=_fake_models(),

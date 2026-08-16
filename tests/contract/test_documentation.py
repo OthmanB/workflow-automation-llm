@@ -26,6 +26,8 @@ def test_operations_document_every_supported_cli_command_and_unsupported_lifecyc
 
     for command in (
         "dispatcher run",
+        "dispatcher cluster-operation status",
+        "dispatcher cluster-operation approve",
         "dispatcher execute",
         "dispatcher permission-manifest",
         "dispatcher approve-real-operation",

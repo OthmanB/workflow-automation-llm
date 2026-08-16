@@ -21,6 +21,114 @@ When model smoke testing is enabled, each model must return exactly `OK` after
 trimming surrounding whitespace. `NOT OK`, extra text, empty output, or a JSON
 wrapper fails preflight.
 
+## Cluster Preflight
+
+```bash
+dispatcher cluster-preflight --config <project.yaml>
+```
+
+This command requires a schema-valid `cluster_preflight` section and prints a
+sanitized structured JSON result. It returns `0` only when the configured
+current context, namespaces, Helm chart-version floors, API resources, namespaced
+`kubectl auth can-i` checks, Kubernetes client/server version floors, and the
+Kubernetes-supported client/server compatibility relationship all pass. The
+relationship requires matching majors and a client/server minor skew no greater
+than one, independently of the configured floors. A readiness failure returns
+`1` and still prints its failed structured result; an invalid or missing cluster
+preflight configuration returns `2`.
+
+The command parses the project schema without creating dispatcher state or
+starting workers, then issues only fixed read-only commands for context/version
+metadata, namespace/release/resource presence, and authorization inspection.
+It never reads Secret data and never applies, deletes, patches, creates,
+rolls out, or port-forwards Kubernetes resources. Command output is bounded and
+only selected safe fields are retained in the JSON result.
+
+When `cluster_preflight.kubectl_path` is set, it must be an absolute,
+normalized path to an executable regular file and is used as argv element zero
+for every kubectl command. The path is validated before cluster contact; omit it
+to use `kubectl` from `PATH`. Helm remains resolved from `PATH`.
+
+API discovery checks only the configured resource names returned by `kubectl
+api-resources --output=name`, such as `pods`. A one-level auth subresource such
+as `pods/portforward` is checked only through `kubectl auth can-i` and requires
+that its parent resource be declared for discovery.
+
+This verifies readiness only. It does not authorize deployment, rollback,
+network access, a kubeconfig, or raw `kubectl`/Helm/port-forward access for a
+worker. Those remain unavailable to workers. Actual deployment and rollback are
+future dispatcher-owned typed capabilities with their own explicit scope,
+approval, mutation, and recovery contracts.
+
+Readiness requirements use capability floors and supported relationships. Exact
+chart/image revisions, manifest digests, and rendered values are bound only by
+an approval-time mutation snapshot and rollback-evidence contract.
+
+## Static Cluster Operation Contracts
+
+There is no dispatcher command for `kubectl` dry-run/apply, Helm upgrade/install,
+rollback, or port-forward. `cluster_mutation`, an optional `cluster_operation`
+plan reference, and the repository-owned operation manifest are validated
+through public Python library APIs. Plan admission validates only the reference,
+so an executor may create the manifest and declared files before dispatcher
+structured Git commits them. The required post-commit
+`validate_cluster_operations_for_plan()` API then reads the operation manifest
+and checks declared repository paths without reading referenced
+manifest/chart/values content or any Secret content; it fails closed for a
+missing or invalid manifest and has no skip/fallback path.
+
+The operation manifest accepts only the finite action names
+`kubectl_server_dry_run`, `helm_upgrade_install`, `port_forward`, and
+`tls_dc8_no_client_certificate_rejection`. It has no
+argv, shell, URL/OCI chart source, `--set`, field-manager, inline Kubernetes
+object, Secret value, or environment-expansion surface. Actual digests, source
+revision, tool identity, server observations, rendered values, approval records,
+mutation execution are separate dispatcher-only phases.
+
+Phase 3 provides a code-tested `ClusterOperationRunner` execution boundary only.
+Phase 4 provides a separate read-only `capture_cluster_operation_snapshot()`
+library boundary. Phase 5 adds a Service-only loopback port-forward plus direct
+no-client-certificate TLS/DC8 rejection check through dispatcher-private
+production adapters. `_cmd_execute` creates those adapters only for a
+real-operation approval with a cluster-operation envelope; they are invoked only
+after source-manifest, snapshot, and lifecycle-approval validation. They never
+enter worker prompts or permissions, and ordinary non-cluster runs do not create
+them. This code has not deployed T2.5. Actual invocation remains gated by
+committed T2.5 source artifacts, the exact approved envelope, a fresh snapshot
+with source/tool/rollback bindings, real-operation approval, and an
+operator-selected `dispatcher execute`.
+
+### Cluster Operation Status and Approval
+
+```bash
+dispatcher cluster-operation status --config <project.yaml> --run-id <run-id> \
+  --operation-id <operation-id> --source-revision <commit-sha> --format json
+
+dispatcher cluster-operation snapshot --config <project.yaml> --run-id <run-id> \
+  --step-id <step-id> --operation-id <operation-id> --source-revision <commit-sha> \
+  --plan <normalized-plan.yaml> --real-operation-approval <approval.json> \
+  --tier1-invariant-snapshot-digest <sha256> --output <sanitized-snapshot.json>
+
+dispatcher cluster-operation approve --config <project.yaml> --run-id <run-id> \
+  --operation-id <operation-id> --source-revision <commit-sha> \
+  --snapshot <sanitized-snapshot.json> --owner-ref <owner-ref> \
+  --allowed-action action-1=<sha256> [--allowed-action action-2=<sha256> ...] \
+  --rollback-digest <sha256> --expires-at <UTC-ISO-8601>
+```
+
+`status` reads an already-existing local journal and does not create one.
+`snapshot` requires that journal record to be `STATIC_VALIDATED`, revalidates the
+provided plan's post-commit operation against the exact approval envelope, and
+writes a private snapshot file without attaching it or modifying state. It uses
+only target-pinned read-only `kubectl` context/version/resource/Secret-metadata
+queries and Helm status/history metadata. It never requests Secret values or
+issues apply, rollout, port-forward, Helm upgrade, Helm repo, or generic network
+commands. `approve` accepts a pre-created, duplicate-free sanitized snapshot
+JSON, attaches it only to a `STATIC_VALIDATED` record (or verifies an exact
+existing captured snapshot), and writes an owner approval only when every
+identity/action/rollback digest is exact and unexpired. There is no dry-run,
+mutation, probe, rollback, or reconciliation command in this release.
+
 ## Mock Run
 
 ```bash
@@ -66,12 +174,16 @@ run can reach without another unresolved operator gate, in plan/dependency
 order. Each scoped entry contains the role kind, role-scoped actions, digest of
 the generated OpenCode permission JSON, and its structured-Git capability
 including the step ID, writable paths, evidence paths, commit policy, and
-identity digest. The top-level `digest` attests to the complete ordered scope.
-For a multi-step scope, the approval command requires that digest through
-`--scope-manifest-digest` after the operator has reviewed the entire manifest;
-it rejects absent or stale digests rather than deriving later-step permissions
-silently. The role/digest arguments still attest the first launch step and keep
-single-step invocation compatibility. A scope spanning repositories requires one
+identity digest. It also contains each complete `cluster_operation_envelopes`
+entry before approval: run/step/repository, target/context, normalized manifest
+path, exact action tuple, automatic rollback intent, operation/source roots,
+plan/config digests, and envelope digest. The top-level `digest` attests to the
+complete ordered scope. A multi-step scope or any scope with a cluster envelope
+requires that digest through `--scope-manifest-digest` after the operator has
+reviewed the entire manifest; it rejects absent or stale digests rather than
+deriving later-step permissions or cluster authority silently. The role/digest
+arguments still attest the first launch step and keep single-step non-cluster
+invocation compatibility. A scope spanning repositories requires one
 `--expected-repository-revision` per repository; each is inspected clean and is
 bound to the approval record in first-scope-use order. Single-repository approvals
 retain the existing command shape and can optionally bind the same explicit
@@ -115,9 +227,12 @@ repository. A recoverable `REVIEW_REQUIRED` step remains the first approved step
 on resume; an accepted prefix remains bound while its approved suffix continues.
 It rejects omitted, reordered, extra, or changed scoped entries,
 including later-step role, writable-path, evidence-path, and structured-Git
-changes. Legacy records without a scope remain valid only when the recomputed
-scope contains exactly one step. The command runs preflight immediately before
-launch and records the validated approval record in the audit log.
+changes, as well as missing, extra, reordered, or changed cluster envelopes.
+Legacy records without a scope remain valid only when the recomputed scope
+contains exactly one non-cluster step; a legacy or single-step approval never
+authorizes a cluster-operation step. The command runs preflight immediately
+before launch and records the validated approval record and envelopes in the audit
+log.
 
 Immediately before `smoke-proof` and `execute`, the dispatcher atomically copies
 the active operator OpenCode credential store from

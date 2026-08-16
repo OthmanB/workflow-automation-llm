@@ -1,5 +1,21 @@
 {
   "$defs": {
+    "ApiResourceRequirement": {
+      "additionalProperties": false,
+      "description": "One exact Kubernetes API resource advertised by discovery.",
+      "properties": {
+        "resource": {
+          "pattern": "^[a-z][a-z0-9-]{0,62}(?:\\.[a-z0-9][a-z0-9.-]{0,251})?$",
+          "title": "Resource",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resource"
+      ],
+      "title": "ApiResourceRequirement",
+      "type": "object"
+    },
     "BudgetDefinition": {
       "additionalProperties": false,
       "description": "Measured resource limits enforced by the sequential coordinator.",
@@ -40,6 +56,242 @@
         "on_limit"
       ],
       "title": "BudgetDefinition",
+      "type": "object"
+    },
+    "ClusterMutationDefinition": {
+      "additionalProperties": false,
+      "description": "Schema-only cluster mutation capability; it grants no execution authority.",
+      "properties": {
+        "capability_version": {
+          "const": 1,
+          "title": "Capability Version",
+          "type": "integer"
+        },
+        "targets": {
+          "patternProperties": {
+            "^[A-Za-z][A-Za-z0-9._-]{0,127}$": {
+              "$ref": "#/$defs/ClusterMutationTargetDefinition"
+            }
+          },
+          "title": "Targets",
+          "type": "object"
+        }
+      },
+      "required": [
+        "capability_version",
+        "targets"
+      ],
+      "title": "ClusterMutationDefinition",
+      "type": "object"
+    },
+    "ClusterMutationTargetDefinition": {
+      "additionalProperties": false,
+      "description": "Static allowlist for a future dispatcher-owned cluster operation target.",
+      "properties": {
+        "allowed_repository_ids": {
+          "items": {
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Allowed Repository Ids",
+          "type": "array"
+        },
+        "context": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$",
+          "title": "Context",
+          "type": "string"
+        },
+        "max_action_timeout_seconds": {
+          "maximum": 3600,
+          "minimum": 1,
+          "title": "Max Action Timeout Seconds",
+          "type": "integer"
+        },
+        "max_snapshot_age_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Max Snapshot Age Seconds",
+          "type": "integer"
+        },
+        "operation_manifest_roots": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Operation Manifest Roots",
+          "type": "array"
+        },
+        "preflight_target_id": {
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Preflight Target Id",
+          "type": "string"
+        },
+        "source_file_roots": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Source File Roots",
+          "type": "array"
+        },
+        "toolchain": {
+          "$ref": "#/$defs/ClusterMutationToolchainDefinition"
+        }
+      },
+      "required": [
+        "context",
+        "toolchain",
+        "allowed_repository_ids",
+        "operation_manifest_roots",
+        "source_file_roots",
+        "max_snapshot_age_seconds",
+        "max_action_timeout_seconds",
+        "preflight_target_id"
+      ],
+      "title": "ClusterMutationTargetDefinition",
+      "type": "object"
+    },
+    "ClusterMutationToolDefinition": {
+      "additionalProperties": false,
+      "description": "One exact dispatcher-owned executable pinned for mutation-time verification.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ClusterMutationToolDefinition",
+      "type": "object"
+    },
+    "ClusterMutationToolchainDefinition": {
+      "additionalProperties": false,
+      "description": "The two binaries whose content is re-verified before every mutation launch.",
+      "properties": {
+        "helm": {
+          "$ref": "#/$defs/ClusterMutationToolDefinition"
+        },
+        "kubectl": {
+          "$ref": "#/$defs/ClusterMutationToolDefinition"
+        }
+      },
+      "required": [
+        "kubectl",
+        "helm"
+      ],
+      "title": "ClusterMutationToolchainDefinition",
+      "type": "object"
+    },
+    "ClusterPreflightDefinition": {
+      "additionalProperties": false,
+      "description": "Read-only Kubernetes readiness contract for a named integration cluster.",
+      "properties": {
+        "auth_checks": {
+          "items": {
+            "$ref": "#/$defs/KubectlAuthRequirement"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Auth Checks",
+          "type": "array"
+        },
+        "capability_version": {
+          "const": 1,
+          "title": "Capability Version",
+          "type": "integer"
+        },
+        "context": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,253}$",
+          "title": "Context",
+          "type": "string"
+        },
+        "kubectl_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kubectl Path"
+        },
+        "minimum_client_version": {
+          "pattern": "^v?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+          "title": "Minimum Client Version",
+          "type": "string"
+        },
+        "minimum_server_version": {
+          "pattern": "^v?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+          "title": "Minimum Server Version",
+          "type": "string"
+        },
+        "request_timeout_seconds": {
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Request Timeout Seconds",
+          "type": "integer"
+        },
+        "required_api_resources": {
+          "items": {
+            "$ref": "#/$defs/ApiResourceRequirement"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "title": "Required Api Resources",
+          "type": "array"
+        },
+        "required_helm_releases": {
+          "items": {
+            "$ref": "#/$defs/HelmReleaseRequirement"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Required Helm Releases",
+          "type": "array"
+        },
+        "required_namespaces": {
+          "items": {
+            "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Required Namespaces",
+          "type": "array"
+        },
+        "target_id": {
+          "default": "cluster-preflight",
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+          "title": "Target Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability_version",
+        "context",
+        "minimum_client_version",
+        "minimum_server_version",
+        "request_timeout_seconds",
+        "required_namespaces",
+        "required_helm_releases",
+        "required_api_resources",
+        "auth_checks"
+      ],
+      "title": "ClusterPreflightDefinition",
       "type": "object"
     },
     "ConcurrencyDefinition": {
@@ -249,6 +501,76 @@
         "response_template"
       ],
       "title": "ExecutionDefinition",
+      "type": "object"
+    },
+    "HelmReleaseRequirement": {
+      "additionalProperties": false,
+      "description": "One deployed Helm release with a chart-version capability floor.",
+      "properties": {
+        "chart": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Chart",
+          "type": "string"
+        },
+        "minimum_chart_version": {
+          "pattern": "^v?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+          "title": "Minimum Chart Version",
+          "type": "string"
+        },
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "release": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Release",
+          "type": "string"
+        }
+      },
+      "required": [
+        "release",
+        "namespace",
+        "chart",
+        "minimum_chart_version"
+      ],
+      "title": "HelmReleaseRequirement",
+      "type": "object"
+    },
+    "KubectlAuthRequirement": {
+      "additionalProperties": false,
+      "description": "One bounded authorization capability required by a future typed operation.",
+      "properties": {
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "resource": {
+          "pattern": "^[a-z][a-z0-9-]{0,62}(?:\\.[a-z0-9][a-z0-9.-]{0,251})?(?:/[a-z][a-z0-9-]{0,62})?$",
+          "title": "Resource",
+          "type": "string"
+        },
+        "verb": {
+          "enum": [
+            "get",
+            "list",
+            "watch",
+            "create",
+            "patch",
+            "update",
+            "delete"
+          ],
+          "title": "Verb",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verb",
+        "resource",
+        "namespace"
+      ],
+      "title": "KubectlAuthRequirement",
       "type": "object"
     },
     "MCPLocalServer": {
@@ -1039,6 +1361,28 @@
   "properties": {
     "budget": {
       "$ref": "#/$defs/BudgetDefinition"
+    },
+    "cluster_mutation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClusterMutationDefinition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "cluster_preflight": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClusterPreflightDefinition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "evidence": {
       "$ref": "#/$defs/EvidencePolicy"

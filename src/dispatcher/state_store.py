@@ -18,6 +18,45 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from .cluster_operation_lifecycle import (
+    ClusterOperationApproval,
+    ClusterOperationApprovalSnapshot,
+    ClusterOperationCommandEvidence,
+    ClusterOperationLifecycleError,
+    ClusterOperationLifecycleRecord,
+    ClusterOperationStatus,
+    PortForwardOwnership,
+    TlsDc8ProbeEvidence,
+    assert_cluster_operation_safe_payload,
+    cluster_operation_record_digest,
+)
+from .cluster_operation_lifecycle import (
+    append_cluster_operation_command_evidence as lifecycle_append_cluster_operation_command_evidence,
+)
+from .cluster_operation_lifecycle import (
+    append_cluster_operation_tls_dc8_probe_evidence as lifecycle_append_cluster_operation_tls_dc8_probe_evidence,
+)
+from .cluster_operation_lifecycle import (
+    attach_cluster_operation_approval as lifecycle_attach_cluster_operation_approval,
+)
+from .cluster_operation_lifecycle import (
+    attach_cluster_operation_snapshot as lifecycle_attach_cluster_operation_snapshot,
+)
+from .cluster_operation_lifecycle import (
+    begin_cluster_operation_port_forward as lifecycle_begin_cluster_operation_port_forward,
+)
+from .cluster_operation_lifecycle import (
+    mark_cluster_operation_port_forward_cleanup_ambiguous as lifecycle_mark_cluster_operation_port_forward_cleanup_ambiguous,
+)
+from .cluster_operation_lifecycle import (
+    mark_cluster_operation_port_forward_started as lifecycle_mark_cluster_operation_port_forward_started,
+)
+from .cluster_operation_lifecycle import (
+    mark_cluster_operation_port_forward_stopped as lifecycle_mark_cluster_operation_port_forward_stopped,
+)
+from .cluster_operation_lifecycle import (
+    transition_cluster_operation as lifecycle_transition_cluster_operation,
+)
 from .security import (
     OWNER_FILE_MODE,
     atomic_write_private_text,
@@ -43,7 +82,7 @@ from .workflow import (
 )
 from .workflow import transition_dispatch as transition_dispatch_record
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 10
 TERMINAL_RUN_STATES = frozenset(
     {RunStatus.HALTED.value, RunStatus.FAILED.value, RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}
 )
@@ -352,6 +391,339 @@ class StateStore:
                 f"project {project_id} has multiple active runs; operator reconciliation is required"
             )
         return None if not rows else self.load_run(str(rows[0]["run_id"]))
+
+    def create_cluster_operation(self, record: ClusterOperationLifecycleRecord) -> int:
+        """Persist one immutable DISCOVERED cluster-operation identity and journal event.
+
+        This is a local SQLite-only operation. Snapshot collection and all cluster
+        execution remain intentionally absent from the state-store boundary.
+        """
+        if record.status is not ClusterOperationStatus.DISCOVERED:
+            raise StateStoreError("new cluster operation records must be DISCOVERED")
+        if record.generation != 1:
+            raise StateStoreError("new cluster operation records must start at generation 1")
+        self._assert_safe_cluster_operation_record(record)
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            existing = connection.execute(
+                """
+                SELECT 1 FROM cluster_operation_journal
+                WHERE run_id = ? AND operation_id = ? AND source_revision = ?
+                """,
+                record.identity,
+            ).fetchone()
+            if existing is not None:
+                raise StateStoreConflictError(
+                    "cluster operation already exists for its immutable run, operation, and source identity"
+                )
+            self._insert_cluster_operation_record(connection, record)
+            self._append_cluster_operation_audit_event(
+                connection,
+                record=record,
+                previous_status=None,
+                kind="cluster_operation_discovered",
+            )
+        self._secure_database_files()
+        return record.generation
+
+    def load_cluster_operation(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+    ) -> ClusterOperationLifecycleRecord:
+        """Load one exact immutable cluster-operation lifecycle record."""
+        row = self._ready_connection().execute(
+            """
+            SELECT * FROM cluster_operation_journal
+            WHERE run_id = ? AND operation_id = ? AND source_revision = ?
+            """,
+            (run_id, operation_id, source_revision),
+        ).fetchone()
+        if row is None:
+            raise StateStoreError("cluster operation record not found")
+        return self._cluster_operation_record_from_row(row)
+
+    def transition_cluster_operation(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        target: ClusterOperationStatus,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-transition a journal row through only the declared lifecycle table."""
+        transition_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_transition_cluster_operation(
+                current, target, now=transition_at
+            ),
+            kind=f"cluster_operation_{target.value.lower()}",
+        )
+
+    def attach_cluster_operation_snapshot(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        snapshot: ClusterOperationApprovalSnapshot,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-bind a pre-created sanitized snapshot after STATIC_VALIDATED only."""
+        transition_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_attach_cluster_operation_snapshot(
+                current, snapshot, now=transition_at
+            ),
+            kind="cluster_operation_snapshot_captured",
+        )
+
+    def attach_cluster_operation_approval(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        approval: ClusterOperationApproval,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-bind one unexpired owner approval after SNAPSHOT_CAPTURED only."""
+        transition_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_attach_cluster_operation_approval(
+                current, approval, now=transition_at
+            ),
+            kind="cluster_operation_approved",
+        )
+
+    def append_cluster_operation_command_evidence(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        evidence: ClusterOperationCommandEvidence,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-append bounded digest-only fixed-command evidence to one journal record."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_append_cluster_operation_command_evidence(
+                current, evidence, now=recorded_at
+            ),
+            kind="cluster_operation_command_evidence",
+        )
+
+    def persist_cluster_operation_port_forward_intent(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        ownership: PortForwardOwnership,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-record child intent before the dispatcher is allowed to spawn it."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_begin_cluster_operation_port_forward(
+                current, ownership, now=recorded_at
+            ),
+            kind="cluster_operation_port_forward_intent",
+        )
+
+    def persist_cluster_operation_port_forward_started(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        action_id: str,
+        pid: int,
+        process_created_at: datetime,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-record the exact spawned-child identity before readiness observation."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_mark_cluster_operation_port_forward_started(
+                current,
+                action_id=action_id,
+                pid=pid,
+                process_created_at=process_created_at,
+                now=recorded_at,
+            ),
+            kind="cluster_operation_port_forward_started",
+        )
+
+    def persist_cluster_operation_port_forward_stopped(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        action_id: str,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-record safe termination of the exact owned child."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_mark_cluster_operation_port_forward_stopped(
+                current, action_id=action_id, now=recorded_at
+            ),
+            kind="cluster_operation_port_forward_stopped",
+        )
+
+    def persist_cluster_operation_port_forward_cleanup_ambiguity(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        action_id: str,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-record an unowned, reused, or otherwise ambiguous child identity."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_mark_cluster_operation_port_forward_cleanup_ambiguous(
+                current, action_id=action_id, now=recorded_at
+            ),
+            kind="cluster_operation_port_forward_cleanup_ambiguous",
+        )
+
+    def append_cluster_operation_tls_dc8_probe_evidence(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        evidence: TlsDc8ProbeEvidence,
+        now: datetime | None = None,
+    ) -> ClusterOperationLifecycleRecord:
+        """CAS-append a digest-only typed TLS/DC8 outcome."""
+        recorded_at = now or datetime.now(UTC)
+        return self._update_cluster_operation(
+            run_id=run_id,
+            operation_id=operation_id,
+            source_revision=source_revision,
+            expected_generation=expected_generation,
+            updater=lambda current: lifecycle_append_cluster_operation_tls_dc8_probe_evidence(
+                current, evidence, now=recorded_at
+            ),
+            kind="cluster_operation_tls_dc8_probe_evidence",
+        )
+
+    def _update_cluster_operation(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        source_revision: str,
+        expected_generation: int,
+        updater: Callable[[ClusterOperationLifecycleRecord], ClusterOperationLifecycleRecord],
+        kind: str,
+    ) -> ClusterOperationLifecycleRecord:
+        connection = self._ready_connection()
+        with self._transaction(connection):
+            row = connection.execute(
+                """
+                SELECT * FROM cluster_operation_journal
+                WHERE run_id = ? AND operation_id = ? AND source_revision = ?
+                """,
+                (run_id, operation_id, source_revision),
+            ).fetchone()
+            if row is None:
+                raise StateStoreError("cluster operation record not found")
+            current = self._cluster_operation_record_from_row(row)
+            if current.generation != expected_generation:
+                raise StateStoreConflictError(
+                    "cluster operation generation conflict: "
+                    f"expected {expected_generation}, found {current.generation}"
+                )
+            try:
+                updated = updater(current)
+            except ClusterOperationLifecycleError as exc:
+                raise StateStoreError(str(exc)) from exc
+            if updated.identity != current.identity or self._cluster_operation_immutable_identity(updated) != (
+                self._cluster_operation_immutable_identity(current)
+            ):
+                raise StateStoreCorruptionError("cluster operation update changed immutable identity")
+            updated = ClusterOperationLifecycleRecord.model_validate(
+                {**updated.model_dump(), "generation": current.generation + 1}
+            )
+            self._assert_safe_cluster_operation_record(updated)
+            cursor = connection.execute(
+                """
+                UPDATE cluster_operation_journal
+                SET state = ?, generation = ?, record_json = ?, updated_at = ?
+                WHERE run_id = ? AND operation_id = ? AND source_revision = ? AND generation = ?
+                """,
+                (
+                    updated.status.value,
+                    updated.generation,
+                    self._cluster_operation_json(updated),
+                    updated.updated_at.isoformat(),
+                    run_id,
+                    operation_id,
+                    source_revision,
+                    expected_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreConflictError("cluster operation changed before its update was committed")
+            self._append_cluster_operation_audit_event(
+                connection,
+                record=updated,
+                previous_status=current.status,
+                kind=kind,
+            )
+        self._secure_database_files()
+        return updated
 
     def sessions_for_run(self, run_id: str) -> dict[str, dict[str, dict[str, Any]]]:
         """Load the dispatcher-owned session registry for one run."""
@@ -2650,6 +3022,12 @@ class StateStore:
             version = 7
         if version == 7:
             self._apply_v8(connection)
+            version = 8
+        if version == 8:
+            self._apply_v9(connection)
+            version = 9
+        if version == 9:
+            self._apply_v10(connection)
 
     def _apply_v1(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -2930,6 +3308,146 @@ class StateStore:
             """
         )
 
+    def _apply_v9(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE cluster_operation_journal (
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                operation_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                config_digest TEXT NOT NULL,
+                validated_manifest_digest TEXT NOT NULL,
+                static_action_digests_json TEXT NOT NULL,
+                rollback_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'DISCOVERED', 'STATIC_VALIDATED', 'SNAPSHOT_CAPTURED', 'APPROVED',
+                    'SERVER_DRY_RUN_PASSED', 'PORT_FORWARD_INTENT',
+                    'PORT_FORWARD_STARTED', 'TLS_DC8_PROBING', 'MUTATION_STARTED', 'MUTATED', 'PROBING',
+                    'SUCCEEDED', 'ROLLBACK_STARTED', 'ROLLED_BACK', 'FAILED',
+                    'RECONCILIATION_REQUIRED'
+                )),
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, operation_id, source_revision)
+            );
+            CREATE INDEX cluster_operation_journal_status
+                ON cluster_operation_journal(run_id, state, updated_at);
+            CREATE TRIGGER cluster_operation_journal_identity_immutable
+                BEFORE UPDATE OF run_id, operation_id, source_revision, step_id, target_name,
+                    plan_digest, config_digest, validated_manifest_digest,
+                    static_action_digests_json, rollback_digest, created_at
+                ON cluster_operation_journal
+                BEGIN SELECT RAISE(ABORT, 'cluster operation identity is immutable'); END;
+            CREATE TABLE cluster_operation_audit_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                previous_state TEXT,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id, operation_id, source_revision)
+                    REFERENCES cluster_operation_journal(run_id, operation_id, source_revision)
+            );
+            CREATE INDEX cluster_operation_audit_events_identity
+                ON cluster_operation_audit_events(run_id, operation_id, source_revision, generation);
+            CREATE TRIGGER cluster_operation_audit_events_no_update
+                BEFORE UPDATE ON cluster_operation_audit_events
+                BEGIN SELECT RAISE(ABORT, 'cluster operation audit events are append-only'); END;
+            CREATE TRIGGER cluster_operation_audit_events_no_delete
+                BEFORE DELETE ON cluster_operation_audit_events
+                BEGIN SELECT RAISE(ABORT, 'cluster operation audit events are append-only'); END;
+            INSERT INTO schema_migrations(version, applied_at) VALUES (9, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
+    def _apply_v10(self, connection: sqlite3.Connection) -> None:
+        """Expand durable lifecycle states without weakening journal identity constraints."""
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+            DROP TRIGGER cluster_operation_audit_events_no_update;
+            DROP TRIGGER cluster_operation_audit_events_no_delete;
+            DROP TRIGGER cluster_operation_journal_identity_immutable;
+            DROP INDEX cluster_operation_journal_status;
+            DROP INDEX cluster_operation_audit_events_identity;
+            ALTER TABLE cluster_operation_audit_events RENAME TO cluster_operation_audit_events_v9;
+            ALTER TABLE cluster_operation_journal RENAME TO cluster_operation_journal_v9;
+            CREATE TABLE cluster_operation_journal (
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                operation_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                config_digest TEXT NOT NULL,
+                validated_manifest_digest TEXT NOT NULL,
+                static_action_digests_json TEXT NOT NULL,
+                rollback_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'DISCOVERED', 'STATIC_VALIDATED', 'SNAPSHOT_CAPTURED', 'APPROVED',
+                    'SERVER_DRY_RUN_PASSED', 'PORT_FORWARD_INTENT',
+                    'PORT_FORWARD_STARTED', 'TLS_DC8_PROBING', 'MUTATION_STARTED', 'MUTATED', 'PROBING',
+                    'SUCCEEDED', 'ROLLBACK_STARTED', 'ROLLED_BACK', 'FAILED',
+                    'RECONCILIATION_REQUIRED'
+                )),
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, operation_id, source_revision)
+            );
+            INSERT INTO cluster_operation_journal
+                SELECT * FROM cluster_operation_journal_v9;
+            CREATE TABLE cluster_operation_audit_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                previous_state TEXT,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id, operation_id, source_revision)
+                    REFERENCES cluster_operation_journal(run_id, operation_id, source_revision)
+            );
+            INSERT INTO cluster_operation_audit_events
+                SELECT * FROM cluster_operation_audit_events_v9;
+            DROP TABLE cluster_operation_audit_events_v9;
+            DROP TABLE cluster_operation_journal_v9;
+            CREATE INDEX cluster_operation_journal_status
+                ON cluster_operation_journal(run_id, state, updated_at);
+            CREATE TRIGGER cluster_operation_journal_identity_immutable
+                BEFORE UPDATE OF run_id, operation_id, source_revision, step_id, target_name,
+                    plan_digest, config_digest, validated_manifest_digest,
+                    static_action_digests_json, rollback_digest, created_at
+                ON cluster_operation_journal
+                BEGIN SELECT RAISE(ABORT, 'cluster operation identity is immutable'); END;
+            CREATE INDEX cluster_operation_audit_events_identity
+                ON cluster_operation_audit_events(run_id, operation_id, source_revision, generation);
+            CREATE TRIGGER cluster_operation_audit_events_no_update
+                BEFORE UPDATE ON cluster_operation_audit_events
+                BEGIN SELECT RAISE(ABORT, 'cluster operation audit events are append-only'); END;
+            CREATE TRIGGER cluster_operation_audit_events_no_delete
+                BEFORE DELETE ON cluster_operation_audit_events
+                BEGIN SELECT RAISE(ABORT, 'cluster operation audit events are append-only'); END;
+            INSERT INTO schema_migrations(version, applied_at) VALUES (10, '{_utc_now()}');
+            COMMIT;
+            """
+        )
+
     def _write_snapshot(
         self,
         connection: sqlite3.Connection,
@@ -3174,6 +3692,170 @@ class StateStore:
         ):
             if path.exists():
                 path.chmod(OWNER_FILE_MODE)
+
+    def _insert_cluster_operation_record(
+        self,
+        connection: sqlite3.Connection,
+        record: ClusterOperationLifecycleRecord,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO cluster_operation_journal(
+                run_id, operation_id, source_revision, step_id, target_name,
+                plan_digest, config_digest, validated_manifest_digest,
+                static_action_digests_json, rollback_digest, state, generation,
+                record_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.run_id,
+                record.operation_id,
+                record.source_revision,
+                record.step_id,
+                record.target_name,
+                record.plan_digest,
+                record.config_digest,
+                record.validated_manifest_digest,
+                json.dumps(
+                    [item.model_dump(mode="json") for item in record.static_action_digests],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                record.rollback_digest,
+                record.status.value,
+                record.generation,
+                self._cluster_operation_json(record),
+                record.created_at.isoformat(),
+                record.updated_at.isoformat(),
+            ),
+        )
+
+    def _append_cluster_operation_audit_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        record: ClusterOperationLifecycleRecord,
+        previous_status: ClusterOperationStatus | None,
+        kind: str,
+    ) -> None:
+        """Append only digest/identity metadata; raw snapshot inputs never enter SQLite."""
+        payload = {
+            "record_digest": cluster_operation_record_digest(record),
+            "snapshot_digest": record.snapshot_digest,
+            "approval_digest": record.approval_digest,
+        }
+        connection.execute(
+            """
+            INSERT INTO cluster_operation_audit_events(
+                event_id, run_id, operation_id, source_revision, generation,
+                kind, previous_state, state, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"cluster-operation-audit-{uuid.uuid4().hex}",
+                record.run_id,
+                record.operation_id,
+                record.source_revision,
+                record.generation,
+                kind,
+                previous_status.value if previous_status is not None else None,
+                record.status.value,
+                self._cluster_operation_audit_json(payload),
+                record.updated_at.isoformat(),
+            ),
+        )
+
+    @staticmethod
+    def _cluster_operation_immutable_identity(record: ClusterOperationLifecycleRecord) -> tuple[object, ...]:
+        return (
+            record.run_id,
+            record.step_id,
+            record.operation_id,
+            record.source_revision,
+            record.target_name,
+            record.plan_digest,
+            record.config_digest,
+            record.validated_manifest_digest,
+            record.static_action_digests,
+            record.rollback_intent,
+            record.rollback_digest,
+            record.max_snapshot_age_seconds,
+            record.created_at,
+        )
+
+    def _cluster_operation_record_from_row(self, row: sqlite3.Row) -> ClusterOperationLifecycleRecord:
+        try:
+            raw = json.loads(str(row["record_json"]))
+            self._assert_safe_cluster_operation_payload(raw)
+            record = ClusterOperationLifecycleRecord.model_validate_json(str(row["record_json"]))
+        except (StateStoreError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StateStoreCorruptionError(
+                "stored cluster operation record is invalid or unsafe; operator reconciliation is required"
+            ) from exc
+        expected_columns = (
+            record.run_id,
+            record.operation_id,
+            record.source_revision,
+            record.step_id,
+            record.target_name,
+            record.plan_digest,
+            record.config_digest,
+            record.validated_manifest_digest,
+            record.rollback_digest,
+            record.status.value,
+            record.generation,
+        )
+        actual_columns = (
+            str(row["run_id"]),
+            str(row["operation_id"]),
+            str(row["source_revision"]),
+            str(row["step_id"]),
+            str(row["target_name"]),
+            str(row["plan_digest"]),
+            str(row["config_digest"]),
+            str(row["validated_manifest_digest"]),
+            str(row["rollback_digest"]),
+            str(row["state"]),
+            int(row["generation"]),
+        )
+        if actual_columns != expected_columns:
+            raise StateStoreCorruptionError("cluster operation journal columns do not match immutable record")
+        try:
+            static_action_digests = json.loads(str(row["static_action_digests_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StateStoreCorruptionError("cluster operation action digest column is invalid") from exc
+        if static_action_digests != [item.model_dump(mode="json") for item in record.static_action_digests]:
+            raise StateStoreCorruptionError("cluster operation action digests do not match immutable record")
+        return record
+
+    def _assert_safe_cluster_operation_record(self, record: ClusterOperationLifecycleRecord) -> None:
+        self._assert_safe_cluster_operation_payload(record.model_dump(mode="json"))
+
+    @staticmethod
+    def _assert_safe_cluster_operation_payload(value: object) -> None:
+        try:
+            assert_cluster_operation_safe_payload(value)
+        except ClusterOperationLifecycleError as exc:
+            raise StateStoreError("cluster operation payload contains forbidden sensitive data") from exc
+
+    @staticmethod
+    def _cluster_operation_json(record: ClusterOperationLifecycleRecord) -> str:
+        return json.dumps(
+            record.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    @staticmethod
+    def _cluster_operation_audit_json(value: Mapping[str, Any]) -> str:
+        try:
+            assert_cluster_operation_safe_payload(value)
+        except ClusterOperationLifecycleError as exc:
+            raise StateStoreError("cluster operation audit payload contains forbidden sensitive data") from exc
+        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _utc_now() -> str:

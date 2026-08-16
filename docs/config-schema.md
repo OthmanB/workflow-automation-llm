@@ -114,6 +114,54 @@ preflight:
   credentials: []
   require_git_remote: true
   disk_space_min_mb: 500
+# Optional: enables only `dispatcher cluster-preflight` when present.
+cluster_preflight:
+  capability_version: 1
+  # Omit to use the stable default `cluster-preflight` target name.
+  target_id: integration-readiness
+  # Optional: an absolute, normalized, executable owner-controlled client.
+  # Omit to use kubectl from PATH.
+  # kubectl_path: /opt/project-tools/kubectl-v1.27.3
+  context: example-integration-cluster
+  minimum_client_version: v1.27.0
+  minimum_server_version: v1.27.0
+  request_timeout_seconds: 10
+  required_namespaces: [vector-system, ml-components]
+  required_helm_releases:
+    - release: vector-logs
+      namespace: vector-system
+      chart: vector
+      minimum_chart_version: 0.50.0
+  required_api_resources:
+    - resource: deployments.apps
+    - resource: pods
+  auth_checks:
+    - verb: get
+      resource: deployments.apps
+      namespace: ml-components
+    - verb: create
+      resource: pods/portforward
+      namespace: ml-components
+# Optional: dispatcher-only mutation target, needed only when a plan step has
+# cluster_operation. It grants no worker authority and does not add a CLI path.
+cluster_mutation:
+  capability_version: 1
+  targets:
+    integration-deploy:
+      context: example-integration-cluster
+      toolchain:
+        kubectl:
+          path: /opt/project-tools/kubectl-v1.27.3
+          sha256: <64-lowercase-hex-characters>
+        helm:
+          path: /opt/project-tools/helm-v4.0.4
+          sha256: <64-lowercase-hex-characters>
+      allowed_repository_ids: [application]
+      operation_manifest_roots: [deploy/operations]
+      source_file_roots: [deploy]
+      max_snapshot_age_seconds: 900
+      max_action_timeout_seconds: 120
+      preflight_target_id: integration-readiness
 ```
 
 The schema-version-2 contract accepts optional `mcp` and per-role `mcp_tools`
@@ -124,6 +172,103 @@ explicit override and disable forms.
 When `models_smoke_test` is enabled, the configured prompt must cause every
 tested model to return the exact marker `OK` after surrounding whitespace is
 trimmed. The preflight check does not accept a substring match.
+
+## Cluster Preflight
+
+`cluster_preflight` is an optional, strict schema-v2 field for the separate
+`dispatcher cluster-preflight --config <project.yaml>` command. When present it
+requires one exact current context, one or more exact existing namespaces, exact
+deployed Helm release/chart-name pairs meeting configured minimum chart versions,
+exact API-resource names, and a finite set of namespaced `kubectl auth can-i`
+requirements. Minimum chart versions are semantic-version floors, not ranges,
+wildcards, regular expressions, or exact release pins.
+
+`target_id` names this read-only preflight target for optional future
+`cluster_mutation` targets. Existing one-target configurations may omit it and
+use the default `cluster-preflight` name.
+
+Optional `kubectl_path` selects one owner-controlled kubectl client for every
+kubectl command in this preflight. It must be an absolute, normalized path to
+an existing executable regular file; otherwise loading the cluster-preflight
+configuration fails before any cluster command. Omit it to use `kubectl` from
+`PATH`. Helm continues to use `helm` from `PATH`.
+
+Configured cluster readiness also requires strict `minimum_client_version` and
+`minimum_server_version` Kubernetes semantic-version floors. Independently of
+those floors, the client and server `gitVersion` metadata must satisfy the
+Kubernetes-supported `kubectl` relationship: same major and an absolute minor
+difference no greater than one. Pre-release and build details are validated;
+they cannot alter the compatibility relationship, and semantic-version ordering
+handles pre-release precedence while ignoring build metadata. Invalid metadata,
+versions below a floor, and incompatible client/server versions fail closed
+before the remaining readiness checks.
+
+`required_api_resources` contains only exact resource names returned by
+`kubectl api-resources --output=name`; it never contains a subresource. For
+example, declare `pods`, then an auth check may name the one-level subresource
+`pods/portforward`. An auth resource without a slash must itself be declared;
+one with a slash must have its exact parent before the slash declared. Multiple
+slashes, wildcards, and cross-resource mappings are rejected.
+
+The command accepts only the bounded shapes above: 1 to 20 namespaces and Helm
+release requirements, 1 to 50 API resources and auth checks, a 1 to 30 second
+request timeout, safe Kubernetes identifiers, and the fixed verb vocabulary
+`get`, `list`, `watch`, `create`, `patch`, `update`, and `delete`. Unknown
+fields, duplicate requirements, wildcard resources, cross-namespace auth
+checks, and auth resources omitted from `required_api_resources` fail schema
+validation.
+
+This is readiness evidence only. It runs fixed read-only argv for current
+context, version metadata, namespace presence, Helm release presence, API
+discovery, and authorization inspection. It never reads Secret contents or
+invokes apply, delete, patch, create, rollout, port-forward, or a deployment
+operation. Its structured JSON result contains selected safe metadata and check
+statuses, not raw command output.
+
+Cluster preflight does not give workers Kubernetes authority. Workers remain
+unable to use raw `kubectl`, Helm, port-forwarding, raw kubeconfigs, or network
+authority. Deployment and rollback require a future dispatcher-owned typed,
+scope-bound capability; this configuration is not that capability.
+
+Use floors and supported relationships here to establish capability readiness.
+Bind exact chart/image revisions, rendered manifests, values, and digests only
+in the approval-time mutation snapshot, invariants, and rollback evidence
+contract.
+
+## Static Cluster Operations
+
+`cluster_mutation` is optional and has no worker runtime effect. It is required
+only when a normalized plan step declares `cluster_operation`; it defines named
+dispatcher-owned targets, never worker permissions. Each target names one fixed
+context, its allowed repository IDs, normalized repository-relative
+operation-manifest and source-file roots, finite snapshot and action-timeout
+ceilings, exact executable `kubectl` and Helm paths, and their expected
+SHA-256 hashes. The configured binaries must be absolute, normalized,
+executable regular files. Their hashes are not static version pins: the Phase 3
+library re-hashes both binaries immediately before every command launch.
+Unknown targets, unregistered repositories, duplicate roots, unsafe paths,
+preflight mismatches, tool path failures, and attempts to configure the section
+without `cluster_preflight` fail closed.
+
+Plan admission validates this target/reference relationship only; it does not
+require an operation manifest or source files that an executor will create and
+dispatcher structured Git will commit. Before any future snapshot, approval, or
+mutation, the public post-commit validator must validate the full manifest and
+every declared file against that exact committed revision. Missing or invalid
+post-commit content fails closed; no fallback skips this validation.
+
+The manifest schema is
+[`schemas/cluster-operation-manifest-v1.json`](../schemas/cluster-operation-manifest-v1.json)
+and its static contract is documented in
+[`cluster-operation-manifest-schema.md`](cluster-operation-manifest-schema.md).
+This configuration adds only dispatcher-owned fixed binary identities; it does
+not add a kubeconfig, worker permission, network permission, or CLI mutation
+authority. The local-only
+`cluster-operation status` and `cluster-operation approve` commands can inspect
+or bind a pre-created sanitized snapshot after static validation, but they do
+not collect snapshots or contact a cluster. The configuration does not encode a
+current server version: readiness remains defined by minimum supported version
+floors and the supported client/server relationship in `cluster_preflight`.
 
 ## Key Rules
 
